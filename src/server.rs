@@ -168,6 +168,36 @@ pub struct GflagsGetArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DumpOnTriggerArgs {
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Trigger: "unhandled" (default), "firstchance", "cpu", or "hang".
+    #[serde(default)]
+    pub on: Option<String>,
+    /// CPU percent threshold for on="cpu" (default 80).
+    #[serde(default)]
+    pub threshold: Option<u32>,
+    /// Full dump (default) vs mini.
+    #[serde(default = "default_true")]
+    pub full: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ServiceDebugArgs {
+    /// Service executable image name, e.g. "myservice.exe".
+    pub image: String,
+    /// Debugger command line (default: cdb, if staged).
+    #[serde(default)]
+    pub debugger: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct AppVerifierArgs {
     /// Image name, e.g. "myapp.exe".
     pub image: String,
@@ -1501,6 +1531,13 @@ impl Heisenberg {
                 None => Err("wpr job has no backing file".to_string()),
             },
             "ttd" => self.stop_ttd().await,
+            "procdump" => {
+                // Best-effort: procdump may already have exited after its trigger fired.
+                if let Some(pid) = job.tool_pid {
+                    let _ = kill_pid(pid).await;
+                }
+                Ok(())
+            }
             _ => {
                 if cancel {
                     match job.tool_pid {
@@ -3055,6 +3092,156 @@ impl Heisenberg {
                     (ErrorKind::Internal, "check WER LocalDumps permissions")
                 };
                 Ok(text(error(tool, k, format!("failed to write WER LocalDumps: {e}"), remedy, Some(POSTMORTEM_DOCS))))
+            }
+        }
+    }
+
+    #[tool(
+        name = "dump.onTrigger",
+        description = "Arm ProcDump to dump a process in the background when a trigger fires (unhandled/firstchance exception, CPU threshold, or hang); returns a jobId. Read-only capture; needs ProcDump staged. Stop with job.stop/job.cancel."
+    )]
+    async fn dump_on_trigger(
+        &self,
+        Parameters(a): Parameters<DumpOnTriggerArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.onTrigger";
+        let docs = "https://learn.microsoft.com/sysinternals/downloads/procdump";
+        let pd = match self.state.locator.find("procdump.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(tool, ErrorKind::ToolNotInstalled, "procdump.exe not found", "install Sysinternals ProcDump or stage it in --tools-dir", Some(docs));
+                v["error"]["wingetId"] = json!("Microsoft.Sysinternals.ProcDump");
+                return Ok(text(v));
+            }
+        };
+        let pid = match proc::resolve(a.pid, a.name.as_deref()) {
+            Ok(p) => p,
+            Err(proc::TargetError::NotFound(m)) => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no process matched {m}"), "pass a pid or name", Some(docs)))),
+            Err(proc::TargetError::Ambiguous { name, pids }) => {
+                let mut v = error(tool, ErrorKind::AmbiguousTarget, format!("'{name}' matches {} processes", pids.len()), "pass a specific pid", Some(docs));
+                v["error"]["candidates"] = json!(pids);
+                return Ok(text(v));
+            }
+        };
+        let on = a.on.clone().unwrap_or_else(|| "unhandled".to_string());
+        let mut trig: Vec<String> = match on.to_lowercase().as_str() {
+            "unhandled" | "exception" => vec!["-e".to_string()],
+            "firstchance" => vec!["-e".to_string(), "1".to_string()],
+            "cpu" => vec!["-c".to_string(), a.threshold.unwrap_or(80).to_string()],
+            "hang" => vec!["-h".to_string()],
+            _ => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("unknown trigger '{on}'"), "use unhandled|firstchance|cpu|hang", Some(docs)))),
+        };
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let out = self.state.store.artifacts_dir().join(format!("trig_{pid}_{ts}.dmp"));
+        let mut args: Vec<String> = vec!["-accepteula".to_string()];
+        args.append(&mut trig);
+        args.push(if a.full { "-ma".to_string() } else { "-mp".to_string() });
+        args.push("-n".to_string());
+        args.push("1".to_string());
+        args.push(pid.to_string());
+        args.push(out.display().to_string());
+        let cmd_str = format!("procdump {}", args.join(" "));
+        match std::process::Command::new(&pd).args(&args).spawn() {
+            Ok(child) => {
+                let tpid = child.id();
+                let job = {
+                    let mut j = self.state.jobs.lock().unwrap();
+                    j.add("procdump", Some(tpid), Some(out.display().to_string()), &format!("procdump {on} trigger on pid {pid} -> {}", out.display()))
+                };
+                self.state.audit.record(tool, &format!("armed procdump job {}", job.id), None, "started", Some(&job.id));
+                Ok(text(
+                    Outcome::new(tool, format!("armed {on} trigger on pid {pid} (job {})", job.id))
+                        .data(json!({ "jobId": job.id, "targetPid": pid, "trigger": on, "backingFile": out.display().to_string(), "resource": format!("heisenberg://captures/{}", job.id) }))
+                        .command(cmd_str)
+                        .docs(docs)
+                        .warn("waiting for the trigger; the dump writes when it fires. Stop with job.stop/job.cancel. Full dumps are high-sensitivity.")
+                        .to_value(),
+                ))
+            }
+            Err(e) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch procdump: {e}"), "check the ProcDump path", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "service.startupDebug",
+        description = "Attach a debugger to an image at process start via the IFEO Debugger value — for a service that crashes or hangs on startup. State-changing, reversible via the ledger; needs elevation. dry_run + confirm."
+    )]
+    async fn service_startup_debug(
+        &self,
+        Parameters(a): Parameters<ServiceDebugArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "service.startupDebug";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/debugging-a-service";
+        let subkey = format!(
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\{}",
+            a.image
+        );
+        let prior = regutil::hklm_read_sz(&subkey, "Debugger");
+        let exists = regutil::hklm_key_exists(&subkey);
+        let debugger = match a.debugger.clone() {
+            Some(d) => d,
+            None => match self.state.locator.find("cdb.exe") {
+                Some(c) => format!("\"{}\" -server tcp:port=5005 -g", c.display()),
+                None => return Ok(text(error(tool, ErrorKind::InvalidArgument, "no debugger given and cdb.exe not found", "pass `debugger` or install the Debugging Tools for Windows", Some(docs)))),
+            },
+        };
+        let cmd = format!("reg add \"HKLM\\{subkey}\" /v Debugger /t REG_SZ /d \"{debugger}\" /f");
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would attach a debugger to {} at start (gate: {:?})", a.image, decision.gate))
+                    .data(json!({ "image": a.image, "debugger": debugger, "prior": prior, "gate": decision }))
+                    .command(cmd)
+                    .docs(docs)
+                    .warn("dry-run: no change made")
+                    .to_value(),
+            ));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing IFEO needs an elevated token", "re-run Heisenberg elevated", Some(docs))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "set-service-debugger", a.confirm.as_deref()) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs))));
+            }
+        };
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                &format!("IFEO Debugger for {}", a.image),
+                RevertPlan::RegRestore {
+                    subkey: subkey.clone(),
+                    strings: vec![("Debugger".to_string(), prior)],
+                    dwords: vec![],
+                    created_key: !exists,
+                },
+            )
+        };
+        match regutil::hklm_set_sz(&subkey, "Debugger", &debugger) {
+            Ok(_) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(tool, &format!("service debugger set for {}", a.image), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                Ok(text(
+                    Outcome::new(tool, format!("attached a debugger to {} at start; change {id}", a.image))
+                        .data(json!({ "image": a.image, "debugger": debugger, "changeId": id }))
+                        .command(cmd)
+                        .docs(docs)
+                        .warn("the debugger launches when the image starts; if a service times out at start, also raise HKLM\\SYSTEM\\CurrentControlSet\\Control\\ServicesPipeTimeout. Revert with changes.revert.")
+                        .to_value(),
+                ))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                let (k, remedy) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    (ErrorKind::RequiresElevation, "re-run elevated")
+                } else {
+                    (ErrorKind::Internal, "check IFEO permissions")
+                };
+                Ok(text(error(tool, k, format!("failed to write IFEO Debugger: {e}"), remedy, Some(docs))))
             }
         }
     }

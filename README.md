@@ -25,6 +25,8 @@ Tools today:
 | `inspect.processTree` / `inspect.network` / `inspect.verify` | Process tree (pid/ppid), active connections (netstat), and Authenticode signature checks. |
 | `dump.capture` | Capture a user-mode dump (full/mini) by pid or name. ProcDump if staged, else comsvcs. Disk pre-checked; full dumps marked high-sensitivity. |
 | `dump.onCrashInstall` | Configure WER LocalDumps so future crashes of an image (or all) auto-dump (reversible; needs elevation). |
+| `dump.onTrigger` | Arm ProcDump to dump on a trigger (exception / CPU / hang) as a background `job.*` capture. |
+| `service.startupDebug` | Attach a debugger to an image at process start (IFEO Debugger) for startup crashes/hangs (reversible; needs elevation). |
 | `postmortem.aeDebug` | Set the AeDebug JIT debugger so any unhandled crash drops to a scripted dump (reversible; needs elevation). |
 | `dump.analyze` | Open a dump in cdb (`!analyze -v`, stacks, modules) and return parsed + raw. Needs the Debugging Tools for Windows. |
 | `analyze.deadlock` / `analyze.highCpu` / `analyze.handles` / `analyze.async` / `analyze.verifierStop` | Targeted cdb analyses of a dump (lock contention, CPU by thread, handle leaks, .NET async, verifier stops). |
