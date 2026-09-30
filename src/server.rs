@@ -933,6 +933,134 @@ impl Heisenberg {
         Ok(text(out.to_value()))
     }
 
+    /// Resolve a dump ref (id or path), locate cdb, run a command set, return raw.
+    async fn run_cdb_on(
+        &self,
+        tool: &str,
+        dump_ref: &str,
+        cmds: &str,
+    ) -> Result<(String, String, String), CallToolResult> {
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/";
+        let path = {
+            let reg = self.state.dumps.lock().unwrap();
+            let id = dump_ref.trim_start_matches("heisenberg://dumps/");
+            reg.get(id).map(|r| r.path.clone()).unwrap_or_else(|| dump_ref.to_string())
+        };
+        if !std::path::Path::new(&path).is_file() {
+            return Err(text(error(tool, ErrorKind::TargetNotFound, format!("no dump at {path}"), "capture one with dump.capture, or pass a valid path", Some(docs))));
+        }
+        let cdb = match self.state.locator.find("cdb.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(tool, ErrorKind::ToolNotInstalled, "cdb.exe not found", "install the Debugging Tools for Windows (winget install Microsoft.WinDbg)", Some(docs));
+                v["error"]["wingetId"] = json!("Microsoft.WinDbg");
+                return Err(text(v));
+            }
+        };
+        let sympath = regutil::get_hkcu_env("_NT_SYMBOL_PATH").unwrap_or_else(|| {
+            format!("srv*{}*https://msdl.microsoft.com/download/symbols", self.state.store.root.join("symbols").display())
+        });
+        let cmd_str = format!("{} -z \"{}\" -y \"{}\" -c \"{}\"", cdb.display(), path, sympath, cmds);
+        let output = match tokio::time::timeout(
+            Duration::from_secs(300),
+            Command::new(&cdb).arg("-z").arg(&path).arg("-y").arg(&sympath).arg("-c").arg(cmds).output(),
+        )
+        .await
+        {
+            Err(_) => return Err(text(error(tool, ErrorKind::Timeout, "cdb timed out after 300s", "retry once symbols are cached", Some(docs)))),
+            Ok(Err(e)) => return Err(text(error(tool, ErrorKind::Internal, format!("failed to launch cdb: {e}"), "check the cdb path", Some(docs)))),
+            Ok(Ok(o)) => o,
+        };
+        Ok((path, String::from_utf8_lossy(&output.stdout).to_string(), cmd_str))
+    }
+
+    /// Shared body for the analyze.* family: run a fixed command set and return the raw tail.
+    async fn simple_analyze(
+        &self,
+        tool: &str,
+        dump: &str,
+        override_cmds: Option<&str>,
+        default_cmds: &str,
+    ) -> Result<CallToolResult, McpError> {
+        let cmds = override_cmds.unwrap_or(default_cmds);
+        match self.run_cdb_on(tool, dump, cmds).await {
+            Ok((path, raw, cmd_str)) => {
+                let sym_missing = raw.contains("symbols could not be loaded")
+                    || raw.contains("Symbol file could not be found");
+                let mut out = Outcome::new(tool, format!("ran {tool} on {path}"))
+                    .data(json!({ "path": path, "commands": cmds, "raw": last_chars(&raw, 8000) }))
+                    .command(cmd_str)
+                    .docs("https://learn.microsoft.com/windows-hardware/drivers/debugger/");
+                if sym_missing {
+                    out = out.warn("some symbols could not be loaded; results may be incomplete");
+                }
+                self.state.audit.record(tool, &format!("analyzed {path}"), None, "analyzed", None);
+                Ok(text(out.to_value()))
+            }
+            Err(ct) => Ok(ct),
+        }
+    }
+
+    #[tool(
+        name = "analyze.deadlock",
+        description = "Analyze a dump for lock / critical-section / .NET monitor contention (!locks, !cs, !syncblk, all-thread stacks). Read-only; needs cdb."
+    )]
+    async fn analyze_deadlock(
+        &self,
+        Parameters(a): Parameters<DumpAnalyzeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.simple_analyze("analyze.deadlock", &a.dump, a.commands.as_deref(), "!locks; !cs -l; !syncblk; ~*kb; q")
+            .await
+    }
+
+    #[tool(
+        name = "analyze.highCpu",
+        description = "Attribute CPU in a dump to threads (!runaway) with their stacks. Read-only; needs cdb."
+    )]
+    async fn analyze_high_cpu(
+        &self,
+        Parameters(a): Parameters<DumpAnalyzeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.simple_analyze("analyze.highCpu", &a.dump, a.commands.as_deref(), "!runaway 7; ~*kb; q")
+            .await
+    }
+
+    #[tool(
+        name = "analyze.handles",
+        description = "Summarize handle usage in a dump (!handle) — for handle-leak hunting. Read-only; needs cdb."
+    )]
+    async fn analyze_handles(
+        &self,
+        Parameters(a): Parameters<DumpAnalyzeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.simple_analyze("analyze.handles", &a.dump, a.commands.as_deref(), "!handle 0 2; q")
+            .await
+    }
+
+    #[tool(
+        name = "analyze.async",
+        description = "Analyze a managed (.NET) dump for async/threadpool state (!dumpasync, !threadpool). Read-only; needs cdb with SOS."
+    )]
+    async fn analyze_async(
+        &self,
+        Parameters(a): Parameters<DumpAnalyzeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.simple_analyze("analyze.async", &a.dump, a.commands.as_deref(), "!dumpasync; !threadpool; q")
+            .await
+    }
+
+    #[tool(
+        name = "analyze.verifierStop",
+        description = "Decode a Driver/Application Verifier stop in a dump (!analyze -v, !verifier) to the exact rule violated. Read-only; needs cdb."
+    )]
+    async fn analyze_verifier_stop(
+        &self,
+        Parameters(a): Parameters<DumpAnalyzeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.simple_analyze("analyze.verifierStop", &a.dump, a.commands.as_deref(), "!analyze -v; !verifier 3; q")
+            .await
+    }
+
     #[tool(
         name = "gflags.get",
         description = "Show the IFEO GlobalFlag / PageHeapFlags for an image (e.g. \"myapp.exe\") — i.e. whether full page heap is enabled. Read-only."
