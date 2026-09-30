@@ -23,6 +23,32 @@ pub const KNOWN_TOOLS: &[(&str, &str)] = &[
     ("poolmon", "poolmon.exe"),
 ];
 
+/// How a known tool is installed.
+pub enum InstallMethod {
+    Winget(&'static str),
+    DotnetTool(&'static str),
+}
+
+/// Map an install key to its method, or None if we don't know how.
+pub fn install_method(key: &str) -> Option<InstallMethod> {
+    Some(match key.to_ascii_lowercase().as_str() {
+        "procdump" => InstallMethod::Winget("Microsoft.Sysinternals.ProcDump"),
+        "procmon" => InstallMethod::Winget("Microsoft.Sysinternals.ProcessMonitor"),
+        "autoruns" => InstallMethod::Winget("Microsoft.Sysinternals.Autoruns"),
+        "psexec" => InstallMethod::Winget("Microsoft.Sysinternals.PsExec"),
+        "sysinternals" | "sysinternals-suite" => InstallMethod::Winget("Microsoft.Sysinternals"),
+        "windbg" | "ttd" => InstallMethod::Winget("Microsoft.WinDbg"),
+        // The classic Debugging Tools (cdb/gflags/umdh/symchk) + WPT ship in the SDK.
+        "windows-sdk" | "sdk" | "cdb" | "gflags" | "umdh" | "symchk" | "wpr" | "wpt" => {
+            InstallMethod::Winget("Microsoft.WindowsSDK")
+        }
+        "dotnet-dump" => InstallMethod::DotnetTool("dotnet-dump"),
+        "dotnet-gcdump" => InstallMethod::DotnetTool("dotnet-gcdump"),
+        "dotnet-trace" => InstallMethod::DotnetTool("dotnet-trace"),
+        _ => return None,
+    })
+}
+
 pub struct Locator {
     dirs: Vec<PathBuf>,
 }

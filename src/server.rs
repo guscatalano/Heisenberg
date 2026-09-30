@@ -174,6 +174,17 @@ fn default_dbgsrv_port() -> u32 {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ToolsInstallArgs {
+    /// What to install: procdump, procmon, autoruns, psexec, sysinternals,
+    /// windbg, windows-sdk, dotnet-dump, dotnet-gcdump, dotnet-trace.
+    pub tool: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct LeakDiffArgs {
     /// Baseline UMDH snapshot path (from leak.heapSnapshot).
     pub baseline: String,
@@ -883,6 +894,101 @@ impl Heisenberg {
             .data(json!({ "tools": inv }))
             .to_value();
         Ok(text(v))
+    }
+
+    #[tool(
+        name = "tools.install",
+        description = "Install a known tool via winget or the dotnet CLI (procdump, procmon, autoruns, psexec, sysinternals, windbg, windows-sdk, dotnet-dump/-gcdump/-trace). State-changing, gated; accepts EULAs non-interactively; recorded in the ledger so it can be uninstalled via changes.revert. Needs network — on air-gapped boxes stage a --tools-dir bundle instead. dry_run + confirm."
+    )]
+    async fn tools_install(
+        &self,
+        Parameters(a): Parameters<ToolsInstallArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "tools.install";
+        let docs = "https://learn.microsoft.com/windows/package-manager/winget/install";
+        let method = match crate::tools::install_method(&a.tool) {
+            Some(m) => m,
+            None => {
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::InvalidArgument,
+                    format!("don't know how to install '{}'", a.tool),
+                    "known: procdump, procmon, autoruns, psexec, sysinternals, windbg, windows-sdk, dotnet-dump, dotnet-gcdump, dotnet-trace",
+                    Some(docs),
+                )))
+            }
+        };
+        let (program, args_vec, revert, label): (&str, Vec<String>, RevertPlan, String) = match &method {
+            crate::tools::InstallMethod::Winget(id) => (
+                "winget",
+                vec![
+                    "install".into(), "--id".into(), id.to_string(), "-e".into(),
+                    "--accept-source-agreements".into(), "--accept-package-agreements".into(),
+                    "--disable-interactivity".into(),
+                ],
+                RevertPlan::Command {
+                    program: "winget".into(),
+                    args: vec!["uninstall".into(), "--id".into(), id.to_string(), "-e".into(), "--disable-interactivity".into()],
+                    describe: format!("winget uninstall {id}"),
+                },
+                format!("winget id {id}"),
+            ),
+            crate::tools::InstallMethod::DotnetTool(pkg) => (
+                "dotnet",
+                vec!["tool".into(), "install".into(), "-g".into(), pkg.to_string()],
+                RevertPlan::Command {
+                    program: "dotnet".into(),
+                    args: vec!["tool".into(), "uninstall".into(), "-g".into(), pkg.to_string()],
+                    describe: format!("dotnet tool uninstall -g {pkg}"),
+                },
+                format!("dotnet tool {pkg}"),
+            ),
+        };
+        let cmd_str = format!("{program} {}", args_vec.join(" "));
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would install {} via {label} (gate: {:?})", a.tool, decision.gate))
+                    .data(json!({ "tool": a.tool, "method": label, "gate": decision }))
+                    .command(cmd_str)
+                    .docs(docs)
+                    .warn("dry-run: no change made; needs network. On air-gapped boxes stage a --tools-dir bundle instead.")
+                    .to_value(),
+            ));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "install-tool", a.confirm.as_deref()) {
+            Ok(d) => d,
+            Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs)))); }
+        };
+        let id = { let mut l = self.state.ledger.lock().unwrap(); l.begin(tool, &format!("install {} ({label})", a.tool), revert) };
+        let argrefs: Vec<&str> = args_vec.iter().map(|s| s.as_str()).collect();
+        let (ok, out) = self.run_capture(program, &argrefs, 600).await;
+        if ok {
+            self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+            self.state.audit.record(tool, &format!("installed {}", a.tool), Some(&format!("{:?}", decision.gate)), "installed", Some(&id));
+            Ok(text(
+                Outcome::new(tool, format!("installed {} via {label}; change {id}", a.tool))
+                    .data(json!({ "tool": a.tool, "method": label, "changeId": id, "output": last_chars(&out, 3000) }))
+                    .command(cmd_str)
+                    .docs(docs)
+                    .warn("re-run tools.list / env.check to confirm the tool resolves; a new shell may be needed for PATH. Uninstall via changes.revert.")
+                    .to_value(),
+            ))
+        } else {
+            self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+            let low = out.to_lowercase();
+            let k = if low.contains("admin") || low.contains("elevat") {
+                ErrorKind::RequiresElevation
+            } else if low.contains("launch error") || low.contains("not found") {
+                ErrorKind::ToolNotInstalled
+            } else {
+                ErrorKind::ToolInstallFailed
+            };
+            let mut v = error(tool, k, format!("install of {} failed", a.tool), "check network/winget availability; on air-gapped boxes stage a --tools-dir bundle", Some(docs));
+            v["error"]["output"] = json!(last_chars(&out, 3000));
+            Ok(text(v))
+        }
     }
 
     #[tool(
