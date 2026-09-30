@@ -19,6 +19,7 @@ mod proc;
 mod regutil;
 mod server;
 mod session;
+mod signing;
 mod store;
 mod tools;
 
@@ -28,6 +29,29 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Offline CLI subcommands for policy signing (no server, no tracing).
+    let args: Vec<String> = std::env::args().collect();
+    match args.get(1).map(|s| s.as_str()) {
+        Some("keygen") => {
+            let (pk, sk) = signing::keygen();
+            println!("public  (trust this; HEISENBERG_TRUSTED_KEY or trusted_key.pub):\n{pk}");
+            println!("\nprivate (keep secret; used to sign policies):\n{sk}");
+            return Ok(());
+        }
+        Some("sign") => {
+            let policy = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: heisenberg sign <policy.json> <privkey-file>"))?;
+            let keyfile = args.get(3).ok_or_else(|| anyhow::anyhow!("usage: heisenberg sign <policy.json> <privkey-file>"))?;
+            let bytes = std::fs::read(policy)?;
+            let key = std::fs::read_to_string(keyfile)?;
+            let sig = signing::sign(&bytes, key.trim()).map_err(|e| anyhow::anyhow!(e))?;
+            let out = format!("{policy}.sig");
+            std::fs::write(&out, sig)?;
+            println!("wrote {out}");
+            return Ok(());
+        }
+        _ => {}
+    }
+
     // Logs go to stderr; stdout is reserved for the MCP JSON-RPC stream.
     tracing_subscriber::fmt()
         .with_env_filter(

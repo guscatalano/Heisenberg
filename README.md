@@ -92,9 +92,17 @@ absent/malformed/unverified, fails safe to `Critical`.
   `HEISENBERG_POLICY`.
 - **Format:** `{ "class": "sandbox" | "development" | "production" | "critical",
   "overrides": { "<tool>": "allow" | "confirm-token" | "human-approval" | "deny" } }`
-- **Trust:** signature verification is a later phase. Until then a policy is
-  `Unverified` (clamped to `Critical`) unless the operator sets
-  `HEISENBERG_TRUST_UNSIGNED=1` — a dev/test escape hatch, not for production.
+- **Trust:** a policy is trusted only when a detached ed25519 signature
+  (`policy.json.sig`) verifies against a trusted public key — otherwise it is
+  `Unverified` and clamped to `Critical`. The key comes from
+  `HEISENBERG_TRUSTED_KEY`, a compile-time `HEISENBERG_TRUSTED_KEY_B64`, or
+  `%ProgramData%\Heisenberg\trusted_key.pub`. `HEISENBERG_TRUST_UNSIGNED=1` is a
+  dev/test escape hatch only.
+
+  ```powershell
+  heisenberg keygen                       # prints a public + private key
+  heisenberg sign policy.json priv.key    # writes policy.json.sig
+  ```
 
 Gate matrix (box class × effect tier):
 
