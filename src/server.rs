@@ -943,6 +943,30 @@ impl Heisenberg {
                 },
                 format!("dotnet tool {pkg}"),
             ),
+            crate::tools::InstallMethod::DirectZip { url, exe } => {
+                let dir = crate::tools::MANAGED_TOOLS_DIR;
+                let script = format!(
+                    "$d='{dir}'; New-Item -ItemType Directory -Force $d | Out-Null; \
+                     $z=Join-Path $env:TEMP ('hb_'+[guid]::NewGuid().ToString('N')+'.zip'); \
+                     Invoke-WebRequest -UseBasicParsing -Uri '{url}' -OutFile $z; \
+                     Expand-Archive -LiteralPath $z -DestinationPath $d -Force; \
+                     Remove-Item $z -Force; (Get-Item (Join-Path $d '{exe}')).FullName"
+                );
+                (
+                    "powershell",
+                    vec!["-NoProfile".into(), "-NonInteractive".into(), "-Command".into(), script],
+                    RevertPlan::Command {
+                        program: "powershell".into(),
+                        args: vec![
+                            "-NoProfile".into(),
+                            "-Command".into(),
+                            format!("Remove-Item -Force -ErrorAction SilentlyContinue '{dir}\\{exe}'"),
+                        ],
+                        describe: format!("remove {exe} from the managed tools dir"),
+                    },
+                    format!("direct download {url}"),
+                )
+            }
         };
         let cmd_str = format!("{program} {}", args_vec.join(" "));
 

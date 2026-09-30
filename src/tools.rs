@@ -27,16 +27,40 @@ pub const KNOWN_TOOLS: &[(&str, &str)] = &[
 pub enum InstallMethod {
     Winget(&'static str),
     DotnetTool(&'static str),
+    /// Download a zip from a public URL and extract into the managed tools dir.
+    DirectZip { url: &'static str, exe: &'static str },
 }
+
+/// The managed directory that direct-download tools extract into (searched by
+/// the locator).
+pub const MANAGED_TOOLS_DIR: &str = r"C:\ProgramData\Heisenberg\tools";
 
 /// Map an install key to its method, or None if we don't know how.
 pub fn install_method(key: &str) -> Option<InstallMethod> {
     Some(match key.to_ascii_lowercase().as_str() {
-        "procdump" => InstallMethod::Winget("Microsoft.Sysinternals.ProcDump"),
-        "procmon" => InstallMethod::Winget("Microsoft.Sysinternals.ProcessMonitor"),
-        "autoruns" => InstallMethod::Winget("Microsoft.Sysinternals.Autoruns"),
-        "psexec" => InstallMethod::Winget("Microsoft.Sysinternals.PsExec"),
-        "sysinternals" | "sysinternals-suite" => InstallMethod::Winget("Microsoft.Sysinternals"),
+        // Sysinternals in winget lives only in the `msstore` source, which can't
+        // install non-interactively (it demands store terms + geo consent). The
+        // official direct downloads are the robust path.
+        "procdump" => InstallMethod::DirectZip {
+            url: "https://download.sysinternals.com/files/Procdump.zip",
+            exe: "procdump.exe",
+        },
+        "procmon" => InstallMethod::DirectZip {
+            url: "https://download.sysinternals.com/files/ProcessMonitor.zip",
+            exe: "Procmon.exe",
+        },
+        "autoruns" => InstallMethod::DirectZip {
+            url: "https://download.sysinternals.com/files/Autoruns.zip",
+            exe: "autorunsc.exe",
+        },
+        "psexec" => InstallMethod::DirectZip {
+            url: "https://download.sysinternals.com/files/PSTools.zip",
+            exe: "PsExec.exe",
+        },
+        "sysinternals" | "sysinternals-suite" => InstallMethod::DirectZip {
+            url: "https://download.sysinternals.com/files/SysinternalsSuite.zip",
+            exe: "procdump.exe",
+        },
         "windbg" | "ttd" => InstallMethod::Winget("Microsoft.WinDbg"),
         // The classic Debugging Tools (cdb/gflags/umdh/symchk) + WPT ship in the SDK.
         "windows-sdk" | "sdk" | "cdb" | "gflags" | "umdh" | "symchk" | "wpr" | "wpt" => {
@@ -121,6 +145,8 @@ fn known_dirs() -> Vec<PathBuf> {
         // wpr.exe and rundll32/comsvcs live here.
         v.push(PathBuf::from(&sr).join("System32"));
     }
+    // Managed dir where tools.install extracts direct-download tools.
+    v.push(PathBuf::from(MANAGED_TOOLS_DIR));
     // dotnet global tools (dotnet-dump / -gcdump / -trace).
     if let Ok(up) = std::env::var("USERPROFILE") {
         v.push(PathBuf::from(&up).join(r".dotnet\tools"));
