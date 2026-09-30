@@ -83,6 +83,49 @@ pub fn list_processes() -> Vec<(u32, String)> {
     out
 }
 
+/// Like `list_processes` but also returns each process's parent pid.
+#[cfg(windows)]
+pub fn list_processes_ext() -> Vec<(u32, u32, String)> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let mut out = Vec::new();
+    unsafe {
+        let snap = match CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) {
+            Ok(s) => s,
+            Err(_) => return out,
+        };
+        let mut e = PROCESSENTRY32W {
+            dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+            ..Default::default()
+        };
+        if Process32FirstW(snap, &mut e).is_ok() {
+            loop {
+                let len = e
+                    .szExeFile
+                    .iter()
+                    .position(|&c| c == 0)
+                    .unwrap_or(e.szExeFile.len());
+                let name = String::from_utf16_lossy(&e.szExeFile[..len]);
+                out.push((e.th32ProcessID, e.th32ParentProcessID, name));
+                if Process32NextW(snap, &mut e).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn list_processes_ext() -> Vec<(u32, u32, String)> {
+    Vec::new()
+}
+
 #[cfg(windows)]
 pub fn working_set(pid: u32) -> Option<u64> {
     use windows::Win32::Foundation::CloseHandle;

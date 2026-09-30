@@ -275,6 +275,12 @@ pub struct CollectPackageArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PathArg {
+    /// Absolute path to the file.
+    pub path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ArtifactsPurgeArgs {
     /// Only purge artifacts older than this many days (default: all candidates).
     #[serde(default)]
@@ -336,6 +342,28 @@ pub struct KernelNetArgs {
     pub dry_run: bool,
     #[serde(default)]
     pub confirm: Option<String>,
+}
+
+fn build_proc_node(
+    pid: u32,
+    info: &std::collections::HashMap<u32, String>,
+    children: &std::collections::HashMap<u32, Vec<u32>>,
+    depth: u32,
+) -> serde_json::Value {
+    let kids: Vec<serde_json::Value> = if depth > 30 {
+        Vec::new()
+    } else {
+        children
+            .get(&pid)
+            .map(|v| {
+                v.iter()
+                    .filter(|c| **c != pid)
+                    .map(|c| build_proc_node(*c, info, children, depth + 1))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    json!({ "pid": pid, "name": info.get(&pid).cloned().unwrap_or_default(), "children": kids })
 }
 
 fn comsvcs_path() -> std::path::PathBuf {
@@ -2603,6 +2631,138 @@ impl Heisenberg {
                 .data(json!({ "dryRun": false, "deleted": deleted, "freedBytes": freed }))
                 .to_value(),
         ))
+    }
+
+    /// Run a command and capture combined stdout+stderr (best-effort).
+    async fn run_capture(&self, program: &str, args: &[&str], secs: u64) -> (bool, String) {
+        match tokio::time::timeout(
+            Duration::from_secs(secs),
+            Command::new(program).args(args).output(),
+        )
+        .await
+        {
+            Ok(Ok(o)) => (
+                o.status.success(),
+                format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&o.stdout),
+                    String::from_utf8_lossy(&o.stderr)
+                ),
+            ),
+            Ok(Err(e)) => (false, format!("launch error: {e}")),
+            Err(_) => (false, "timed out".to_string()),
+        }
+    }
+
+    #[tool(
+        name = "system.triage",
+        description = "First-response triage on a (possibly broken) box: OS/system info, services, tasklist /svc, boot config, driver list, detected hypervisor, and key log locations. Read-only. The first thing to run on arrival."
+    )]
+    async fn system_triage(&self) -> Result<CallToolResult, McpError> {
+        let (_, systeminfo) = self.run_capture("systeminfo", &[], 60).await;
+        let (_, services) = self.run_capture("sc", &["query", "state=", "all"], 30).await;
+        let (_, tasks) = self.run_capture("tasklist", &["/svc"], 30).await;
+        let (bcd_ok, bcd) = self.run_capture("bcdedit", &["/enum", "{current}"], 20).await;
+        let (_, drivers) = self.run_capture("driverquery", &["/v"], 30).await;
+        let sr = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+        let hv = kernel::detect_hypervisor();
+        let v = Outcome::new(
+            "system.triage",
+            format!("triage gathered on {} ({hv})", crate::store::hostname()),
+        )
+        .data(json!({
+            "hypervisor": hv,
+            "systeminfo": last_chars(&systeminfo, 4000),
+            "services": last_chars(&services, 4000),
+            "tasklist": last_chars(&tasks, 4000),
+            "bootConfig": if bcd_ok { bcd } else { format!("(needs elevation) {}", bcd.trim()) },
+            "drivers": last_chars(&drivers, 3000),
+            "logLocations": [
+                format!("{sr}\\Logs\\CBS\\CBS.log"),
+                format!("{sr}\\Minidump"),
+                format!("{sr}\\LiveKernelReports"),
+                format!("{sr}\\MEMORY.DMP"),
+                r"%ProgramData%\Microsoft\Windows\WER\ReportQueue",
+            ],
+        }))
+        .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "inspect.verify",
+        description = "Verify an executable's Authenticode signature (status, signer, thumbprint) via Get-AuthenticodeSignature. Read-only."
+    )]
+    async fn inspect_verify(
+        &self,
+        Parameters(a): Parameters<PathArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "inspect.verify";
+        if !std::path::Path::new(&a.path).is_file() {
+            return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no file at {}", a.path), "pass a valid file path", None)));
+        }
+        let escaped = a.path.replace('\'', "''");
+        let ps = format!(
+            "(Get-AuthenticodeSignature -LiteralPath '{escaped}') | Select-Object Status,StatusMessage,@{{n='Signer';e={{$_.SignerCertificate.Subject}}}},@{{n='Thumbprint';e={{$_.SignerCertificate.Thumbprint}}}} | ConvertTo-Json -Compress"
+        );
+        let (_, out) = self
+            .run_capture("powershell", &["-NoProfile", "-NonInteractive", "-Command", ps.as_str()], 30)
+            .await;
+        let parsed: serde_json::Value =
+            serde_json::from_str(out.trim()).unwrap_or_else(|_| json!({ "raw": out.trim() }));
+        let status = parsed.get("Status").and_then(|v| v.as_str()).unwrap_or("?").to_string();
+        let v = Outcome::new(tool, format!("{}: {status}", a.path))
+            .data(json!({ "path": a.path, "signature": parsed }))
+            .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "inspect.network",
+        description = "List active TCP/UDP connections with owning pids (netstat -ano). Read-only."
+    )]
+    async fn inspect_network(&self) -> Result<CallToolResult, McpError> {
+        let (_, out) = self.run_capture("netstat", &["-ano"], 30).await;
+        let conns = out
+            .lines()
+            .filter(|l| {
+                let t = l.trim_start();
+                t.starts_with("TCP") || t.starts_with("UDP")
+            })
+            .count();
+        let v = Outcome::new("inspect.network", format!("{conns} connection(s)"))
+            .data(json!({ "connections": conns, "raw": last_chars(&out, 6000) }))
+            .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "inspect.processTree",
+        description = "Enumerate running processes as a tree (pid, ppid, name) from a Toolhelp snapshot. Read-only."
+    )]
+    async fn inspect_process_tree(&self) -> Result<CallToolResult, McpError> {
+        use std::collections::HashMap;
+        let procs = proc::list_processes_ext();
+        let mut info: HashMap<u32, String> = HashMap::new();
+        let mut children: HashMap<u32, Vec<u32>> = HashMap::new();
+        for (pid, ppid, name) in &procs {
+            info.insert(*pid, name.clone());
+            children.entry(*ppid).or_default().push(*pid);
+        }
+        // Roots: processes whose parent is not itself a live pid (or self-parent).
+        let roots: Vec<u32> = procs
+            .iter()
+            .filter(|(pid, ppid, _)| !info.contains_key(ppid) || ppid == pid)
+            .map(|(pid, _, _)| *pid)
+            .collect();
+        let tree: Vec<serde_json::Value> = roots
+            .iter()
+            .map(|r| build_proc_node(*r, &info, &children, 0))
+            .collect();
+        let v = Outcome::new("inspect.processTree", format!("{} processes", procs.len()))
+            .data(json!({ "count": procs.len(), "tree": tree }))
+            .to_value();
+        Ok(text(v))
     }
 }
 

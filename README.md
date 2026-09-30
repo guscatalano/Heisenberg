@@ -21,6 +21,8 @@ Tools today:
 | `env.check` | Probe OS build/edition, architecture (incl. WOW64), integrity level, privileges (SeDebug/SeTcb), session id, derived capabilities. Read-only. |
 | `policy.show` / `gate.check` | Show the box class + gate matrix; test what gate a proposed tool+tier would face, without running anything. |
 | `tools.list` | Inventory the external tools Heisenberg drives — found (with path) vs missing — each with its doc link. |
+| `system.triage` | First-response gather on a broken box: systeminfo, services, tasklist, boot config, drivers, hypervisor, log locations. |
+| `inspect.processTree` / `inspect.network` / `inspect.verify` | Process tree (pid/ppid), active connections (netstat), and Authenticode signature checks. |
 | `dump.capture` | Capture a user-mode dump (full/mini) by pid or name. ProcDump if staged, else comsvcs. Disk pre-checked; full dumps marked high-sensitivity. |
 | `dump.analyze` | Open a dump in cdb (`!analyze -v`, stacks, modules) and return parsed + raw. Needs the Debugging Tools for Windows. |
 | `analyze.deadlock` / `analyze.highCpu` / `analyze.handles` / `analyze.async` / `analyze.verifierStop` | Targeted cdb analyses of a dump (lock contention, CPU by thread, handle leaks, .NET async, verifier stops). |
