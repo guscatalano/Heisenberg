@@ -14,6 +14,14 @@ use crate::{regutil, store};
 pub enum RevertPlan {
     /// Restore an `HKCU\Environment` value to its prior state (`None` = delete).
     HkcuEnv { name: String, prior: Option<String> },
+    /// Restore IFEO GlobalFlag/PageHeapFlags for an image (or delete the key if we
+    /// created it) — undoes a gflags page-heap change.
+    IfeoFlags {
+        image: String,
+        prior_global_flag: Option<u32>,
+        prior_page_heap: Option<u32>,
+        created_key: bool,
+    },
     /// A change we can describe but not yet undo automatically.
     Manual { instructions: String },
 }
@@ -23,6 +31,15 @@ impl RevertPlan {
         match self {
             RevertPlan::HkcuEnv { name, prior } => {
                 regutil::restore_hkcu_env(name, prior.as_deref())?;
+                Ok(())
+            }
+            RevertPlan::IfeoFlags {
+                image,
+                prior_global_flag,
+                prior_page_heap,
+                created_key,
+            } => {
+                regutil::ifeo_restore(image, *prior_global_flag, *prior_page_heap, *created_key)?;
                 Ok(())
             }
             RevertPlan::Manual { instructions } => {

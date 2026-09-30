@@ -28,6 +28,14 @@ const SYMBOLS_TOKEN: &str = "set-symbol-path";
 const SYMBOL_PATH_DOCS: &str =
     "https://learn.microsoft.com/windows-hardware/drivers/debugger/symbol-path";
 
+const GFLAGS_TOKEN: &str = "set-gflags";
+const GFLAGS_DOCS: &str =
+    "https://learn.microsoft.com/windows-hardware/drivers/debugger/gflags-and-pageheap";
+/// FLG_HEAP_PAGE_ALLOCS ("hpa") in the IFEO GlobalFlag.
+const FLG_HEAP_PAGE_ALLOCS: u32 = 0x0200_0000;
+/// PageHeapFlags value for *full* page heap.
+const PAGE_HEAP_FULL: u32 = 0x3;
+
 /// Shared server state: the immutable policy plus the on-disk ledger and audit.
 pub struct AppState {
     pub policy: Policy,
@@ -112,6 +120,24 @@ pub struct DumpAnalyzeArgs {
     /// Optional cdb command string (default: "!analyze -v; ~*k; lm t; q").
     #[serde(default)]
     pub commands: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GflagsGetArgs {
+    /// Image name, e.g. "myapp.exe".
+    pub image: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GflagsSetArgs {
+    /// Image name, e.g. "myapp.exe".
+    pub image: String,
+    /// Preview the change without writing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Confirm token ("set-gflags") when the box requires one.
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 fn comsvcs_path() -> std::path::PathBuf {
@@ -746,6 +772,146 @@ impl Heisenberg {
         }
         self.state.audit.record(tool, &format!("analyzed {path}"), None, "analyzed", None);
         Ok(text(out.to_value()))
+    }
+
+    #[tool(
+        name = "gflags.get",
+        description = "Show the IFEO GlobalFlag / PageHeapFlags for an image (e.g. \"myapp.exe\") — i.e. whether full page heap is enabled. Read-only."
+    )]
+    async fn gflags_get(
+        &self,
+        Parameters(a): Parameters<GflagsGetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let (gf, ph, exists) = regutil::ifeo_read(&a.image);
+        let full = ph == Some(PAGE_HEAP_FULL)
+            && gf.map(|g| g & FLG_HEAP_PAGE_ALLOCS != 0).unwrap_or(false);
+        let state = if full {
+            "FULL"
+        } else if exists {
+            "partial/other"
+        } else {
+            "off"
+        };
+        let v = Outcome::new("gflags.get", format!("{}: page heap {state}", a.image))
+            .data(json!({
+                "image": a.image, "keyExists": exists,
+                "globalFlag": gf, "pageHeapFlags": ph, "fullPageHeap": full
+            }))
+            .docs(GFLAGS_DOCS)
+            .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "gflags.set",
+        description = "Enable full page heap for an image via IFEO (state-changing, reversible via the ledger; needs elevation). Supports dry_run; confirm token on Production, human approval on Critical. Disable by reverting the change."
+    )]
+    async fn gflags_set(
+        &self,
+        Parameters(a): Parameters<GflagsSetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "gflags.set";
+        let image = a.image.clone();
+        let (prior_gf, prior_ph, exists) = regutil::ifeo_read(&image);
+        let cmd = format!("gflags /p /enable {image} /full");
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            self.state.audit.record(tool, "dry-run", Some(&format!("{:?}", decision.gate)), "dry-run", None);
+            let v = Outcome::new(
+                tool,
+                format!("[dry-run] would enable full page heap for {image} (gate: {:?})", decision.gate),
+            )
+            .data(json!({
+                "image": image,
+                "prior": { "globalFlag": prior_gf, "pageHeapFlags": prior_ph },
+                "wouldSet": { "globalFlag": FLG_HEAP_PAGE_ALLOCS, "pageHeapFlags": PAGE_HEAP_FULL },
+                "gate": decision
+            }))
+            .command(cmd)
+            .docs(GFLAGS_DOCS)
+            .warn("dry-run: no change made")
+            .to_value();
+            return Ok(text(v));
+        }
+
+        if !env_probe::is_elevated() {
+            self.state.audit.record(tool, "not elevated", None, "blocked", None);
+            return Ok(text(error(
+                tool,
+                ErrorKind::RequiresElevation,
+                "writing IFEO page-heap flags needs an elevated (admin) token",
+                "re-run Heisenberg elevated, or via the elevated broker",
+                Some(GFLAGS_DOCS),
+            )));
+        }
+
+        let decision = match gate::enforce(
+            &self.state.policy,
+            tool,
+            EffectTier::StateChanging,
+            GFLAGS_TOKEN,
+            a.confirm.as_deref(),
+        ) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(GFLAGS_DOCS))));
+            }
+        };
+
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                &format!("enable full page heap for {image}"),
+                RevertPlan::IfeoFlags {
+                    image: image.clone(),
+                    prior_global_flag: prior_gf,
+                    prior_page_heap: prior_ph,
+                    created_key: !exists,
+                },
+            )
+        };
+
+        match regutil::ifeo_write(&image, FLG_HEAP_PAGE_ALLOCS, PAGE_HEAP_FULL) {
+            Ok(_) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(
+                    tool,
+                    &format!("enabled full page heap for {image}"),
+                    Some(&format!("{:?}", decision.gate)),
+                    "applied",
+                    Some(&id),
+                );
+                let v = Outcome::new(tool, format!("enabled full page heap for {image}; change {id}"))
+                    .data(json!({
+                        "image": image, "globalFlag": FLG_HEAP_PAGE_ALLOCS,
+                        "pageHeapFlags": PAGE_HEAP_FULL, "changeId": id
+                    }))
+                    .command(cmd)
+                    .docs(GFLAGS_DOCS)
+                    .warn("full page heap sharply increases the target's memory use and can stop it starting; revert with changes.revert when done")
+                    .to_value();
+                Ok(text(v))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                let (kind, remedy) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    (ErrorKind::RequiresElevation, "re-run elevated to write IFEO")
+                } else {
+                    (ErrorKind::Internal, "check the image name and HKLM IFEO permissions")
+                };
+                self.state.audit.record(tool, &format!("apply failed: {e}"), None, "failed", Some(&id));
+                Ok(text(error(
+                    tool,
+                    kind,
+                    format!("failed to write IFEO for {image}: {e}"),
+                    remedy,
+                    Some(GFLAGS_DOCS),
+                )))
+            }
+        }
     }
 }
 

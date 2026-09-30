@@ -137,6 +137,18 @@ pub fn probe() -> EnvReport {
     }
 }
 
+/// Lightweight check: is the current process running elevated? Used by tools that
+/// need admin (e.g. writing IFEO) to fail fast with RequiresElevation.
+#[cfg(windows)]
+pub fn is_elevated() -> bool {
+    win::token_info().is_elevated
+}
+
+#[cfg(not(windows))]
+pub fn is_elevated() -> bool {
+    false
+}
+
 #[cfg(not(windows))]
 pub fn probe() -> EnvReport {
     EnvReport {
