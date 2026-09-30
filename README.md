@@ -24,6 +24,8 @@ Tools today:
 | `system.triage` | First-response gather on a broken box: systeminfo, services, tasklist, boot config, drivers, hypervisor, log locations. |
 | `inspect.processTree` / `inspect.network` / `inspect.verify` | Process tree (pid/ppid), active connections (netstat), and Authenticode signature checks. |
 | `dump.capture` | Capture a user-mode dump (full/mini) by pid or name. ProcDump if staged, else comsvcs. Disk pre-checked; full dumps marked high-sensitivity. |
+| `dump.onCrashInstall` | Configure WER LocalDumps so future crashes of an image (or all) auto-dump (reversible; needs elevation). |
+| `postmortem.aeDebug` | Set the AeDebug JIT debugger so any unhandled crash drops to a scripted dump (reversible; needs elevation). |
 | `dump.analyze` | Open a dump in cdb (`!analyze -v`, stacks, modules) and return parsed + raw. Needs the Debugging Tools for Windows. |
 | `analyze.deadlock` / `analyze.highCpu` / `analyze.handles` / `analyze.async` / `analyze.verifierStop` | Targeted cdb analyses of a dump (lock contention, CPU by thread, handle leaks, .NET async, verifier stops). |
 | `gflags.get` / `gflags.set` | Show / enable full page heap for an image via IFEO (reversible via the ledger; `dry_run` + confirm token; needs elevation). Disable by reverting the change. |

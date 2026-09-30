@@ -159,6 +159,121 @@ pub fn crashcontrol_restore(prior: Option<u32>) -> std::io::Result<()> {
     }
 }
 
+// --- Generic HKLM helpers (for AeDebug, WER LocalDumps, IFEO Debugger, ...) ---
+
+#[cfg(windows)]
+pub fn hklm_read_sz(subkey: &str, name: &str) -> Option<String> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(subkey)
+        .ok()?
+        .get_value::<String, _>(name)
+        .ok()
+}
+
+#[cfg(windows)]
+pub fn hklm_read_dword(subkey: &str, name: &str) -> Option<u32> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(subkey)
+        .ok()?
+        .get_value::<u32, _>(name)
+        .ok()
+}
+
+#[cfg(windows)]
+pub fn hklm_key_exists(subkey: &str) -> bool {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey(subkey).is_ok()
+}
+
+#[cfg(windows)]
+pub fn hklm_set_sz(subkey: &str, name: &str, val: &str) -> std::io::Result<bool> {
+    use winreg::enums::{RegDisposition, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+    let (k, disp) = RegKey::predef(HKEY_LOCAL_MACHINE).create_subkey(subkey)?;
+    k.set_value(name, &val.to_string())?;
+    Ok(disp == RegDisposition::REG_CREATED_NEW_KEY)
+}
+
+#[cfg(windows)]
+pub fn hklm_set_dword(subkey: &str, name: &str, val: u32) -> std::io::Result<bool> {
+    use winreg::enums::{RegDisposition, HKEY_LOCAL_MACHINE};
+    use winreg::RegKey;
+    let (k, disp) = RegKey::predef(HKEY_LOCAL_MACHINE).create_subkey(subkey)?;
+    k.set_value(name, &val)?;
+    Ok(disp == RegDisposition::REG_CREATED_NEW_KEY)
+}
+
+/// Restore a set of string/dword values to prior state (or delete the key if we
+/// created it). Undoes AeDebug / WER / IFEO-Debugger changes.
+#[cfg(windows)]
+pub fn hklm_restore(
+    subkey: &str,
+    strings: &[(String, Option<String>)],
+    dwords: &[(String, Option<u32>)],
+    created_key: bool,
+) -> std::io::Result<()> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_ALL_ACCESS};
+    use winreg::RegKey;
+    let base = RegKey::predef(HKEY_LOCAL_MACHINE);
+    if created_key {
+        let _ = base.delete_subkey_all(subkey);
+        return Ok(());
+    }
+    let k = base.open_subkey_with_flags(subkey, KEY_ALL_ACCESS)?;
+    for (n, v) in strings {
+        match v {
+            Some(s) => k.set_value(n, &s.to_string())?,
+            None => {
+                let _ = k.delete_value(n);
+            }
+        }
+    }
+    for (n, v) in dwords {
+        match v {
+            Some(d) => k.set_value(n, d)?,
+            None => {
+                let _ = k.delete_value(n);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+pub fn hklm_read_sz(_subkey: &str, _name: &str) -> Option<String> {
+    None
+}
+#[cfg(not(windows))]
+pub fn hklm_read_dword(_subkey: &str, _name: &str) -> Option<u32> {
+    None
+}
+#[cfg(not(windows))]
+pub fn hklm_key_exists(_subkey: &str) -> bool {
+    false
+}
+#[cfg(not(windows))]
+pub fn hklm_set_sz(_subkey: &str, _name: &str, _val: &str) -> std::io::Result<bool> {
+    Ok(false)
+}
+#[cfg(not(windows))]
+pub fn hklm_set_dword(_subkey: &str, _name: &str, _val: u32) -> std::io::Result<bool> {
+    Ok(false)
+}
+#[cfg(not(windows))]
+pub fn hklm_restore(
+    _subkey: &str,
+    _strings: &[(String, Option<String>)],
+    _dwords: &[(String, Option<u32>)],
+    _created_key: bool,
+) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(not(windows))]
 pub fn crashcontrol_read() -> Option<u32> {
     None

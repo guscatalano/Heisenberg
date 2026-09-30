@@ -24,6 +24,13 @@ pub enum RevertPlan {
     },
     /// Restore `CrashControl\CrashDumpEnabled` to its prior value.
     CrashControl { prior: Option<u32> },
+    /// Restore a set of HKLM string/dword values (AeDebug, WER LocalDumps, ...).
+    RegRestore {
+        subkey: String,
+        strings: Vec<(String, Option<String>)>,
+        dwords: Vec<(String, Option<u32>)>,
+        created_key: bool,
+    },
     /// Run a command to undo the change (e.g. `bcdedit /debug off`).
     Command {
         program: String,
@@ -52,6 +59,15 @@ impl RevertPlan {
             }
             RevertPlan::CrashControl { prior } => {
                 regutil::crashcontrol_restore(*prior)?;
+                Ok(())
+            }
+            RevertPlan::RegRestore {
+                subkey,
+                strings,
+                dwords,
+                created_key,
+            } => {
+                regutil::hklm_restore(subkey, strings, dwords, *created_key)?;
                 Ok(())
             }
             RevertPlan::Command {

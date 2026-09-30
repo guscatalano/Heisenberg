@@ -59,6 +59,13 @@ const TTD_DOCS: &str =
     "https://learn.microsoft.com/windows-hardware/drivers/debugger/time-travel-debugging-overview";
 const DOTNET_DOCS: &str = "https://learn.microsoft.com/dotnet/core/diagnostics/dotnet-dump";
 
+const AEDEBUG_TOKEN: &str = "set-postmortem-debugger";
+const WER_TOKEN: &str = "set-wer-localdumps";
+const AEDEBUG_KEY: &str = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\AeDebug";
+const WER_LOCALDUMPS: &str = r"SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps";
+const POSTMORTEM_DOCS: &str =
+    "https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps";
+
 /// Shared server state: the immutable policy plus the on-disk ledger and audit.
 pub struct AppState {
     pub policy: Policy,
@@ -278,6 +285,34 @@ pub struct CollectPackageArgs {
 pub struct PathArg {
     /// Absolute path to the file.
     pub path: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AeDebugArgs {
+    /// Debugger command line (default: cdb scripted dump, if cdb is staged).
+    #[serde(default)]
+    pub debugger: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OnCrashInstallArgs {
+    /// Image name (e.g. "myapp.exe") for a per-image rule; omitted = global.
+    #[serde(default)]
+    pub image: Option<String>,
+    /// Full dump (default) vs mini.
+    #[serde(default = "default_true")]
+    pub full: bool,
+    /// Folder for the dumps (default "%LOCALAPPDATA%\\CrashDumps").
+    #[serde(default)]
+    pub dump_folder: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2763,6 +2798,172 @@ impl Heisenberg {
             .data(json!({ "count": procs.len(), "tree": tree }))
             .to_value();
         Ok(text(v))
+    }
+
+    #[tool(
+        name = "postmortem.aeDebug",
+        description = "Set the AeDebug JIT postmortem debugger (Debugger + Auto=1) so any unhandled crash drops to a scripted dump. State-changing, reversible via the ledger; needs elevation. dry_run + confirm."
+    )]
+    async fn postmortem_aedebug(
+        &self,
+        Parameters(a): Parameters<AeDebugArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "postmortem.aeDebug";
+        let prior_debugger = regutil::hklm_read_sz(AEDEBUG_KEY, "Debugger");
+        let prior_auto = regutil::hklm_read_sz(AEDEBUG_KEY, "Auto");
+        let exists = regutil::hklm_key_exists(AEDEBUG_KEY);
+        let debugger = match a.debugger.clone() {
+            Some(d) => d,
+            None => match self.state.locator.find("cdb.exe") {
+                Some(c) => format!("\"{}\" -p %ld -e %ld -g", c.display()),
+                None => {
+                    return Ok(text(error(tool, ErrorKind::InvalidArgument, "no debugger given and cdb.exe not found", "pass `debugger`, or install the Debugging Tools for Windows", Some(POSTMORTEM_DOCS))))
+                }
+            },
+        };
+        let cmd = format!("reg add \"HKLM\\{AEDEBUG_KEY}\" /v Debugger /t REG_SZ /d \"{debugger}\" /f  (+ Auto=1)");
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would set AeDebug to {debugger} (gate: {:?})", decision.gate))
+                    .data(json!({ "debugger": debugger, "prior": { "Debugger": prior_debugger, "Auto": prior_auto }, "gate": decision }))
+                    .command(cmd)
+                    .docs(POSTMORTEM_DOCS)
+                    .warn("dry-run: no change made")
+                    .to_value(),
+            ));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing AeDebug needs an elevated token", "re-run Heisenberg elevated", Some(POSTMORTEM_DOCS))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, AEDEBUG_TOKEN, a.confirm.as_deref()) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(POSTMORTEM_DOCS))));
+            }
+        };
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                "set AeDebug postmortem debugger",
+                RevertPlan::RegRestore {
+                    subkey: AEDEBUG_KEY.to_string(),
+                    strings: vec![("Debugger".to_string(), prior_debugger), ("Auto".to_string(), prior_auto)],
+                    dwords: vec![],
+                    created_key: !exists,
+                },
+            )
+        };
+        let r = regutil::hklm_set_sz(AEDEBUG_KEY, "Debugger", &debugger)
+            .and_then(|_| regutil::hklm_set_sz(AEDEBUG_KEY, "Auto", "1"));
+        match r {
+            Ok(_) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(tool, "AeDebug set", Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                Ok(text(
+                    Outcome::new(tool, format!("set AeDebug postmortem debugger; change {id}"))
+                        .data(json!({ "debugger": debugger, "changeId": id }))
+                        .command(cmd)
+                        .docs(POSTMORTEM_DOCS)
+                        .warn("every unhandled user-mode crash now launches this debugger; revert with changes.revert when done")
+                        .to_value(),
+                ))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                let (k, remedy) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    (ErrorKind::RequiresElevation, "re-run elevated")
+                } else {
+                    (ErrorKind::Internal, "check AeDebug permissions")
+                };
+                Ok(text(error(tool, k, format!("failed to write AeDebug: {e}"), remedy, Some(POSTMORTEM_DOCS))))
+            }
+        }
+    }
+
+    #[tool(
+        name = "dump.onCrashInstall",
+        description = "Configure WER LocalDumps so future crashes of an image (or all processes) auto-write a dump. State-changing, reversible via the ledger; needs elevation. dry_run + confirm."
+    )]
+    async fn dump_on_crash_install(
+        &self,
+        Parameters(a): Parameters<OnCrashInstallArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.onCrashInstall";
+        let subkey = match &a.image {
+            Some(img) => format!("{WER_LOCALDUMPS}\\{img}"),
+            None => WER_LOCALDUMPS.to_string(),
+        };
+        let dumptype = if a.full { 2u32 } else { 1u32 };
+        let folder = a.dump_folder.clone().unwrap_or_else(|| r"%LOCALAPPDATA%\CrashDumps".to_string());
+        let prior_type = regutil::hklm_read_dword(&subkey, "DumpType");
+        let prior_folder = regutil::hklm_read_sz(&subkey, "DumpFolder");
+        let exists = regutil::hklm_key_exists(&subkey);
+        let target = a.image.clone().unwrap_or_else(|| "all processes".to_string());
+        let cmd = format!("reg add \"HKLM\\{subkey}\" /v DumpType /t REG_DWORD /d {dumptype} /f  (+ DumpFolder)");
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would auto-dump {target} ({}) to {folder}", if a.full { "full" } else { "mini" }))
+                    .data(json!({ "target": target, "dumpType": dumptype, "dumpFolder": folder, "prior": { "DumpType": prior_type, "DumpFolder": prior_folder }, "gate": decision }))
+                    .command(cmd)
+                    .docs(POSTMORTEM_DOCS)
+                    .warn("dry-run: no change made")
+                    .to_value(),
+            ));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing WER LocalDumps needs an elevated token", "re-run Heisenberg elevated", Some(POSTMORTEM_DOCS))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, WER_TOKEN, a.confirm.as_deref()) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(POSTMORTEM_DOCS))));
+            }
+        };
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                &format!("WER LocalDumps for {target}"),
+                RevertPlan::RegRestore {
+                    subkey: subkey.clone(),
+                    strings: vec![("DumpFolder".to_string(), prior_folder)],
+                    dwords: vec![("DumpType".to_string(), prior_type)],
+                    created_key: !exists,
+                },
+            )
+        };
+        let r = regutil::hklm_set_dword(&subkey, "DumpType", dumptype)
+            .and_then(|_| regutil::hklm_set_sz(&subkey, "DumpFolder", &folder));
+        match r {
+            Ok(_) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(tool, &format!("WER LocalDumps set for {target}"), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                Ok(text(
+                    Outcome::new(tool, format!("future crashes of {target} will auto-dump to {folder}; change {id}"))
+                        .data(json!({ "target": target, "dumpType": dumptype, "dumpFolder": folder, "changeId": id }))
+                        .command(cmd)
+                        .docs(POSTMORTEM_DOCS)
+                        .warn("revert with changes.revert when done; dumps may contain secrets (high-sensitivity)")
+                        .to_value(),
+                ))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                let (k, remedy) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    (ErrorKind::RequiresElevation, "re-run elevated")
+                } else {
+                    (ErrorKind::Internal, "check WER LocalDumps permissions")
+                };
+                Ok(text(error(tool, k, format!("failed to write WER LocalDumps: {e}"), remedy, Some(POSTMORTEM_DOCS))))
+            }
+        }
     }
 }
 
