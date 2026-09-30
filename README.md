@@ -38,6 +38,9 @@ Tools today:
 | `session.list` | Windows sessions (id/station/state) + the active console session. |
 | `session.launchInUser` | Launch a process from session 0 / SYSTEM into the active user session (needs SeTcbPrivilege). |
 | `changes.list` / `changes.revert` | The reversible-change ledger and one-call undo. |
+| `collect.package` | Bundle a portable case (env + policy + ledger + jobs + dumps + audit) into a zipped manifest. |
+| `report.generate` | Human-readable Markdown incident report from the current state. |
+| `artifacts.purge` | Reclaim disk by deleting captured artifacts (dry-run by default; optional age filter). |
 
 Resources: `heisenberg://env`, `heisenberg://policy`, `heisenberg://changes`,
 `heisenberg://audit`, `heisenberg://dumps` (+ `/<id>`), `heisenberg://captures`

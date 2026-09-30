@@ -37,9 +37,14 @@ impl Store {
         self.root.join("jobs.json")
     }
 
-    #[allow(dead_code)] // used by artifact-producing tools in a later phase.
     pub fn artifacts_dir(&self) -> PathBuf {
         self.root.join("artifacts")
+    }
+
+    pub fn cases_dir(&self) -> PathBuf {
+        let d = self.root.join("cases");
+        let _ = std::fs::create_dir_all(&d);
+        d
     }
 }
 

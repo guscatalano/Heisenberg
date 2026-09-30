@@ -267,6 +267,23 @@ pub struct DotnetAnalyzeArgs {
     pub commands: Option<Vec<String>>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CollectPackageArgs {
+    /// Optional note recorded in the case manifest.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ArtifactsPurgeArgs {
+    /// Only purge artifacts older than this many days (default: all candidates).
+    #[serde(default)]
+    pub older_than_days: Option<u64>,
+    /// Preview what would be deleted without deleting (default true).
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+}
+
 impl Default for LogsEventQueryArgs {
     fn default() -> Self {
         LogsEventQueryArgs {
@@ -2377,6 +2394,213 @@ impl Heisenberg {
                 .data(json!({ "path": path, "commands": cmds, "raw": last_chars(&raw, 8000) }))
                 .command(format!("dotnet-dump analyze \"{path}\" -c ... -c exit"))
                 .docs(DOTNET_DOCS)
+                .to_value(),
+        ))
+    }
+
+    #[tool(
+        name = "collect.package",
+        description = "Bundle a portable case: env snapshot + policy + change ledger + job/dump lists + audit journal into one zipped manifest (references artifacts by path/hash; does not copy multi-GB dumps). Read-only."
+    )]
+    async fn collect_package(
+        &self,
+        Parameters(a): Parameters<CollectPackageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "collect.package";
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let case_dir = self.state.store.cases_dir().join(format!("case_{ts}"));
+        if let Err(e) = std::fs::create_dir_all(&case_dir) {
+            return Ok(text(error(tool, ErrorKind::Internal, format!("failed to create case dir: {e}"), "check HEISENBERG_HOME is writable", None)));
+        }
+
+        let manifest = json!({
+            "generated": crate::store::now_rfc3339(),
+            "host": crate::store::hostname(),
+            "note": a.note,
+            "env": serde_json::to_value(env_probe::probe()).unwrap_or_else(|_| json!({})),
+            "policy": {
+                "declaredClass": self.state.policy.class,
+                "effectiveClass": self.state.policy.effective_class(),
+                "source": self.state.policy.source,
+            },
+            "changes": self.state.ledger.lock().unwrap().list(),
+            "jobs": self.state.jobs.lock().unwrap().list(),
+            "dumps": self.state.dumps.lock().unwrap().list(),
+            "audit": self.state.audit.tail(1000),
+        });
+        let manifest_path = case_dir.join("manifest.json");
+        if let Err(e) = std::fs::write(&manifest_path, serde_json::to_vec_pretty(&manifest).unwrap_or_default()) {
+            return Ok(text(error(tool, ErrorKind::Internal, format!("failed to write manifest: {e}"), "check disk space", None)));
+        }
+
+        let zip = self.state.store.cases_dir().join(format!("case_{ts}.zip"));
+        let ps = format!(
+            "Compress-Archive -Path '{}\\*' -DestinationPath '{}' -Force",
+            case_dir.display(),
+            zip.display()
+        );
+        let zipped = tokio::time::timeout(
+            Duration::from_secs(120),
+            Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &ps]).output(),
+        )
+        .await;
+        let (artifact_path, bytes) = match zipped {
+            Ok(Ok(o)) if o.status.success() && zip.is_file() => {
+                (zip.display().to_string(), std::fs::metadata(&zip).map(|m| m.len()).unwrap_or(0))
+            }
+            _ => {
+                // Fall back to the uncompressed case folder if zipping failed.
+                (case_dir.display().to_string(), 0)
+            }
+        };
+        self.state.audit.record(tool, &format!("packaged case to {artifact_path}"), None, "packaged", None);
+        Ok(text(
+            Outcome::new(tool, format!("packaged case -> {artifact_path}"))
+                .data(json!({ "caseDir": case_dir.display().to_string(), "archive": artifact_path, "bytes": bytes, "manifest": manifest_path.display().to_string() }))
+                .artifact(Artifact { kind: "case".to_string(), path: artifact_path.clone(), bytes, resource: artifact_path, sensitivity: Some("medium".to_string()) })
+                .command(ps)
+                .warn("the manifest references dumps/traces by path; include those files when sending the case off-box, and review for sensitive data first")
+                .to_value(),
+        ))
+    }
+
+    #[tool(
+        name = "report.generate",
+        description = "Generate a human-readable Markdown incident report (env, hypervisor, dumps, changes, recent audit) and write it as an artifact. Read-only."
+    )]
+    async fn report_generate(&self) -> Result<CallToolResult, McpError> {
+        let tool = "report.generate";
+        let env = env_probe::probe();
+        let mut md = String::new();
+        md.push_str(&format!("# Heisenberg report — {}\n\n", crate::store::hostname()));
+        md.push_str(&format!("_Generated {} (UTC)_\n\n", crate::store::now_rfc3339()));
+        md.push_str("## Machine\n\n");
+        md.push_str(&format!(
+            "- OS: {} build {} ({})\n- Arch: {} (native {})\n- Session {}{}\n- Integrity: {}\n- SeDebug: {} · SeTcb: {}\n\n",
+            env.os.name, env.os.build, env.os.edition_id,
+            env.arch.process_arch, env.arch.native_arch,
+            env.session_id, if env.in_session0 { " (session 0)" } else { "" },
+            env.integrity_level, env.privileges.se_debug.held, env.privileges.se_tcb.held,
+        ));
+
+        {
+            let dumps = self.state.dumps.lock().unwrap();
+            md.push_str(&format!("## Dumps ({})\n\n", dumps.list().len()));
+            if !dumps.list().is_empty() {
+                md.push_str("| id | pid | kind | MB | sensitivity | created |\n|---|---|---|---|---|---|\n");
+                for d in dumps.list() {
+                    md.push_str(&format!("| {} | {} | {} | {:.1} | {} | {} |\n", d.id, d.pid, d.kind, d.bytes as f64 / 1048576.0, d.sensitivity, d.created));
+                }
+                md.push('\n');
+            }
+        }
+        {
+            let ledger = self.state.ledger.lock().unwrap();
+            md.push_str(&format!("## Changes ({})\n\n", ledger.list().len()));
+            if !ledger.list().is_empty() {
+                md.push_str("| id | tool | summary | status |\n|---|---|---|---|\n");
+                for c in ledger.list() {
+                    md.push_str(&format!("| {} | {} | {} | {:?} |\n", c.id, c.tool, c.summary, c.status));
+                }
+                md.push('\n');
+            }
+        }
+        let recent = self.state.audit.tail(25);
+        md.push_str(&format!("## Recent activity ({} of last 25)\n\n", recent.len()));
+        for e in &recent {
+            md.push_str(&format!(
+                "- `{}` {} — {} ({})\n",
+                e.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
+                e.get("tool").and_then(|v| v.as_str()).unwrap_or(""),
+                e.get("summary").and_then(|v| v.as_str()).unwrap_or(""),
+                e.get("outcome").and_then(|v| v.as_str()).unwrap_or(""),
+            ));
+        }
+
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let path = self.state.store.cases_dir().join(format!("report_{ts}.md"));
+        if let Err(e) = std::fs::write(&path, md.as_bytes()) {
+            return Ok(text(error(tool, ErrorKind::Internal, format!("failed to write report: {e}"), "check HEISENBERG_HOME is writable", None)));
+        }
+        let bytes = md.len() as u64;
+        self.state.audit.record(tool, &format!("generated report {}", path.display()), None, "generated", None);
+        Ok(text(
+            Outcome::new(tool, format!("generated report -> {}", path.display()))
+                .data(json!({ "path": path.display().to_string(), "markdown": md }))
+                .artifact(Artifact { kind: "report".to_string(), path: path.display().to_string(), bytes, resource: path.display().to_string(), sensitivity: Some("low".to_string()) })
+                .to_value(),
+        ))
+    }
+
+    #[tool(
+        name = "artifacts.purge",
+        description = "Delete captured artifacts (dumps/traces/etl/run/pml/gcdump/evtx) from the store to reclaim disk. Defaults to a dry-run preview; set dry_run=false to delete. Optionally filter by age."
+    )]
+    async fn artifacts_purge(
+        &self,
+        Parameters(a): Parameters<ArtifactsPurgeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "artifacts.purge";
+        let exts = ["dmp", "etl", "run", "pml", "gcdump", "evtx", "nettrace"];
+        let dir = self.state.store.artifacts_dir();
+        let now = std::time::SystemTime::now();
+        let mut candidates: Vec<(String, u64, f64)> = Vec::new(); // path, bytes, age_days
+        if let Ok(rd) = std::fs::read_dir(&dir) {
+            for entry in rd.flatten() {
+                let p = entry.path();
+                let ext_ok = p
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .map(|e| exts.contains(&e.to_ascii_lowercase().as_str()))
+                    .unwrap_or(false);
+                if !ext_ok {
+                    continue;
+                }
+                let meta = match entry.metadata() {
+                    Ok(m) => m,
+                    Err(_) => continue,
+                };
+                let age_days = meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| now.duration_since(m).ok())
+                    .map(|d| d.as_secs_f64() / 86400.0)
+                    .unwrap_or(0.0);
+                if let Some(days) = a.older_than_days {
+                    if age_days < days as f64 {
+                        continue;
+                    }
+                }
+                candidates.push((p.display().to_string(), meta.len(), age_days));
+            }
+        }
+        let total: u64 = candidates.iter().map(|(_, b, _)| *b).sum();
+        let list: Vec<serde_json::Value> = candidates
+            .iter()
+            .map(|(p, b, age)| json!({ "path": p, "bytes": b, "ageDays": (age * 10.0).round() / 10.0 }))
+            .collect();
+
+        if a.dry_run {
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] {} artifact(s), {:.1} MB would be purged", candidates.len(), total as f64 / 1048576.0))
+                    .data(json!({ "dryRun": true, "count": candidates.len(), "totalBytes": total, "artifacts": list }))
+                    .warn("dry-run: nothing deleted. Re-call with dry_run=false to delete.")
+                    .to_value(),
+            ));
+        }
+
+        let mut deleted = 0u64;
+        let mut freed = 0u64;
+        for (p, b, _) in &candidates {
+            if std::fs::remove_file(p).is_ok() {
+                deleted += 1;
+                freed += *b;
+            }
+        }
+        self.state.audit.record(tool, &format!("purged {deleted} artifacts, {freed} bytes"), None, "purged", None);
+        Ok(text(
+            Outcome::new(tool, format!("purged {deleted} artifact(s), freed {:.1} MB", freed as f64 / 1048576.0))
+                .data(json!({ "dryRun": false, "deleted": deleted, "freedBytes": freed }))
                 .to_value(),
         ))
     }
