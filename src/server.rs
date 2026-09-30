@@ -46,6 +46,11 @@ const KERNEL_DOCS: &str =
 const CRASHDUMP_DOCS: &str =
     "https://learn.microsoft.com/windows-hardware/drivers/debugger/enabling-a-kernel-mode-dump-file";
 
+const WEVTUTIL_DOCS: &str =
+    "https://learn.microsoft.com/windows-server/administration/windows-commands/wevtutil";
+const WPR_DOCS: &str =
+    "https://learn.microsoft.com/windows-hardware/test/wpt/windows-performance-recorder";
+
 /// Shared server state: the immutable policy plus the on-disk ledger and audit.
 pub struct AppState {
     pub policy: Policy,
@@ -174,6 +179,51 @@ fn default_baud() -> u32 {
 }
 fn default_kdport() -> u32 {
     50000
+}
+fn default_channel() -> String {
+    "System".to_string()
+}
+fn default_count() -> u32 {
+    20
+}
+fn default_wpr_profile() -> String {
+    "GeneralProfile".to_string()
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LogsEventQueryArgs {
+    /// Event log channel, e.g. "System", "Application", "Microsoft-Windows-Kernel-Power/Analytic".
+    #[serde(default = "default_channel")]
+    pub channel: String,
+    /// Number of most-recent events to return.
+    #[serde(default = "default_count")]
+    pub count: u32,
+    /// Return raw event XML instead of text.
+    #[serde(default)]
+    pub xml: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LogsEventExportArgs {
+    /// Event log channel to export to a .evtx file.
+    pub channel: String,
+}
+
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct LogsEtwStartArgs {
+    /// WPR profile (default "GeneralProfile"; e.g. "CPU", "DiskIO", "FileIO").
+    #[serde(default = "default_wpr_profile")]
+    pub profile: String,
+}
+
+impl Default for LogsEventQueryArgs {
+    fn default() -> Self {
+        LogsEventQueryArgs {
+            channel: default_channel(),
+            count: default_count(),
+            xml: false,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1007,6 +1057,22 @@ impl Heisenberg {
         }
     }
 
+    /// Stop a WPR ETW session and finalize its `.etl`.
+    async fn stop_wpr(&self, etl: &str) -> Result<(), String> {
+        let out = tokio::time::timeout(
+            Duration::from_secs(180),
+            Command::new("wpr").args(["-stop", etl]).output(),
+        )
+        .await
+        .map_err(|_| "wpr -stop timed out".to_string())?
+        .map_err(|e| format!("failed to launch wpr: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
     /// Ask a running Procmon to flush and exit (its own `/Terminate` form).
     async fn terminate_procmon(&self) -> Result<(), String> {
         let pm = self
@@ -1057,6 +1123,10 @@ impl Heisenberg {
 
         let stop_result: Result<(), String> = match job.kind.as_str() {
             "procmon" => self.terminate_procmon().await,
+            "wpr" => match &job.backing_file {
+                Some(p) => self.stop_wpr(p).await,
+                None => Err("wpr job has no backing file".to_string()),
+            },
             _ => {
                 if cancel {
                     match job.tool_pid {
@@ -1585,6 +1655,202 @@ impl Heisenberg {
                 .warn("reboot the target for KDNET to take effect; Secure Boot OFF; the NIC must be KDNET-supported (e1000e, not virtio)")
                 .to_value(),
         ))
+    }
+
+    #[tool(
+        name = "logs.eventQuery",
+        description = "Query the most recent Windows event log entries from a channel (default System) via wevtutil. Read-only; Application/System work unprivileged, some channels (Security) need admin."
+    )]
+    async fn logs_event_query(
+        &self,
+        Parameters(a): Parameters<LogsEventQueryArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "logs.eventQuery";
+        let fmt = if a.xml { "xml" } else { "text" };
+        let count_arg = format!("/c:{}", a.count);
+        let fmt_arg = format!("/f:{fmt}");
+        let args = ["qe", a.channel.as_str(), &count_arg, "/rd:true", &fmt_arg];
+        let out = match tokio::time::timeout(
+            Duration::from_secs(60),
+            Command::new("wevtutil").args(args).output(),
+        )
+        .await
+        {
+            Err(_) => {
+                return Ok(text(error(tool, ErrorKind::Timeout, "wevtutil timed out", "narrow the channel or count", Some(WEVTUTIL_DOCS))))
+            }
+            Ok(Err(e)) => {
+                return Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch wevtutil: {e}"), "ensure wevtutil is on PATH", Some(WEVTUTIL_DOCS))))
+            }
+            Ok(Ok(o)) => o,
+        };
+        if !out.status.success() {
+            let err = String::from_utf8_lossy(&out.stderr).to_string();
+            let low = err.to_lowercase();
+            let (k, remedy) = if low.contains("access is denied") {
+                (ErrorKind::AccessDenied, "this channel needs elevation")
+            } else if low.contains("channel") || low.contains("could not be found") {
+                (ErrorKind::InvalidArgument, "check the channel name (list them with: wevtutil el)")
+            } else {
+                (ErrorKind::Internal, "check the channel and query")
+            };
+            return Ok(text(error(tool, k, format!("wevtutil failed: {}", err.trim()), remedy, Some(WEVTUTIL_DOCS))));
+        }
+        let raw = String::from_utf8_lossy(&out.stdout).to_string();
+        let events = if a.xml {
+            raw.matches("<Event").count()
+        } else {
+            raw.matches("Event[").count()
+        };
+        let v = Outcome::new(tool, format!("{events} event(s) from {}", a.channel))
+            .data(json!({ "channel": a.channel, "count": events, "format": fmt, "raw": last_chars(&raw, 8000) }))
+            .command(format!("wevtutil qe {} /c:{} /rd:true /f:{fmt}", a.channel, a.count))
+            .docs(WEVTUTIL_DOCS)
+            .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "logs.eventExport",
+        description = "Export a Windows event log channel to a .evtx file (wevtutil epl). Read-only; produces an artifact to hand to findneedle. Some channels (Security) need admin."
+    )]
+    async fn logs_event_export(
+        &self,
+        Parameters(a): Parameters<LogsEventExportArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "logs.eventExport";
+        let safe: String = a
+            .channel
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect();
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let path = self.state.store.artifacts_dir().join(format!("evtx_{safe}_{ts}.evtx"));
+        let cmd = format!("wevtutil epl \"{}\" \"{}\" /ow:true", a.channel, path.display());
+        let out = match tokio::time::timeout(
+            Duration::from_secs(120),
+            Command::new("wevtutil")
+                .arg("epl")
+                .arg(&a.channel)
+                .arg(&path)
+                .arg("/ow:true")
+                .output(),
+        )
+        .await
+        {
+            Err(_) => {
+                return Ok(text(error(tool, ErrorKind::Timeout, "wevtutil epl timed out", "retry", Some(WEVTUTIL_DOCS))))
+            }
+            Ok(Err(e)) => {
+                return Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch wevtutil: {e}"), "ensure wevtutil is on PATH", Some(WEVTUTIL_DOCS))))
+            }
+            Ok(Ok(o)) => o,
+        };
+        if !out.status.success() || !path.is_file() {
+            let err = String::from_utf8_lossy(&out.stderr).to_string();
+            let low = err.to_lowercase();
+            let (k, remedy) = if low.contains("access is denied") {
+                (ErrorKind::AccessDenied, "this channel needs elevation")
+            } else {
+                (ErrorKind::InvalidArgument, "check the channel name (wevtutil el)")
+            };
+            return Ok(text(error(tool, k, format!("wevtutil epl failed: {}", err.trim()), remedy, Some(WEVTUTIL_DOCS))));
+        }
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        self.state.audit.record(tool, &format!("exported {} ({bytes} bytes)", a.channel), None, "exported", None);
+        let v = Outcome::new(tool, format!("exported {} ({:.1} KB)", a.channel, bytes as f64 / 1024.0))
+            .data(json!({ "channel": a.channel, "path": path.display().to_string(), "bytes": bytes }))
+            .artifact(Artifact {
+                kind: "evtx".to_string(),
+                path: path.display().to_string(),
+                bytes,
+                resource: path.display().to_string(),
+                sensitivity: Some("medium".to_string()),
+            })
+            .command(cmd)
+            .docs(WEVTUTIL_DOCS)
+            .warn("hand the .evtx to findneedle (add_log_location) for querying and cross-artifact correlation")
+            .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "logs.etwStart",
+        description = "Start a WPR ETW trace in the background (default GeneralProfile; e.g. CPU/DiskIO/FileIO) to a .etl; returns a jobId. Needs elevation. Stop with logs.etwStop or job.stop to finalize the .etl."
+    )]
+    async fn logs_etw_start(
+        &self,
+        Parameters(a): Parameters<LogsEtwStartArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "logs.etwStart";
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "WPR needs an elevated token to start an ETW session", "re-run Heisenberg elevated", Some(WPR_DOCS))));
+        }
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let etl = self.state.store.artifacts_dir().join(format!("wpr_{ts}.etl"));
+        let profile = if a.profile.is_empty() {
+            "GeneralProfile".to_string()
+        } else {
+            a.profile.clone()
+        };
+        let cmd = format!("wpr -start {profile} -filemode");
+        let out = match tokio::time::timeout(
+            Duration::from_secs(60),
+            Command::new("wpr").args(["-start", &profile, "-filemode"]).output(),
+        )
+        .await
+        {
+            Err(_) => {
+                return Ok(text(error(tool, ErrorKind::Timeout, "wpr -start timed out", "retry", Some(WPR_DOCS))))
+            }
+            Ok(Err(e)) => {
+                return Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch wpr: {e}"), "ensure wpr.exe is available", Some(WPR_DOCS))))
+            }
+            Ok(Ok(o)) => o,
+        };
+        if !out.status.success() {
+            let err = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let low = err.to_lowercase();
+            let (k, remedy) = if low.contains("already") || low.contains("in progress") {
+                (ErrorKind::CaptureInProgress, "stop the current WPR session first (logs.etwStop / wpr -cancel)")
+            } else if low.contains("denied") || low.contains("elevat") {
+                (ErrorKind::RequiresElevation, "re-run elevated")
+            } else {
+                (ErrorKind::Internal, "check the WPR profile name")
+            };
+            return Ok(text(error(tool, k, format!("wpr -start failed: {}", err.trim()), remedy, Some(WPR_DOCS))));
+        }
+        let job = {
+            let mut j = self.state.jobs.lock().unwrap();
+            j.add("wpr", None, Some(etl.display().to_string()), &format!("wpr {profile} -> {}", etl.display()))
+        };
+        self.state.audit.record(tool, &format!("started wpr job {}", job.id), None, "started", Some(&job.id));
+        let v = Outcome::new(tool, format!("started WPR {profile} capture (job {})", job.id))
+            .data(json!({
+                "jobId": job.id, "profile": profile,
+                "backingFile": etl.display().to_string(),
+                "resource": format!("heisenberg://captures/{}", job.id)
+            }))
+            .command(cmd)
+            .docs(WPR_DOCS)
+            .warn("ETW session is running; stop with logs.etwStop or job.stop to write the .etl")
+            .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "logs.etwStop",
+        description = "Stop a running WPR ETW trace job, finalize the .etl, and return it as an artifact."
+    )]
+    async fn logs_etw_stop(
+        &self,
+        Parameters(a): Parameters<JobIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_stop("logs.etwStop", &a.id, false).await
     }
 }
 

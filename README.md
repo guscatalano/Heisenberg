@@ -30,6 +30,8 @@ Tools today:
 | `kernel.status` | Crash-dump mode, detected hypervisor (Hyper-V / Proxmox / VMware / physical), and bcdedit debug settings. |
 | `kernel.setCrashDump` | Set the crash-dump mode via CrashControl (reversible; needs elevation). |
 | `kernel.serialDebugSetup` / `kernel.netDebugSetup` | Configure guest kernel debugging (serial or KDNET) + emit host-side wiring for the hypervisor (reversible; needs elevation + reboot). |
+| `logs.eventQuery` / `logs.eventExport` | Query recent event-log entries (wevtutil) or export a channel to `.evtx`. |
+| `logs.etwStart` / `logs.etwStop` | Start/stop a background WPR ETW trace to `.etl` (a `job.*` capture; needs elevation). |
 | `changes.list` / `changes.revert` | The reversible-change ledger and one-call undo. |
 
 Resources: `heisenberg://env`, `heisenberg://policy`, `heisenberg://changes`,
