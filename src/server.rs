@@ -167,6 +167,17 @@ pub struct GflagsGetArgs {
     pub image: String,
 }
 
+fn default_dbgsrv_port() -> u32 {
+    5005
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemoteServerArgs {
+    /// TCP port for the process server (default 5005).
+    #[serde(default = "default_dbgsrv_port")]
+    pub port: u32,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DumpOnTriggerArgs {
     #[serde(default)]
@@ -1531,8 +1542,9 @@ impl Heisenberg {
                 None => Err("wpr job has no backing file".to_string()),
             },
             "ttd" => self.stop_ttd().await,
-            "procdump" => {
-                // Best-effort: procdump may already have exited after its trigger fired.
+            "procdump" | "dbgsrv" => {
+                // Best-effort: procdump may already have exited after its trigger
+                // fired; dbgsrv is a long-running server we terminate.
                 if let Some(pid) = job.tool_pid {
                     let _ = kill_pid(pid).await;
                 }
@@ -3243,6 +3255,52 @@ impl Heisenberg {
                 };
                 Ok(text(error(tool, k, format!("failed to write IFEO Debugger: {e}"), remedy, Some(docs))))
             }
+        }
+    }
+
+    #[tool(
+        name = "remote.debugServer",
+        description = "Start a user-mode process server (dbgsrv) in the background so a remote WinDbg can debug processes on this box; returns a jobId and the connect string. Needs dbgsrv (ships with the Debugging Tools). Stop with job.stop/job.cancel."
+    )]
+    async fn remote_debug_server(
+        &self,
+        Parameters(a): Parameters<RemoteServerArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "remote.debugServer";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/-server--start-the-process-server";
+        let ds = match self.state.locator.find("dbgsrv.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(tool, ErrorKind::ToolNotInstalled, "dbgsrv.exe not found", "install the Debugging Tools for Windows (winget install Microsoft.WinDbg)", Some(docs));
+                v["error"]["wingetId"] = json!("Microsoft.WinDbg");
+                return Ok(text(v));
+            }
+        };
+        let conn = format!("tcp:port={}", a.port);
+        let cmd_str = format!("dbgsrv -t {conn}");
+        match std::process::Command::new(&ds).arg("-t").arg(&conn).spawn() {
+            Ok(child) => {
+                let tpid = child.id();
+                let job = {
+                    let mut j = self.state.jobs.lock().unwrap();
+                    j.add("dbgsrv", Some(tpid), None, &format!("dbgsrv process server on {conn}"))
+                };
+                self.state.audit.record(tool, &format!("started dbgsrv job {}", job.id), None, "started", Some(&job.id));
+                let host = crate::store::hostname();
+                Ok(text(
+                    Outcome::new(tool, format!("process server listening on {conn} (job {})", job.id))
+                        .data(json!({
+                            "jobId": job.id, "port": a.port, "pid": tpid,
+                            "connect": format!("remote WinDbg: File > Connect to Remote Stub -> tcp:port={},server={host}   (or windbg -premote tcp:port={},server={host})", a.port, a.port),
+                            "resource": format!("heisenberg://captures/{}", job.id)
+                        }))
+                        .command(cmd_str)
+                        .docs(docs)
+                        .warn("the server exposes this machine's processes to the remote debugger; firewall the port and stop it (job.stop) when done")
+                        .to_value(),
+                ))
+            }
+            Err(e) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch dbgsrv: {e}"), "check the dbgsrv path", Some(docs)))),
         }
     }
 }

@@ -44,6 +44,7 @@ Tools today:
 | `logs.etwStart` / `logs.etwStop` | Start/stop a background WPR ETW trace to `.etl` (a `job.*` capture; needs elevation). |
 | `session.list` | Windows sessions (id/station/state) + the active console session. |
 | `session.launchInUser` | Launch a process from session 0 / SYSTEM into the active user session (needs SeTcbPrivilege). |
+| `remote.debugServer` | Start a dbgsrv process server (a `job.*` capture) so a remote WinDbg can debug this box; returns the connect string. |
 | `changes.list` / `changes.revert` | The reversible-change ledger and one-call undo. |
 | `collect.package` | Bundle a portable case (env + policy + ledger + jobs + dumps + audit) into a zipped manifest. |
 | `report.generate` | Human-readable Markdown incident report from the current state. |
