@@ -29,13 +29,14 @@ pub fn load_policy() -> Policy {
             }
             Err(e) => {
                 // A policy we can't parse must not silently loosen anything.
-                let mut p = Policy::default();
-                p.source = PolicySource {
-                    origin: format!("{origin} (parse error: {e})"),
-                    trust: Trust::Absent,
-                    hash: None,
-                };
-                p
+                Policy {
+                    source: PolicySource {
+                        origin: format!("{origin} (parse error: {e})"),
+                        trust: Trust::Absent,
+                        hash: None,
+                    },
+                    ..Default::default()
+                }
             }
         },
         Err(_) => {

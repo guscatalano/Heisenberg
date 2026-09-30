@@ -134,7 +134,7 @@ impl Default for PolicySource {
 
 /// A per-tool gate override. Loosening overrides only take effect under a trusted
 /// policy; on an untrusted one they are dropped and the base gate applies.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Policy {
     #[serde(default)]
     pub class: BoxClass,
@@ -143,16 +143,6 @@ pub struct Policy {
     pub overrides: BTreeMap<String, Gate>,
     #[serde(default, skip_deserializing)]
     pub source: PolicySource,
-}
-
-impl Default for Policy {
-    fn default() -> Self {
-        Policy {
-            class: BoxClass::default(),
-            overrides: BTreeMap::new(),
-            source: PolicySource::default(),
-        }
-    }
 }
 
 /// The result of asking the policy about one action.
