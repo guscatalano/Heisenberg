@@ -55,6 +55,10 @@ const SESSION_TOKEN: &str = "launch-in-user-session";
 const SESSION_DOCS: &str =
     "https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessasuserw";
 
+const TTD_DOCS: &str =
+    "https://learn.microsoft.com/windows-hardware/drivers/debugger/time-travel-debugging-overview";
+const DOTNET_DOCS: &str = "https://learn.microsoft.com/dotnet/core/diagnostics/dotnet-dump";
+
 /// Shared server state: the immutable policy plus the on-disk ledger and audit.
 pub struct AppState {
     pub policy: Policy,
@@ -230,6 +234,37 @@ pub struct SessionLaunchArgs {
     /// Confirm token ("launch-in-user-session") when the box requires one.
     #[serde(default)]
     pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TtdRecordArgs {
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Ring-buffer mode (bounded trace size).
+    #[serde(default)]
+    pub ring: bool,
+    /// With ring mode, the max trace size in MB.
+    #[serde(default)]
+    pub max_file_mb: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DotnetTargetArgs {
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DotnetAnalyzeArgs {
+    /// Managed dump id (from dotnet.dump / dump.capture) or a file path.
+    pub dump: String,
+    /// dotnet-dump SOS commands (default: clrthreads, clrstack -all).
+    #[serde(default)]
+    pub commands: Option<Vec<String>>,
 }
 
 impl Default for LogsEventQueryArgs {
@@ -1201,6 +1236,27 @@ impl Heisenberg {
         }
     }
 
+    /// Stop all TTD recordings (finalizes the `.run` trace).
+    async fn stop_ttd(&self) -> Result<(), String> {
+        let ttd = self
+            .state
+            .locator
+            .find("TTD.exe")
+            .ok_or_else(|| "TTD.exe not found".to_string())?;
+        let out = tokio::time::timeout(
+            Duration::from_secs(120),
+            Command::new(&ttd).args(["-stop", "all"]).output(),
+        )
+        .await
+        .map_err(|_| "TTD -stop timed out".to_string())?
+        .map_err(|e| format!("failed to launch TTD: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
     /// Stop a WPR ETW session and finalize its `.etl`.
     async fn stop_wpr(&self, etl: &str) -> Result<(), String> {
         let out = tokio::time::timeout(
@@ -1271,6 +1327,7 @@ impl Heisenberg {
                 Some(p) => self.stop_wpr(p).await,
                 None => Err("wpr job has no backing file".to_string()),
             },
+            "ttd" => self.stop_ttd().await,
             _ => {
                 if cancel {
                     match job.tool_pid {
@@ -2088,6 +2145,240 @@ impl Heisenberg {
                 Ok(text(error(tool, k, e, "ensure SYSTEM context and a valid interactive session", Some(SESSION_DOCS))))
             }
         }
+    }
+
+    #[tool(
+        name = "ttd.record",
+        description = "Record a process to a Time Travel Debugging .run trace in the background (TTD -attach); returns a jobId. Needs TTD (ships with WinDbg) + elevation. Stop with ttd.stop/job.stop; replay with ttd.replay."
+    )]
+    async fn ttd_record(
+        &self,
+        Parameters(a): Parameters<TtdRecordArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "ttd.record";
+        let ttd = match self.state.locator.find("TTD.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(tool, ErrorKind::ToolNotInstalled, "TTD.exe not found", "install WinDbg (winget install Microsoft.WinDbg) which includes TTD, or stage it in --tools-dir", Some(TTD_DOCS));
+                v["error"]["wingetId"] = json!("Microsoft.WinDbg");
+                return Ok(text(v));
+            }
+        };
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "TTD needs an elevated token to record", "re-run Heisenberg elevated", Some(TTD_DOCS))));
+        }
+        let pid = match proc::resolve(a.pid, a.name.as_deref()) {
+            Ok(p) => p,
+            Err(proc::TargetError::NotFound(m)) => {
+                return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no process matched {m}"), "pass a pid or name", Some(TTD_DOCS))))
+            }
+            Err(proc::TargetError::Ambiguous { name, pids }) => {
+                let mut v = error(tool, ErrorKind::AmbiguousTarget, format!("'{name}' matches {} processes", pids.len()), "pass a specific pid", Some(TTD_DOCS));
+                v["error"]["candidates"] = json!(pids);
+                return Ok(text(v));
+            }
+        };
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let run = self.state.store.artifacts_dir().join(format!("ttd_{pid}_{ts}.run"));
+        let mut cmdargs: Vec<String> = vec!["-out".into(), run.display().to_string()];
+        if a.ring {
+            cmdargs.push("-ring".into());
+            if let Some(mb) = a.max_file_mb {
+                cmdargs.push("-maxFile".into());
+                cmdargs.push(mb.to_string());
+            }
+        }
+        cmdargs.push("-attach".into());
+        cmdargs.push(pid.to_string());
+        let cmd_str = format!("TTD.exe {}", cmdargs.join(" "));
+        match std::process::Command::new(&ttd).args(&cmdargs).spawn() {
+            Ok(child) => {
+                let tpid = child.id();
+                let job = {
+                    let mut j = self.state.jobs.lock().unwrap();
+                    j.add("ttd", Some(tpid), Some(run.display().to_string()), &format!("TTD recording pid {pid} -> {}", run.display()))
+                };
+                self.state.audit.record(tool, &format!("started ttd job {}", job.id), None, "started", Some(&job.id));
+                Ok(text(
+                    Outcome::new(tool, format!("recording pid {pid} (job {})", job.id))
+                        .data(json!({ "jobId": job.id, "targetPid": pid, "backingFile": run.display().to_string(), "resource": format!("heisenberg://captures/{}", job.id) }))
+                        .command(cmd_str)
+                        .docs(TTD_DOCS)
+                        .warn("recording; stop with ttd.stop or job.stop, then replay with ttd.replay")
+                        .to_value(),
+                ))
+            }
+            Err(e) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch TTD: {e}"), "check the TTD path", Some(TTD_DOCS)))),
+        }
+    }
+
+    #[tool(name = "ttd.stop", description = "Stop a TTD recording job and finalize its .run trace.")]
+    async fn ttd_stop(&self, Parameters(a): Parameters<JobIdArgs>) -> Result<CallToolResult, McpError> {
+        self.do_stop("ttd.stop", &a.id, false).await
+    }
+
+    #[tool(
+        name = "ttd.replay",
+        description = "Open a TTD .run trace in cdb and run commands (default: stacks). Accepts a trace path. Read-only; needs cdb."
+    )]
+    async fn ttd_replay(&self, Parameters(a): Parameters<DumpAnalyzeArgs>) -> Result<CallToolResult, McpError> {
+        self.simple_analyze("ttd.replay", &a.dump, a.commands.as_deref(), "k; q").await
+    }
+
+    #[tool(
+        name = "dotnet.dump",
+        description = "Capture a managed (.NET) process dump with dotnet-dump. Read-only; needs the dotnet-dump global tool. Full dump — high-sensitivity."
+    )]
+    async fn dotnet_dump(&self, Parameters(a): Parameters<DotnetTargetArgs>) -> Result<CallToolResult, McpError> {
+        let tool = "dotnet.dump";
+        let dd = match self.state.locator.find("dotnet-dump.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(tool, ErrorKind::ToolNotInstalled, "dotnet-dump not found", "install it: dotnet tool install -g dotnet-dump", Some(DOTNET_DOCS));
+                v["error"]["install"] = json!("dotnet tool install -g dotnet-dump");
+                return Ok(text(v));
+            }
+        };
+        let pid = match proc::resolve(a.pid, a.name.as_deref()) {
+            Ok(p) => p,
+            Err(proc::TargetError::NotFound(m)) => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no process matched {m}"), "pass a pid or name", Some(DOTNET_DOCS)))),
+            Err(proc::TargetError::Ambiguous { name, pids }) => {
+                let mut v = error(tool, ErrorKind::AmbiguousTarget, format!("'{name}' matches {} processes", pids.len()), "pass a specific pid", Some(DOTNET_DOCS));
+                v["error"]["candidates"] = json!(pids);
+                return Ok(text(v));
+            }
+        };
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let out = self.state.store.artifacts_dir().join(format!("dotnet_{pid}_{ts}.dmp"));
+        let cmd_str = format!("dotnet-dump collect -p {pid} -o \"{}\"", out.display());
+        let output = match tokio::time::timeout(
+            Duration::from_secs(180),
+            Command::new(&dd).arg("collect").arg("-p").arg(pid.to_string()).arg("-o").arg(&out).output(),
+        )
+        .await
+        {
+            Err(_) => return Ok(text(error(tool, ErrorKind::Timeout, "dotnet-dump timed out", "retry", Some(DOTNET_DOCS)))),
+            Ok(Err(e)) => return Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch dotnet-dump: {e}"), "check the tool", Some(DOTNET_DOCS)))),
+            Ok(Ok(o)) => o,
+        };
+        if !output.status.success() || !out.is_file() {
+            let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            let k = if combined.to_lowercase().contains("access") { ErrorKind::AccessDenied } else { ErrorKind::AnalysisFailed };
+            let mut v = error(tool, k, format!("dotnet-dump failed for pid {pid}"), "ensure the target is a .NET process and you have access (elevation may be needed)", Some(DOTNET_DOCS));
+            v["error"]["output"] = json!(combined.trim());
+            return Ok(text(v));
+        }
+        let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        let rec = {
+            let mut reg = self.state.dumps.lock().unwrap();
+            reg.add(out.display().to_string(), pid, "full", "dotnet-dump", bytes)
+        };
+        self.state.audit.record(tool, &format!("captured managed dump of pid {pid}"), None, "captured", Some(&rec.id));
+        Ok(text(
+            Outcome::new(tool, format!("captured managed dump of pid {pid} ({:.1} MB)", bytes as f64 / 1048576.0))
+                .data(json!({ "pid": pid, "backend": "dotnet-dump", "bytes": bytes, "path": out.display().to_string(), "dumpId": rec.id }))
+                .artifact(Artifact { kind: "dump".to_string(), path: out.display().to_string(), bytes, resource: format!("heisenberg://dumps/{}", rec.id), sensitivity: Some("high".to_string()) })
+                .command(cmd_str)
+                .docs(DOTNET_DOCS)
+                .warn("managed full dump may contain secrets; treat as high-sensitivity")
+                .to_value(),
+        ))
+    }
+
+    #[tool(
+        name = "dotnet.gcHeap",
+        description = "Collect a .NET GC heap snapshot (.gcdump) with dotnet-gcdump — for managed memory/leak analysis. Read-only; needs the dotnet-gcdump global tool."
+    )]
+    async fn dotnet_gcheap(&self, Parameters(a): Parameters<DotnetTargetArgs>) -> Result<CallToolResult, McpError> {
+        let tool = "dotnet.gcHeap";
+        let dg = match self.state.locator.find("dotnet-gcdump.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(tool, ErrorKind::ToolNotInstalled, "dotnet-gcdump not found", "install it: dotnet tool install -g dotnet-gcdump", Some(DOTNET_DOCS));
+                v["error"]["install"] = json!("dotnet tool install -g dotnet-gcdump");
+                return Ok(text(v));
+            }
+        };
+        let pid = match proc::resolve(a.pid, a.name.as_deref()) {
+            Ok(p) => p,
+            Err(proc::TargetError::NotFound(m)) => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no process matched {m}"), "pass a pid or name", Some(DOTNET_DOCS)))),
+            Err(proc::TargetError::Ambiguous { name, pids }) => {
+                let mut v = error(tool, ErrorKind::AmbiguousTarget, format!("'{name}' matches {} processes", pids.len()), "pass a specific pid", Some(DOTNET_DOCS));
+                v["error"]["candidates"] = json!(pids);
+                return Ok(text(v));
+            }
+        };
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let out = self.state.store.artifacts_dir().join(format!("gcheap_{pid}_{ts}.gcdump"));
+        let cmd_str = format!("dotnet-gcdump collect -p {pid} -o \"{}\"", out.display());
+        let output = match tokio::time::timeout(
+            Duration::from_secs(120),
+            Command::new(&dg).arg("collect").arg("-p").arg(pid.to_string()).arg("-o").arg(&out).output(),
+        )
+        .await
+        {
+            Err(_) => return Ok(text(error(tool, ErrorKind::Timeout, "dotnet-gcdump timed out", "retry", Some(DOTNET_DOCS)))),
+            Ok(Err(e)) => return Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch dotnet-gcdump: {e}"), "check the tool", Some(DOTNET_DOCS)))),
+            Ok(Ok(o)) => o,
+        };
+        if !output.status.success() || !out.is_file() {
+            let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            let mut v = error(tool, ErrorKind::AnalysisFailed, format!("dotnet-gcdump failed for pid {pid}"), "ensure the target is a .NET process", Some(DOTNET_DOCS));
+            v["error"]["output"] = json!(combined.trim());
+            return Ok(text(v));
+        }
+        let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        self.state.audit.record(tool, &format!("gc heap snapshot of pid {pid}"), None, "captured", None);
+        Ok(text(
+            Outcome::new(tool, format!("collected GC heap snapshot of pid {pid} ({:.1} MB)", bytes as f64 / 1048576.0))
+                .data(json!({ "pid": pid, "bytes": bytes, "path": out.display().to_string() }))
+                .artifact(Artifact { kind: "gcdump".to_string(), path: out.display().to_string(), bytes, resource: out.display().to_string(), sensitivity: Some("medium".to_string()) })
+                .command(cmd_str)
+                .docs(DOTNET_DOCS)
+                .to_value(),
+        ))
+    }
+
+    #[tool(
+        name = "dotnet.analyze",
+        description = "Analyze a managed dump with dotnet-dump (default SOS: clrthreads, clrstack -all). Accepts a dump id or path. Read-only; needs dotnet-dump."
+    )]
+    async fn dotnet_analyze(&self, Parameters(a): Parameters<DotnetAnalyzeArgs>) -> Result<CallToolResult, McpError> {
+        let tool = "dotnet.analyze";
+        let dd = match self.state.locator.find("dotnet-dump.exe") {
+            Some(p) => p,
+            None => return Ok(text(error(tool, ErrorKind::ToolNotInstalled, "dotnet-dump not found", "dotnet tool install -g dotnet-dump", Some(DOTNET_DOCS)))),
+        };
+        let path = {
+            let reg = self.state.dumps.lock().unwrap();
+            let id = a.dump.trim_start_matches("heisenberg://dumps/");
+            reg.get(id).map(|r| r.path.clone()).unwrap_or_else(|| a.dump.clone())
+        };
+        if !std::path::Path::new(&path).is_file() {
+            return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no dump at {path}"), "capture with dotnet.dump or pass a path", Some(DOTNET_DOCS))));
+        }
+        let cmds = a.commands.clone().unwrap_or_else(|| vec!["clrthreads".to_string(), "clrstack -all".to_string()]);
+        let mut args: Vec<String> = vec!["analyze".to_string(), path.clone()];
+        for c in &cmds {
+            args.push("-c".to_string());
+            args.push(c.clone());
+        }
+        args.push("-c".to_string());
+        args.push("exit".to_string());
+        let output = match tokio::time::timeout(Duration::from_secs(300), Command::new(&dd).args(&args).output()).await {
+            Err(_) => return Ok(text(error(tool, ErrorKind::Timeout, "dotnet-dump analyze timed out", "retry", Some(DOTNET_DOCS)))),
+            Ok(Err(e)) => return Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch dotnet-dump: {e}"), "check the tool", Some(DOTNET_DOCS)))),
+            Ok(Ok(o)) => o,
+        };
+        let raw = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+        self.state.audit.record(tool, &format!("analyzed {path}"), None, "analyzed", None);
+        Ok(text(
+            Outcome::new(tool, format!("analyzed managed dump {path}"))
+                .data(json!({ "path": path, "commands": cmds, "raw": last_chars(&raw, 8000) }))
+                .command(format!("dotnet-dump analyze \"{path}\" -c ... -c exit"))
+                .docs(DOTNET_DOCS)
+                .to_value(),
+        ))
     }
 }
 

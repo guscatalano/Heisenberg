@@ -25,6 +25,8 @@ Tools today:
 | `dump.analyze` | Open a dump in cdb (`!analyze -v`, stacks, modules) and return parsed + raw. Needs the Debugging Tools for Windows. |
 | `analyze.deadlock` / `analyze.highCpu` / `analyze.handles` / `analyze.async` / `analyze.verifierStop` | Targeted cdb analyses of a dump (lock contention, CPU by thread, handle leaks, .NET async, verifier stops). |
 | `gflags.get` / `gflags.set` | Show / enable full page heap for an image via IFEO (reversible via the ledger; `dry_run` + confirm token; needs elevation). Disable by reverting the change. |
+| `ttd.record` / `ttd.stop` / `ttd.replay` | Record a process to a Time Travel Debugging `.run` trace (a `job.*` capture) and replay it in cdb. |
+| `dotnet.dump` / `dotnet.gcHeap` / `dotnet.analyze` | Managed (.NET) dumps, GC-heap snapshots, and SOS analysis via the dotnet diagnostics tools. |
 | `symbols.show` / `symbols.configure` | Read / set `_NT_SYMBOL_PATH` (reversible via the ledger; `dry_run` + confirm token). |
 | `procmon.start` / `procmon.stop` | Start/stop a background Process Monitor capture to a `.pml` (needs Procmon staged + elevation). |
 | `job.list` / `job.status` / `job.stop` / `job.cancel` | Unified control for every background capture job. |

@@ -14,6 +14,9 @@ pub const KNOWN_TOOLS: &[(&str, &str)] = &[
     ("livekd", "livekd.exe"),
     ("ttd", "TTD.exe"),
     ("wpr", "wpr.exe"),
+    ("dotnet-dump", "dotnet-dump.exe"),
+    ("dotnet-gcdump", "dotnet-gcdump.exe"),
+    ("dotnet-trace", "dotnet-trace.exe"),
 ];
 
 pub struct Locator {
@@ -76,9 +79,10 @@ fn known_dirs() -> Vec<PathBuf> {
         std::env::var("ProgramFiles").ok(),
     ];
     for base in program_files.into_iter().flatten() {
-        // Debugging Tools for Windows (cdb, windbg, gflags, symchk).
+        // Debugging Tools for Windows (cdb, windbg, gflags, symchk) + TTD.
         for arch in ["x64", "x86", "arm64"] {
             v.push(PathBuf::from(&base).join(format!(r"Windows Kits\10\Debuggers\{arch}")));
+            v.push(PathBuf::from(&base).join(format!(r"Windows Kits\10\Debuggers\{arch}\TTD")));
         }
         // Sysinternals Suite common install spot.
         v.push(PathBuf::from(&base).join("Sysinternals"));
@@ -86,6 +90,14 @@ fn known_dirs() -> Vec<PathBuf> {
     if let Ok(sr) = std::env::var("SystemRoot") {
         // wpr.exe and rundll32/comsvcs live here.
         v.push(PathBuf::from(&sr).join("System32"));
+    }
+    // dotnet global tools (dotnet-dump / -gcdump / -trace).
+    if let Ok(up) = std::env::var("USERPROFILE") {
+        v.push(PathBuf::from(&up).join(r".dotnet\tools"));
+    }
+    // TTD may install as an MSIX app here.
+    if let Ok(la) = std::env::var("LOCALAPPDATA") {
+        v.push(PathBuf::from(&la).join(r"Microsoft\WindowsApps"));
     }
     v
 }
