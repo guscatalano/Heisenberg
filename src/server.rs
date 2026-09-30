@@ -23,7 +23,7 @@ use crate::ledger::{ChangeStatus, Ledger, RevertPlan};
 use crate::policy::{base_gate, BoxClass, EffectTier, Policy};
 use crate::store::Store;
 use crate::tools::Locator;
-use crate::{docs, env_probe, gate, kernel, proc, regutil};
+use crate::{docs, env_probe, gate, kernel, proc, regutil, session};
 
 const SYMBOLS_TOKEN: &str = "set-symbol-path";
 const SYMBOL_PATH_DOCS: &str =
@@ -50,6 +50,10 @@ const WEVTUTIL_DOCS: &str =
     "https://learn.microsoft.com/windows-server/administration/windows-commands/wevtutil";
 const WPR_DOCS: &str =
     "https://learn.microsoft.com/windows-hardware/test/wpt/windows-performance-recorder";
+
+const SESSION_TOKEN: &str = "launch-in-user-session";
+const SESSION_DOCS: &str =
+    "https://learn.microsoft.com/windows/win32/api/processthreadsapi/nf-processthreadsapi-createprocessasuserw";
 
 /// Shared server state: the immutable policy plus the on-disk ledger and audit.
 pub struct AppState {
@@ -214,6 +218,18 @@ pub struct LogsEtwStartArgs {
     /// WPR profile (default "GeneralProfile"; e.g. "CPU", "DiskIO", "FileIO").
     #[serde(default = "default_wpr_profile")]
     pub profile: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionLaunchArgs {
+    /// Command line to launch, e.g. "C:\\Windows\\System32\\notepad.exe".
+    pub command: String,
+    /// Target session id; defaults to the active console session.
+    #[serde(default)]
+    pub session_id: Option<u32>,
+    /// Confirm token ("launch-in-user-session") when the box requires one.
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 impl Default for LogsEventQueryArgs {
@@ -1851,6 +1867,99 @@ impl Heisenberg {
         Parameters(a): Parameters<JobIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.do_stop("logs.etwStop", &a.id, false).await
+    }
+
+    #[tool(
+        name = "session.list",
+        description = "List Windows sessions (id, window station, state) and the active console session. Read-only."
+    )]
+    async fn session_list(&self) -> Result<CallToolResult, McpError> {
+        let sessions = session::list_sessions();
+        let active = session::active_console_session();
+        let v = Outcome::new(
+            "session.list",
+            format!("{} session(s); active console: {active:?}", sessions.len()),
+        )
+        .data(json!({ "sessions": sessions, "activeConsole": active }))
+        .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "session.launchInUser",
+        description = "Launch a process from session 0 / SYSTEM into the active interactive user session (WTSQueryUserToken -> CreateProcessAsUser, full desktop + environment-block recipe). Needs SeTcbPrivilege (SYSTEM), not merely an elevated admin. State-changing; confirm token per box class."
+    )]
+    async fn session_launch(
+        &self,
+        Parameters(a): Parameters<SessionLaunchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "session.launchInUser";
+        let env = env_probe::probe();
+        if !env.privileges.se_tcb.held {
+            self.state.audit.record(tool, "missing SeTcbPrivilege", None, "blocked", None);
+            return Ok(text(error(
+                tool,
+                ErrorKind::RequiresPrivilege,
+                "launching into a user session needs SeTcbPrivilege (run as LocalSystem/SYSTEM; an elevated admin is not enough)",
+                "run Heisenberg as a SYSTEM service, or via an elevated broker running as SYSTEM",
+                Some(SESSION_DOCS),
+            )));
+        }
+        let decision = match gate::enforce(
+            &self.state.policy,
+            tool,
+            EffectTier::StateChanging,
+            SESSION_TOKEN,
+            a.confirm.as_deref(),
+        ) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(SESSION_DOCS))));
+            }
+        };
+        let sid = match a.session_id.or_else(session::active_console_session) {
+            Some(s) => s,
+            None => {
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::SessionNotFound,
+                    "no active console session",
+                    "pass session_id (see session.list)",
+                    Some(SESSION_DOCS),
+                )))
+            }
+        };
+        match session::launch_in_session(sid, &a.command) {
+            Ok(pid) => {
+                self.state.audit.record(
+                    tool,
+                    &format!("launched '{}' in session {sid} (pid {pid})", a.command),
+                    Some(&format!("{:?}", decision.gate)),
+                    "launched",
+                    None,
+                );
+                Ok(text(
+                    Outcome::new(tool, format!("launched '{}' in session {sid} as pid {pid}", a.command))
+                        .data(json!({ "command": a.command, "sessionId": sid, "pid": pid }))
+                        .command(format!("CreateProcessAsUser(session {sid}): {}", a.command))
+                        .docs(SESSION_DOCS)
+                        .to_value(),
+                ))
+            }
+            Err(e) => {
+                self.state.audit.record(tool, &format!("launch failed: {e}"), None, "failed", None);
+                let low = e.to_lowercase();
+                let k = if low.contains("setcb") || low.contains("privilege") {
+                    ErrorKind::RequiresPrivilege
+                } else if low.contains("denied") {
+                    ErrorKind::AccessDenied
+                } else {
+                    ErrorKind::Internal
+                };
+                Ok(text(error(tool, k, e, "ensure SYSTEM context and a valid interactive session", Some(SESSION_DOCS))))
+            }
+        }
     }
 }
 

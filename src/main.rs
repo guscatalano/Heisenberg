@@ -18,6 +18,7 @@ mod policy;
 mod proc;
 mod regutil;
 mod server;
+mod session;
 mod store;
 mod tools;
 

@@ -45,6 +45,7 @@ pub enum ErrorKind {
     CaptureInProgress,
     ConfirmationRequired,
     RequiresApproval,
+    RequiresPrivilege,
     PolicyDenied,
     NotImplemented,
     Internal,

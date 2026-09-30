@@ -32,6 +32,8 @@ Tools today:
 | `kernel.serialDebugSetup` / `kernel.netDebugSetup` | Configure guest kernel debugging (serial or KDNET) + emit host-side wiring for the hypervisor (reversible; needs elevation + reboot). |
 | `logs.eventQuery` / `logs.eventExport` | Query recent event-log entries (wevtutil) or export a channel to `.evtx`. |
 | `logs.etwStart` / `logs.etwStop` | Start/stop a background WPR ETW trace to `.etl` (a `job.*` capture; needs elevation). |
+| `session.list` | Windows sessions (id/station/state) + the active console session. |
+| `session.launchInUser` | Launch a process from session 0 / SYSTEM into the active user session (needs SeTcbPrivilege). |
 | `changes.list` / `changes.revert` | The reversible-change ledger and one-call undo. |
 
 Resources: `heisenberg://env`, `heisenberg://policy`, `heisenberg://changes`,
