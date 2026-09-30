@@ -66,6 +66,12 @@ const WER_LOCALDUMPS: &str = r"SOFTWARE\Microsoft\Windows\Windows Error Reportin
 const POSTMORTEM_DOCS: &str =
     "https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps";
 
+const APPVERIF_TOKEN: &str = "enable-appverifier";
+const APPVERIF_DOCS: &str =
+    "https://learn.microsoft.com/windows-hardware/drivers/devtest/application-verifier";
+/// FLG_APPLICATION_VERIFIER in the IFEO GlobalFlag.
+const FLG_APPLICATION_VERIFIER: u32 = 0x100;
+
 /// Shared server state: the immutable policy plus the on-disk ledger and audit.
 pub struct AppState {
     pub policy: Policy,
@@ -159,6 +165,16 @@ pub struct DumpAnalyzeArgs {
 pub struct GflagsGetArgs {
     /// Image name, e.g. "myapp.exe".
     pub image: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AppVerifierArgs {
+    /// Image name, e.g. "myapp.exe".
+    pub image: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1174,6 +1190,83 @@ impl Heisenberg {
     ) -> Result<CallToolResult, McpError> {
         self.simple_analyze("analyze.verifierStop", &a.dump, a.commands.as_deref(), "!analyze -v; !verifier 3; q")
             .await
+    }
+
+    #[tool(
+        name = "appverifier.enable",
+        description = "Enable Application Verifier for an image (sets the FLG_APPLICATION_VERIFIER bit in IFEO GlobalFlag). State-changing, reversible via the ledger; needs elevation. Configure specific checks with appverif.exe. dry_run + confirm."
+    )]
+    async fn appverifier_enable(
+        &self,
+        Parameters(a): Parameters<AppVerifierArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "appverifier.enable";
+        let subkey = format!(
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\{}",
+            a.image
+        );
+        let prior_gf = regutil::hklm_read_dword(&subkey, "GlobalFlag");
+        let exists = regutil::hklm_key_exists(&subkey);
+        let new_gf = prior_gf.unwrap_or(0) | FLG_APPLICATION_VERIFIER;
+        let cmd = format!("reg add \"HKLM\\{subkey}\" /v GlobalFlag /t REG_DWORD /d {new_gf} /f");
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would enable App Verifier for {} (gate: {:?})", a.image, decision.gate))
+                    .data(json!({ "image": a.image, "priorGlobalFlag": prior_gf, "wouldSet": new_gf, "gate": decision }))
+                    .command(cmd)
+                    .docs(APPVERIF_DOCS)
+                    .warn("dry-run: no change made")
+                    .to_value(),
+            ));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing IFEO needs an elevated token", "re-run Heisenberg elevated", Some(APPVERIF_DOCS))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, APPVERIF_TOKEN, a.confirm.as_deref()) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(APPVERIF_DOCS))));
+            }
+        };
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                &format!("enable App Verifier for {}", a.image),
+                RevertPlan::RegRestore {
+                    subkey: subkey.clone(),
+                    strings: vec![],
+                    dwords: vec![("GlobalFlag".to_string(), prior_gf)],
+                    created_key: !exists,
+                },
+            )
+        };
+        match regutil::hklm_set_dword(&subkey, "GlobalFlag", new_gf) {
+            Ok(_) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(tool, &format!("App Verifier enabled for {}", a.image), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                Ok(text(
+                    Outcome::new(tool, format!("enabled App Verifier for {}; change {id}", a.image))
+                        .data(json!({ "image": a.image, "globalFlag": new_gf, "changeId": id }))
+                        .command(cmd)
+                        .docs(APPVERIF_DOCS)
+                        .warn("App Verifier adds heavy runtime checks and can surface stops; configure layers with appverif.exe; revert with changes.revert when done")
+                        .to_value(),
+                ))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                let (k, remedy) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    (ErrorKind::RequiresElevation, "re-run elevated")
+                } else {
+                    (ErrorKind::Internal, "check IFEO permissions")
+                };
+                Ok(text(error(tool, k, format!("failed to write IFEO: {e}"), remedy, Some(APPVERIF_DOCS))))
+            }
+        }
     }
 
     #[tool(
