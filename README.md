@@ -25,11 +25,13 @@ Tools today:
 | `dump.analyze` | Open a dump in cdb (`!analyze -v`, stacks, modules) and return parsed + raw. Needs the Debugging Tools for Windows. |
 | `gflags.get` / `gflags.set` | Show / enable full page heap for an image via IFEO (reversible via the ledger; `dry_run` + confirm token; needs elevation). Disable by reverting the change. |
 | `symbols.show` / `symbols.configure` | Read / set `_NT_SYMBOL_PATH` (reversible via the ledger; `dry_run` + confirm token). |
+| `procmon.start` / `procmon.stop` | Start/stop a background Process Monitor capture to a `.pml` (needs Procmon staged + elevation). |
+| `job.list` / `job.status` / `job.stop` / `job.cancel` | Unified control for every background capture job. |
 | `changes.list` / `changes.revert` | The reversible-change ledger and one-call undo. |
 
 Resources: `heisenberg://env`, `heisenberg://policy`, `heisenberg://changes`,
-`heisenberg://audit`, `heisenberg://dumps` (+ `/<id>`), `heisenberg://tools`,
-`docs://<tool>`.
+`heisenberg://audit`, `heisenberg://dumps` (+ `/<id>`), `heisenberg://captures`
+(+ `/<id>`), `heisenberg://tools`, `docs://<tool>`.
 
 ## Build
 

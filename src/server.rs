@@ -18,6 +18,7 @@ use tokio::process::Command;
 use crate::audit::Audit;
 use crate::dumps::DumpRegistry;
 use crate::envelope::{error, Artifact, ErrorKind, Outcome};
+use crate::jobs::{JobRegistry, JobState};
 use crate::ledger::{ChangeStatus, Ledger, RevertPlan};
 use crate::policy::{base_gate, BoxClass, EffectTier, Policy};
 use crate::store::Store;
@@ -36,6 +37,8 @@ const FLG_HEAP_PAGE_ALLOCS: u32 = 0x0200_0000;
 /// PageHeapFlags value for *full* page heap.
 const PAGE_HEAP_FULL: u32 = 0x3;
 
+const PROCMON_DOCS: &str = "https://learn.microsoft.com/sysinternals/downloads/procmon";
+
 /// Shared server state: the immutable policy plus the on-disk ledger and audit.
 pub struct AppState {
     pub policy: Policy,
@@ -43,6 +46,7 @@ pub struct AppState {
     pub locator: Locator,
     pub ledger: Mutex<Ledger>,
     pub dumps: Mutex<DumpRegistry>,
+    pub jobs: Mutex<JobRegistry>,
     pub audit: Audit,
 }
 
@@ -51,12 +55,14 @@ impl AppState {
         let store = Store::discover();
         let ledger = Ledger::load(store.ledger_path());
         let dumps = DumpRegistry::load(store.dumps_path());
+        let jobs = JobRegistry::load(store.jobs_path());
         let audit = Audit::open(store.audit_path());
         AppState {
             policy,
             locator: Locator::discover(),
             ledger: Mutex::new(ledger),
             dumps: Mutex::new(dumps),
+            jobs: Mutex::new(jobs),
             audit,
             store,
         }
@@ -140,6 +146,19 @@ pub struct GflagsSetArgs {
     pub confirm: Option<String>,
 }
 
+#[derive(Debug, Default, Deserialize, schemars::JsonSchema)]
+pub struct ProcmonStartArgs {
+    /// Optional process-name filter (not yet applied — recorded for now).
+    #[serde(default)]
+    pub process: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct JobIdArgs {
+    /// Job id from job.list / heisenberg://captures.
+    pub id: String,
+}
+
 fn comsvcs_path() -> std::path::PathBuf {
     let sr = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
     std::path::PathBuf::from(sr).join("System32").join("comsvcs.dll")
@@ -171,6 +190,19 @@ fn last_chars(s: &str, n: usize) -> String {
         s.to_string()
     } else {
         v[v.len() - n..].iter().collect()
+    }
+}
+
+async fn kill_pid(pid: u32) -> Result<(), String> {
+    let out = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/F", "/T"])
+        .output()
+        .await
+        .map_err(|e| e.to_string())?;
+    if out.status.success() {
+        Ok(())
+    } else {
+        Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
     }
 }
 
@@ -913,6 +945,260 @@ impl Heisenberg {
             }
         }
     }
+
+    /// Ask a running Procmon to flush and exit (its own `/Terminate` form).
+    async fn terminate_procmon(&self) -> Result<(), String> {
+        let pm = self
+            .state
+            .locator
+            .find("Procmon.exe")
+            .ok_or_else(|| "Procmon.exe not found".to_string())?;
+        let out = tokio::time::timeout(
+            Duration::from_secs(60),
+            Command::new(&pm).args(["/Terminate", "/AcceptEula"]).output(),
+        )
+        .await
+        .map_err(|_| "procmon /Terminate timed out".to_string())?
+        .map_err(|e| format!("failed to launch procmon: {e}"))?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+    }
+
+    /// Shared stop/cancel path for background jobs.
+    async fn do_stop(&self, tool: &str, id: &str, cancel: bool) -> Result<CallToolResult, McpError> {
+        let job = {
+            self.state.jobs.lock().unwrap().get(id).cloned()
+        };
+        let job = match job {
+            Some(j) => j,
+            None => {
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::SessionNotFound,
+                    format!("no job {id}"),
+                    "list jobs with job.list",
+                    None,
+                )))
+            }
+        };
+        if job.state != JobState::Running {
+            return Ok(text(error(
+                tool,
+                ErrorKind::InvalidArgument,
+                format!("job {id} is {:?}, not running", job.state),
+                "only running jobs can be stopped",
+                None,
+            )));
+        }
+
+        let stop_result: Result<(), String> = match job.kind.as_str() {
+            "procmon" => self.terminate_procmon().await,
+            _ => {
+                if cancel {
+                    match job.tool_pid {
+                        Some(pid) => kill_pid(pid).await,
+                        None => Ok(()),
+                    }
+                } else {
+                    Ok(())
+                }
+            }
+        };
+
+        let final_state = if cancel {
+            JobState::Cancelled
+        } else {
+            JobState::Stopped
+        };
+        let verb = if cancel { "cancelled" } else { "stopped" };
+
+        match stop_result {
+            Ok(()) => {
+                let updated = self.state.jobs.lock().unwrap().set_state(id, final_state);
+                self.state.audit.record(tool, &format!("{verb} job {id}"), None, verb, Some(id));
+                let mut out = Outcome::new(tool, format!("{verb} job {id} ({})", job.kind))
+                    .data(json!({ "job": updated }));
+                if let Some(bf) = &job.backing_file {
+                    if std::path::Path::new(bf).is_file() {
+                        let bytes = std::fs::metadata(bf).map(|m| m.len()).unwrap_or(0);
+                        out = out.artifact(Artifact {
+                            kind: "trace".to_string(),
+                            path: bf.clone(),
+                            bytes,
+                            resource: format!("heisenberg://captures/{id}"),
+                            sensitivity: Some("medium".to_string()),
+                        });
+                    }
+                }
+                Ok(text(out.to_value()))
+            }
+            Err(e) => {
+                self.state.jobs.lock().unwrap().set_state(id, JobState::Failed);
+                Ok(text(error(
+                    tool,
+                    ErrorKind::Internal,
+                    format!("failed to stop job {id}: {e}"),
+                    "try job.cancel to force-kill the tool process",
+                    None,
+                )))
+            }
+        }
+    }
+
+    #[tool(
+        name = "procmon.start",
+        description = "Start a Process Monitor capture in the background to a .pml backing file; returns a jobId. Read-only capture, but needs elevation (Procmon loads a driver). Stop with procmon.stop or job.stop."
+    )]
+    async fn procmon_start(
+        &self,
+        Parameters(a): Parameters<ProcmonStartArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "procmon.start";
+        let pm = match self.state.locator.find("Procmon.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(
+                    tool,
+                    ErrorKind::ToolNotInstalled,
+                    "Procmon.exe not found",
+                    "install Sysinternals Process Monitor or stage it in --tools-dir",
+                    Some(PROCMON_DOCS),
+                );
+                v["error"]["wingetId"] = json!("Microsoft.Sysinternals.ProcessMonitor");
+                return Ok(text(v));
+            }
+        };
+        if !env_probe::is_elevated() {
+            return Ok(text(error(
+                tool,
+                ErrorKind::RequiresElevation,
+                "Procmon needs an elevated token to load its capture driver",
+                "re-run Heisenberg elevated, or via the elevated broker",
+                Some(PROCMON_DOCS),
+            )));
+        }
+
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let backing = self.state.store.artifacts_dir().join(format!("procmon_{ts}.pml"));
+        let cmd_str = format!(
+            "{} /AcceptEula /Quiet /Minimized /BackingFile \"{}\"",
+            pm.display(),
+            backing.display()
+        );
+        let mut c = std::process::Command::new(&pm);
+        c.args(["/AcceptEula", "/Quiet", "/Minimized", "/BackingFile"])
+            .arg(&backing);
+        match c.spawn() {
+            Ok(child) => {
+                let pid = child.id();
+                let job = {
+                    let mut j = self.state.jobs.lock().unwrap();
+                    j.add(
+                        "procmon",
+                        Some(pid),
+                        Some(backing.display().to_string()),
+                        &format!("procmon capture -> {}", backing.display()),
+                    )
+                };
+                self.state.audit.record(tool, &format!("started procmon job {}", job.id), None, "started", Some(&job.id));
+                let mut out = Outcome::new(tool, format!("started procmon capture (job {})", job.id))
+                    .data(json!({
+                        "jobId": job.id, "pid": pid,
+                        "backingFile": backing.display().to_string(),
+                        "resource": format!("heisenberg://captures/{}", job.id)
+                    }))
+                    .command(cmd_str)
+                    .docs(PROCMON_DOCS)
+                    .warn("capture is running; stop it with procmon.stop or job.stop to flush the .pml");
+                if a.process.is_some() {
+                    out = out.warn("process filter not yet applied; the capture is unfiltered");
+                }
+                Ok(text(out.to_value()))
+            }
+            Err(e) => Ok(text(error(
+                tool,
+                ErrorKind::Internal,
+                format!("failed to launch Procmon: {e}"),
+                "check the Procmon path",
+                Some(PROCMON_DOCS),
+            ))),
+        }
+    }
+
+    #[tool(
+        name = "procmon.stop",
+        description = "Stop a running Procmon capture job, flush its .pml, and return the backing file as an artifact."
+    )]
+    async fn procmon_stop(
+        &self,
+        Parameters(a): Parameters<JobIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_stop("procmon.stop", &a.id, false).await
+    }
+
+    #[tool(
+        name = "job.list",
+        description = "List background jobs (captures) — running and finished — with kind, state, and backing file. Read-only."
+    )]
+    async fn job_list(&self) -> Result<CallToolResult, McpError> {
+        let (n, data) = {
+            let j = self.state.jobs.lock().unwrap();
+            (j.list().len(), json!({ "jobs": j.list() }))
+        };
+        Ok(text(Outcome::new("job.list", format!("{n} job(s)")).data(data).to_value()))
+    }
+
+    #[tool(
+        name = "job.status",
+        description = "Show one background job by id. Read-only."
+    )]
+    async fn job_status(
+        &self,
+        Parameters(a): Parameters<JobIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let job = {
+            self.state.jobs.lock().unwrap().get(&a.id).cloned()
+        };
+        match job {
+            Some(j) => Ok(text(
+                Outcome::new("job.status", format!("job {} is {:?}", j.id, j.state))
+                    .data(json!({ "job": j }))
+                    .to_value(),
+            )),
+            None => Ok(text(error(
+                "job.status",
+                ErrorKind::SessionNotFound,
+                format!("no job {}", a.id),
+                "list jobs with job.list",
+                None,
+            ))),
+        }
+    }
+
+    #[tool(
+        name = "job.stop",
+        description = "Gracefully stop a running background job by id (kind-aware; procmon flushes its .pml)."
+    )]
+    async fn job_stop(
+        &self,
+        Parameters(a): Parameters<JobIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_stop("job.stop", &a.id, false).await
+    }
+
+    #[tool(
+        name = "job.cancel",
+        description = "Force-stop a running background job by id (kills the tool process). Prefer job.stop for a clean flush."
+    )]
+    async fn job_cancel(
+        &self,
+        Parameters(a): Parameters<JobIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_stop("job.cancel", &a.id, true).await
+    }
 }
 
 #[tool_handler]
@@ -948,6 +1234,7 @@ impl ServerHandler for Heisenberg {
             Resource::new("heisenberg://changes", "Reversible-change ledger".to_string()),
             Resource::new("heisenberg://audit", "Audit journal (recent entries)".to_string()),
             Resource::new("heisenberg://dumps", "Captured dumps".to_string()),
+            Resource::new("heisenberg://captures", "Background capture jobs".to_string()),
             Resource::new("heisenberg://tools", "External tool inventory".to_string()),
         ];
         for (key, name, _, _) in docs::DOCS {
@@ -993,10 +1280,19 @@ impl ServerHandler for Heisenberg {
             "heisenberg://tools" => {
                 serde_json::to_string_pretty(&json!({ "tools": self.state.locator.inventory() })).ok()
             }
+            "heisenberg://captures" => {
+                let j = self.state.jobs.lock().unwrap();
+                serde_json::to_string_pretty(&json!({ "jobs": j.list() })).ok()
+            }
             other if other.starts_with("heisenberg://dumps/") => {
                 let id = &other["heisenberg://dumps/".len()..];
                 let reg = self.state.dumps.lock().unwrap();
                 reg.get(id).map(|r| serde_json::to_string_pretty(r).unwrap_or_default())
+            }
+            other if other.starts_with("heisenberg://captures/") => {
+                let id = &other["heisenberg://captures/".len()..];
+                let j = self.state.jobs.lock().unwrap();
+                j.get(id).map(|job| serde_json::to_string_pretty(job).unwrap_or_default())
             }
             other if other.starts_with("docs://") => {
                 let key = &other["docs://".len()..];

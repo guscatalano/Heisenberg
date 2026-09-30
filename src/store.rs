@@ -33,6 +33,10 @@ impl Store {
         self.root.join("dumps.json")
     }
 
+    pub fn jobs_path(&self) -> PathBuf {
+        self.root.join("jobs.json")
+    }
+
     #[allow(dead_code)] // used by artifact-producing tools in a later phase.
     pub fn artifacts_dir(&self) -> PathBuf {
         self.root.join("artifacts")
