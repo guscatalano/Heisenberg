@@ -1,0 +1,10 @@
+/target
+**/*.rs.bk
+Cargo.lock.orig
+
+# Local runtime artifacts (dumps, traces, case bundles, ledger) must never be committed.
+/artifacts
+*.dmp
+*.etl
+*.run
+*.evtx

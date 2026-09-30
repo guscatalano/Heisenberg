@@ -1,0 +1,7 @@
+# Link the CRT statically so heisenberg.exe drops onto a bare/broken box with no
+# vcruntime/UCRT redistributable present. See the Deployment section of the plan.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
