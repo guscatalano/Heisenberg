@@ -4,12 +4,17 @@
 //! Phase 1: the static single-binary server foundation — `env.check`, the policy
 //! safety spine, and the `heisenberg://` / `docs://` resources over stdio.
 
+mod audit;
 mod config;
 mod docs;
 mod env_probe;
 mod envelope;
+mod gate;
+mod ledger;
 mod policy;
+mod regutil;
 mod server;
+mod store;
 
 use anyhow::Result;
 use rmcp::{transport::stdio, ServiceExt};

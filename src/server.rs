@@ -1,8 +1,9 @@
-//! The MCP server surface. Phase 1 exposes the foundation: `env.check`, the
-//! policy view, a `gate.check` that demonstrates the safety spine, and the
-//! `heisenberg://` + `docs://` resources.
+//! The MCP server surface. Phase 1 gave the foundation (`env.check`, policy view,
+//! `gate.check`, resources). Phase 2 adds the safety spine's teeth: the change
+//! ledger, audit journal, gate *enforcement*, and a first reversible tool
+//! (`symbols.configure`) that exercises the whole path.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -12,15 +13,44 @@ use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, Rol
 use serde::Deserialize;
 use serde_json::json;
 
+use crate::audit::Audit;
 use crate::envelope::{error, ErrorKind, Outcome};
+use crate::ledger::{ChangeStatus, Ledger, RevertPlan};
 use crate::policy::{base_gate, BoxClass, EffectTier, Policy};
-use crate::{docs, env_probe};
+use crate::store::Store;
+use crate::{docs, env_probe, gate, regutil};
+
+const SYMBOLS_TOKEN: &str = "set-symbol-path";
+const SYMBOL_PATH_DOCS: &str =
+    "https://learn.microsoft.com/windows-hardware/drivers/debugger/symbol-path";
+
+/// Shared server state: the immutable policy plus the on-disk ledger and audit.
+pub struct AppState {
+    pub policy: Policy,
+    #[allow(dead_code)] // used by artifact-producing tools in a later phase.
+    pub store: Store,
+    pub ledger: Mutex<Ledger>,
+    pub audit: Audit,
+}
+
+impl AppState {
+    pub fn new(policy: Policy) -> Self {
+        let store = Store::discover();
+        let ledger = Ledger::load(store.ledger_path());
+        let audit = Audit::open(store.audit_path());
+        AppState {
+            policy,
+            store,
+            ledger: Mutex::new(ledger),
+            audit,
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct Heisenberg {
-    policy: Arc<Policy>,
-    // Read by the generated ServerHandler (tool_handler macro); not seen by dead-code analysis.
-    #[allow(dead_code)]
+    state: Arc<AppState>,
+    #[allow(dead_code)] // read by the generated ServerHandler (tool_handler macro).
     tool_router: ToolRouter<Heisenberg>,
 }
 
@@ -32,6 +62,24 @@ pub struct GateCheckArgs {
     pub tier: String,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SymbolsConfigureArgs {
+    /// New _NT_SYMBOL_PATH, e.g. "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols".
+    pub path: String,
+    /// Preview the commands and before/after without changing anything.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// Confirm token naming the effect ("set-symbol-path") when the box requires one.
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ChangesRevertArgs {
+    /// The change id to undo (from changes.list).
+    pub id: String,
+}
+
 fn parse_tier(s: &str) -> Option<EffectTier> {
     match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
         "read-only" | "readonly" | "ro" => Some(EffectTier::ReadOnly),
@@ -39,6 +87,12 @@ fn parse_tier(s: &str) -> Option<EffectTier> {
         "machine-disrupting" | "machinedisrupting" | "md" => Some(EffectTier::MachineDisrupting),
         _ => None,
     }
+}
+
+fn text(v: serde_json::Value) -> CallToolResult {
+    CallToolResult::success(vec![ContentBlock::text(
+        serde_json::to_string_pretty(&v).unwrap_or_default(),
+    )])
 }
 
 fn gate_matrix() -> serde_json::Value {
@@ -57,9 +111,9 @@ fn gate_matrix() -> serde_json::Value {
     for c in classes {
         let mut row = serde_json::Map::new();
         for t in tiers {
-            let key = serde_json::to_value(t).unwrap();
+            let tkey = serde_json::to_value(t).unwrap();
             row.insert(
-                key.as_str().unwrap_or("?").to_string(),
+                tkey.as_str().unwrap_or("?").to_string(),
                 serde_json::to_value(base_gate(c, t)).unwrap(),
             );
         }
@@ -73,7 +127,7 @@ fn gate_matrix() -> serde_json::Value {
 impl Heisenberg {
     pub fn new(policy: Policy) -> Self {
         Self {
-            policy: Arc::new(policy),
+            state: Arc::new(AppState::new(policy)),
             tool_router: Self::tool_router(),
         }
     }
@@ -102,23 +156,29 @@ impl Heisenberg {
     }
 
     fn policy_json(&self) -> serde_json::Value {
-        let class = self.policy.effective_class();
+        let policy = &self.state.policy;
+        let class = policy.effective_class();
         let data = json!({
-            "declaredClass": self.policy.class,
+            "declaredClass": policy.class,
             "effectiveClass": class,
-            "source": self.policy.source,
-            "overrides": self.policy.overrides,
+            "source": policy.source,
+            "overrides": policy.overrides,
             "gateMatrix": gate_matrix(),
         });
         Outcome::new(
             "policy.show",
             format!(
                 "effective class: {:?} (source: {}, {:?})",
-                class, self.policy.source.origin, self.policy.source.trust
+                class, policy.source.origin, policy.source.trust
             ),
         )
         .data(data)
         .to_value()
+    }
+
+    fn changes_json(&self) -> serde_json::Value {
+        let l = self.state.ledger.lock().unwrap();
+        json!({ "changes": l.list() })
     }
 
     #[tool(
@@ -126,10 +186,7 @@ impl Heisenberg {
         description = "Probe the machine: OS build/edition, architecture (incl. WOW64), integrity level, privileges (SeDebug/SeTcb), session id, and derived capabilities. Read-only."
     )]
     async fn env_check(&self) -> Result<CallToolResult, McpError> {
-        let v = self.env_report_json();
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            serde_json::to_string_pretty(&v).unwrap_or_default(),
-        )]))
+        Ok(text(self.env_report_json()))
     }
 
     #[tool(
@@ -137,10 +194,7 @@ impl Heisenberg {
         description = "Show the effective box class, its source and trust, per-tool overrides, and the full gate matrix (box class x effect tier). Read-only."
     )]
     async fn policy_show(&self) -> Result<CallToolResult, McpError> {
-        let v = self.policy_json();
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            serde_json::to_string_pretty(&v).unwrap_or_default(),
-        )]))
+        Ok(text(self.policy_json()))
     }
 
     #[tool(
@@ -153,7 +207,7 @@ impl Heisenberg {
     ) -> Result<CallToolResult, McpError> {
         let v = match parse_tier(&args.tier) {
             Some(tier) => {
-                let decision = self.policy.decide(&args.tool, tier);
+                let decision = self.state.policy.decide(&args.tool, tier);
                 Outcome::new(
                     "gate.check",
                     format!("{} [{:?}] -> {:?}", decision.tool, decision.tier, decision.gate),
@@ -169,9 +223,180 @@ impl Heisenberg {
                 None,
             ),
         };
-        Ok(CallToolResult::success(vec![ContentBlock::text(
-            serde_json::to_string_pretty(&v).unwrap_or_default(),
-        )]))
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "symbols.show",
+        description = "Show the current _NT_SYMBOL_PATH (from the user environment). Read-only."
+    )]
+    async fn symbols_show(&self) -> Result<CallToolResult, McpError> {
+        let cur = regutil::get_hkcu_env("_NT_SYMBOL_PATH");
+        let summary = match &cur {
+            Some(p) => format!("_NT_SYMBOL_PATH = {p}"),
+            None => "_NT_SYMBOL_PATH is unset".to_string(),
+        };
+        let v = Outcome::new("symbols.show", summary)
+            .data(json!({ "path": cur }))
+            .docs(SYMBOL_PATH_DOCS)
+            .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "symbols.configure",
+        description = "Set _NT_SYMBOL_PATH in the user environment (state-changing, reversible via the ledger). Supports dry_run; needs a confirm token on Production, human approval on Critical."
+    )]
+    async fn symbols_configure(
+        &self,
+        Parameters(a): Parameters<SymbolsConfigureArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "symbols.configure";
+        let prior = regutil::get_hkcu_env("_NT_SYMBOL_PATH");
+        let cmd = format!("setx _NT_SYMBOL_PATH \"{}\"", a.path);
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            self.state
+                .audit
+                .record(tool, "dry-run", Some(&format!("{:?}", decision.gate)), "dry-run", None);
+            let v = Outcome::new(
+                tool,
+                format!("[dry-run] would set _NT_SYMBOL_PATH (gate: {:?})", decision.gate),
+            )
+            .data(json!({ "path": a.path, "prior": prior, "gate": decision }))
+            .command(cmd)
+            .docs(SYMBOL_PATH_DOCS)
+            .warn("dry-run: no change made")
+            .to_value();
+            return Ok(text(v));
+        }
+
+        let decision = match gate::enforce(
+            &self.state.policy,
+            tool,
+            EffectTier::StateChanging,
+            SYMBOLS_TOKEN,
+            a.confirm.as_deref(),
+        ) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state
+                    .audit
+                    .record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(SYMBOL_PATH_DOCS))));
+            }
+        };
+
+        // Record the inverse *before* applying.
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                &format!("set _NT_SYMBOL_PATH to {}", a.path),
+                RevertPlan::HkcuEnv {
+                    name: "_NT_SYMBOL_PATH".to_string(),
+                    prior: prior.clone(),
+                },
+            )
+        };
+
+        match regutil::set_hkcu_env("_NT_SYMBOL_PATH", &a.path) {
+            Ok(()) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(
+                    tool,
+                    &format!("set _NT_SYMBOL_PATH to {}", a.path),
+                    Some(&format!("{:?}", decision.gate)),
+                    "applied",
+                    Some(&id),
+                );
+                let v = Outcome::new(
+                    tool,
+                    format!(
+                        "set _NT_SYMBOL_PATH (was {}); change {}",
+                        prior.as_deref().unwrap_or("<unset>"),
+                        id
+                    ),
+                )
+                .data(json!({ "path": a.path, "prior": prior, "changeId": id }))
+                .command(cmd)
+                .docs(SYMBOL_PATH_DOCS)
+                .warn("new/restarted processes pick this up; already-running processes keep the old value")
+                .to_value();
+                Ok(text(v))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                self.state.audit.record(
+                    tool,
+                    &format!("apply failed: {e}"),
+                    Some(&format!("{:?}", decision.gate)),
+                    "failed",
+                    Some(&id),
+                );
+                Ok(text(error(
+                    tool,
+                    ErrorKind::Internal,
+                    format!("failed to set registry value: {e}"),
+                    "check HKCU\\Environment permissions",
+                    Some(SYMBOL_PATH_DOCS),
+                )))
+            }
+        }
+    }
+
+    #[tool(
+        name = "changes.list",
+        description = "List the reversible-change ledger: every state mutation this server made, its status, and how to undo it. Read-only."
+    )]
+    async fn changes_list(&self) -> Result<CallToolResult, McpError> {
+        let (count, data) = {
+            let l = self.state.ledger.lock().unwrap();
+            (l.list().len(), json!({ "changes": l.list() }))
+        };
+        let v = Outcome::new("changes.list", format!("{count} change(s) recorded"))
+            .data(data)
+            .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "changes.revert",
+        description = "Undo a change by id (from changes.list) using its recorded inverse. Reverting is always allowed."
+    )]
+    async fn changes_revert(
+        &self,
+        Parameters(a): Parameters<ChangesRevertArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "changes.revert";
+        let result = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.revert(&a.id)
+        };
+        let v = match result {
+            Ok(c) => {
+                self.state
+                    .audit
+                    .record(tool, &format!("reverted {}", a.id), Some("Allow"), "reverted", Some(&a.id));
+                Outcome::new(tool, format!("reverted change {} ({})", c.id, c.summary))
+                    .data(json!({ "change": c }))
+                    .to_value()
+            }
+            Err(e) => {
+                self.state
+                    .audit
+                    .record(tool, &format!("revert failed: {e}"), Some("Allow"), "failed", Some(&a.id));
+                error(
+                    tool,
+                    ErrorKind::InvalidArgument,
+                    format!("{e}"),
+                    "check the id via changes.list",
+                    None,
+                )
+            }
+        };
+        Ok(text(v))
     }
 }
 
@@ -191,7 +416,8 @@ impl ServerHandler for Heisenberg {
         .with_instructions(
             "Heisenberg makes Windows native debugging easy for an agent, wrapping only free \
              Microsoft-published tools. Start with env.check to learn what the box supports, and \
-             gate.check to see what a proposed action would require before attempting it."
+             gate.check to see what a proposed action would require. Mutating tools (e.g. \
+             symbols.configure) are recorded in the change ledger and reversible via changes.revert."
                 .to_string(),
         )
     }
@@ -204,6 +430,8 @@ impl ServerHandler for Heisenberg {
         let mut resources = vec![
             Resource::new("heisenberg://env", "Machine capability snapshot".to_string()),
             Resource::new("heisenberg://policy", "Effective safety policy".to_string()),
+            Resource::new("heisenberg://changes", "Reversible-change ledger".to_string()),
+            Resource::new("heisenberg://audit", "Audit journal (recent entries)".to_string()),
         ];
         for (key, name, _, _) in docs::DOCS {
             resources.push(Resource::new(
@@ -234,9 +462,13 @@ impl ServerHandler for Heisenberg {
         _: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, McpError> {
         let uri = request.uri.clone();
-        let text = match uri.as_str() {
+        let text_body = match uri.as_str() {
             "heisenberg://env" => serde_json::to_string_pretty(&self.env_report_json()).ok(),
             "heisenberg://policy" => serde_json::to_string_pretty(&self.policy_json()).ok(),
+            "heisenberg://changes" => serde_json::to_string_pretty(&self.changes_json()).ok(),
+            "heisenberg://audit" => {
+                serde_json::to_string_pretty(&json!({ "entries": self.state.audit.tail(200) })).ok()
+            }
             other if other.starts_with("docs://") => {
                 let key = &other["docs://".len()..];
                 docs::lookup(key).map(|(k, name, url, summary)| {
@@ -249,7 +481,7 @@ impl ServerHandler for Heisenberg {
             _ => None,
         };
 
-        match text {
+        match text_body {
             Some(t) => Ok(ReadResourceResult::new(vec![ResourceContents::text(t, uri)]).into()),
             None => Err(McpError::resource_not_found(
                 "resource_not_found",

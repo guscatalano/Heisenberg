@@ -44,6 +44,8 @@ pub enum ErrorKind {
     Timeout,
     CaptureInProgress,
     ConfirmationRequired,
+    RequiresApproval,
+    PolicyDenied,
     NotImplemented,
     Internal,
 }
