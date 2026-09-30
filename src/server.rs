@@ -23,7 +23,7 @@ use crate::ledger::{ChangeStatus, Ledger, RevertPlan};
 use crate::policy::{base_gate, BoxClass, EffectTier, Policy};
 use crate::store::Store;
 use crate::tools::Locator;
-use crate::{docs, env_probe, gate, proc, regutil};
+use crate::{docs, env_probe, gate, kernel, proc, regutil};
 
 const SYMBOLS_TOKEN: &str = "set-symbol-path";
 const SYMBOL_PATH_DOCS: &str =
@@ -38,6 +38,13 @@ const FLG_HEAP_PAGE_ALLOCS: u32 = 0x0200_0000;
 const PAGE_HEAP_FULL: u32 = 0x3;
 
 const PROCMON_DOCS: &str = "https://learn.microsoft.com/sysinternals/downloads/procmon";
+
+const KERNEL_TOKEN: &str = "kernel-debug-setup";
+const CRASHDUMP_TOKEN: &str = "set-crash-dump";
+const KERNEL_DOCS: &str =
+    "https://learn.microsoft.com/windows-hardware/drivers/debugger/setting-up-kernel-mode-debugging-in-windbg--cdb--or-ntsd";
+const CRASHDUMP_DOCS: &str =
+    "https://learn.microsoft.com/windows-hardware/drivers/debugger/enabling-a-kernel-mode-dump-file";
 
 /// Shared server state: the immutable policy plus the on-disk ledger and audit.
 pub struct AppState {
@@ -157,6 +164,60 @@ pub struct ProcmonStartArgs {
 pub struct JobIdArgs {
     /// Job id from job.list / heisenberg://captures.
     pub id: String,
+}
+
+fn default_com() -> u32 {
+    1
+}
+fn default_baud() -> u32 {
+    115200
+}
+fn default_kdport() -> u32 {
+    50000
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KernelCrashDumpArgs {
+    /// none | small | kernel | complete | automatic.
+    pub mode: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KernelSerialArgs {
+    /// Guest COM port number (1 = COM1).
+    #[serde(default = "default_com")]
+    pub port: u32,
+    #[serde(default = "default_baud")]
+    pub baudrate: u32,
+    /// Host/hypervisor hint: hyperv | proxmox | vmware | physical | auto.
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KernelNetArgs {
+    /// The debugger host's IP the target will send KDNET packets to.
+    pub hostip: String,
+    #[serde(default = "default_kdport")]
+    pub port: u32,
+    /// Optional KDNET key; omitted → bcdedit generates one (returned).
+    #[serde(default)]
+    pub key: Option<String>,
+    /// Host/hypervisor hint: hyperv | proxmox | vmware | physical | auto.
+    #[serde(default)]
+    pub host: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 fn comsvcs_path() -> std::path::PathBuf {
@@ -1198,6 +1259,332 @@ impl Heisenberg {
         Parameters(a): Parameters<JobIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.do_stop("job.cancel", &a.id, true).await
+    }
+
+    /// Run bcdedit, mapping access-denied to RequiresElevation.
+    async fn run_bcdedit(&self, args: &[&str]) -> Result<String, (ErrorKind, String)> {
+        let out = Command::new("bcdedit")
+            .args(args)
+            .output()
+            .await
+            .map_err(|e| (ErrorKind::Internal, e.to_string()))?;
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        if out.status.success() {
+            Ok(combined.trim().to_string())
+        } else {
+            let low = combined.to_lowercase();
+            let kind = if low.contains("access is denied") || low.contains("elevat") {
+                ErrorKind::RequiresElevation
+            } else {
+                ErrorKind::Internal
+            };
+            Err((kind, combined.trim().to_string()))
+        }
+    }
+
+    #[tool(
+        name = "kernel.status",
+        description = "Show kernel-debug configuration: crash-dump mode (CrashControl), detected hypervisor (Hyper-V/Proxmox/VMware/physical), and — when elevated — bcdedit debug settings. Read-only."
+    )]
+    async fn kernel_status(&self) -> Result<CallToolResult, McpError> {
+        let cc = regutil::crashcontrol_read();
+        let hv = kernel::detect_hypervisor();
+        let (dbg, dbg_note) = match self.run_bcdedit(&["/dbgsettings"]).await {
+            Ok(s) => (Some(s), None),
+            Err((k, e)) => (None, Some(format!("{k:?}: {e}"))),
+        };
+        let v = Outcome::new(
+            "kernel.status",
+            format!(
+                "crash dump: {}, hypervisor: {hv}",
+                cc.map(kernel::crash_dump_mode_name).unwrap_or("unknown")
+            ),
+        )
+        .data(json!({
+            "crashDumpEnabled": cc,
+            "crashDumpMode": cc.map(kernel::crash_dump_mode_name),
+            "hypervisor": hv,
+            "dbgSettings": dbg,
+            "dbgSettingsNote": dbg_note,
+        }))
+        .docs(KERNEL_DOCS)
+        .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "kernel.setCrashDump",
+        description = "Set the kernel crash-dump mode (none|small|kernel|complete|automatic) via CrashControl. State-changing, reversible via the ledger; needs elevation. dry_run + confirm."
+    )]
+    async fn kernel_set_crash_dump(
+        &self,
+        Parameters(a): Parameters<KernelCrashDumpArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "kernel.setCrashDump";
+        let target = match kernel::crash_dump_mode_value(&a.mode) {
+            Some(v) => v,
+            None => {
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::InvalidArgument,
+                    format!("unknown mode '{}'", a.mode),
+                    "use none|small|kernel|complete|automatic",
+                    Some(CRASHDUMP_DOCS),
+                )))
+            }
+        };
+        let prior = regutil::crashcontrol_read();
+        let cmd = format!(
+            "reg add HKLM\\SYSTEM\\CurrentControlSet\\Control\\CrashControl /v CrashDumpEnabled /t REG_DWORD /d {target} /f"
+        );
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            self.state.audit.record(tool, "dry-run", Some(&format!("{:?}", decision.gate)), "dry-run", None);
+            return Ok(text(
+                Outcome::new(
+                    tool,
+                    format!("[dry-run] would set crash dump to {}", kernel::crash_dump_mode_name(target)),
+                )
+                .data(json!({
+                    "priorMode": prior.map(kernel::crash_dump_mode_name), "prior": prior,
+                    "wouldSet": target, "mode": kernel::crash_dump_mode_name(target), "gate": decision
+                }))
+                .command(cmd)
+                .docs(CRASHDUMP_DOCS)
+                .warn("dry-run: no change made")
+                .to_value(),
+            ));
+        }
+
+        if !env_probe::is_elevated() {
+            return Ok(text(error(
+                tool,
+                ErrorKind::RequiresElevation,
+                "writing CrashControl needs an elevated token",
+                "re-run Heisenberg elevated",
+                Some(CRASHDUMP_DOCS),
+            )));
+        }
+        let decision = match gate::enforce(
+            &self.state.policy,
+            tool,
+            EffectTier::StateChanging,
+            CRASHDUMP_TOKEN,
+            a.confirm.as_deref(),
+        ) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(CRASHDUMP_DOCS))));
+            }
+        };
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                &format!("set crash dump to {}", kernel::crash_dump_mode_name(target)),
+                RevertPlan::CrashControl { prior },
+            )
+        };
+        match regutil::crashcontrol_write(target) {
+            Ok(()) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(
+                    tool,
+                    &format!("crash dump -> {}", kernel::crash_dump_mode_name(target)),
+                    Some(&format!("{:?}", decision.gate)),
+                    "applied",
+                    Some(&id),
+                );
+                Ok(text(
+                    Outcome::new(
+                        tool,
+                        format!("set crash dump to {}; change {id}", kernel::crash_dump_mode_name(target)),
+                    )
+                    .data(json!({ "mode": kernel::crash_dump_mode_name(target), "value": target, "prior": prior, "changeId": id }))
+                    .command(cmd)
+                    .docs(CRASHDUMP_DOCS)
+                    .warn("complete/kernel dumps need a page file sized appropriately on the system drive; takes effect on the next bugcheck")
+                    .to_value(),
+                ))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                let (kind, remedy) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    (ErrorKind::RequiresElevation, "re-run elevated")
+                } else {
+                    (ErrorKind::Internal, "check CrashControl permissions")
+                };
+                Ok(text(error(tool, kind, format!("failed to write CrashControl: {e}"), remedy, Some(CRASHDUMP_DOCS))))
+            }
+        }
+    }
+
+    #[tool(
+        name = "kernel.serialDebugSetup",
+        description = "Configure the guest for SERIAL kernel debugging (bcdedit dbgsettings + /debug on) and return host-side wiring for the hypervisor (Hyper-V exposes the COM port as a named pipe; Proxmox needs a socket bridge; VMware/physical too). State-changing, reversible; needs elevation + reboot. dry_run + confirm."
+    )]
+    async fn kernel_serial_setup(
+        &self,
+        Parameters(a): Parameters<KernelSerialArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "kernel.serialDebugSetup";
+        let host = kernel::resolve_host(a.host.as_deref());
+        let guidance = kernel::serial_guidance(&host, a.port, a.baudrate);
+        let cmds = format!(
+            "bcdedit /dbgsettings serial debugport:{} baudrate:{} ; bcdedit /debug on",
+            a.port, a.baudrate
+        );
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] serial KD on COM{} @ {} for {host}", a.port, a.baudrate))
+                    .data(json!({ "host": host, "guidance": guidance, "gate": decision }))
+                    .command(cmds)
+                    .docs(KERNEL_DOCS)
+                    .warn("dry-run: no change made")
+                    .to_value(),
+            ));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "bcdedit needs an elevated token", "re-run Heisenberg elevated", Some(KERNEL_DOCS))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, KERNEL_TOKEN, a.confirm.as_deref()) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(KERNEL_DOCS))));
+            }
+        };
+        let prior = self.run_bcdedit(&["/dbgsettings"]).await.ok();
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                &format!("enable serial KD (COM{} @ {})", a.port, a.baudrate),
+                RevertPlan::Command {
+                    program: "bcdedit".to_string(),
+                    args: vec!["/debug".to_string(), "off".to_string()],
+                    describe: "disable kernel debugging (bcdedit /debug off)".to_string(),
+                },
+            )
+        };
+        if let Err((k, e)) = self
+            .run_bcdedit(&["/dbgsettings", "serial", &format!("debugport:{}", a.port), &format!("baudrate:{}", a.baudrate)])
+            .await
+        {
+            self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+            return Ok(text(error(tool, k, format!("bcdedit dbgsettings failed: {e}"), "run elevated; ensure BCD is writable", Some(KERNEL_DOCS))));
+        }
+        if let Err((k, e)) = self.run_bcdedit(&["/debug", "on"]).await {
+            self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+            return Ok(text(error(tool, k, format!("bcdedit /debug on failed: {e}"), "run elevated", Some(KERNEL_DOCS))));
+        }
+        self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+        self.state.audit.record(tool, "serial KD configured", Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+        Ok(text(
+            Outcome::new(tool, format!("configured serial KD on COM{} @ {} (reboot required); change {id}", a.port, a.baudrate))
+                .data(json!({ "host": host, "guidance": guidance, "priorDbgSettings": prior, "changeId": id }))
+                .command(cmds)
+                .docs(KERNEL_DOCS)
+                .warn("reboot the target for kernel debugging to take effect; Secure Boot must be OFF")
+                .to_value(),
+        ))
+    }
+
+    #[tool(
+        name = "kernel.netDebugSetup",
+        description = "Configure the guest for NETWORK (KDNET) kernel debugging (bcdedit dbgsettings net + /debug on) and return host-side wiring + hypervisor caveats (Proxmox: e1000e + hv-vendor-id; Hyper-V Gen2 synthetic NIC). Returns the generated key. State-changing, reversible; needs elevation + reboot. dry_run + confirm."
+    )]
+    async fn kernel_net_setup(
+        &self,
+        Parameters(a): Parameters<KernelNetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "kernel.netDebugSetup";
+        let host = kernel::resolve_host(a.host.as_deref());
+        let guidance = kernel::net_guidance(&host, &a.hostip, a.port, a.key.as_deref());
+        let keypart = a.key.as_ref().map(|k| format!(" key:{k}")).unwrap_or_default();
+        let cmds = format!("bcdedit /dbgsettings net hostip:{} port:{}{keypart} ; bcdedit /debug on", a.hostip, a.port);
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] KDNET to {}:{} for {host}", a.hostip, a.port))
+                    .data(json!({ "host": host, "guidance": guidance, "gate": decision }))
+                    .command(cmds)
+                    .docs(KERNEL_DOCS)
+                    .warn("dry-run: no change made")
+                    .to_value(),
+            ));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "bcdedit needs an elevated token", "re-run Heisenberg elevated", Some(KERNEL_DOCS))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, KERNEL_TOKEN, a.confirm.as_deref()) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(KERNEL_DOCS))));
+            }
+        };
+        let prior = self.run_bcdedit(&["/dbgsettings"]).await.ok();
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                &format!("enable KDNET (hostip {} port {})", a.hostip, a.port),
+                RevertPlan::Command {
+                    program: "bcdedit".to_string(),
+                    args: vec!["/debug".to_string(), "off".to_string()],
+                    describe: "disable kernel debugging (bcdedit /debug off)".to_string(),
+                },
+            )
+        };
+        let mut args: Vec<String> = vec![
+            "/dbgsettings".to_string(),
+            "net".to_string(),
+            format!("hostip:{}", a.hostip),
+            format!("port:{}", a.port),
+        ];
+        if let Some(k) = &a.key {
+            args.push(format!("key:{k}"));
+        }
+        let argrefs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let dbg_out = match self.run_bcdedit(&argrefs).await {
+            Ok(o) => o,
+            Err((k, e)) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                return Ok(text(error(tool, k, format!("bcdedit dbgsettings net failed: {e}"), "run elevated; ensure BCD is writable", Some(KERNEL_DOCS))));
+            }
+        };
+        if let Err((k, e)) = self.run_bcdedit(&["/debug", "on"]).await {
+            self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+            return Ok(text(error(tool, k, format!("bcdedit /debug on failed: {e}"), "run elevated", Some(KERNEL_DOCS))));
+        }
+        // bcdedit prints the (generated) key.
+        let generated_key = dbg_out
+            .lines()
+            .find(|l| l.to_lowercase().contains("key"))
+            .and_then(|l| l.split(':').nth(1))
+            .map(|s| s.trim().to_string())
+            .or_else(|| a.key.clone());
+
+        self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+        self.state.audit.record(tool, "KDNET configured", Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+        Ok(text(
+            Outcome::new(tool, format!("configured KDNET to {}:{} (reboot required); change {id}", a.hostip, a.port))
+                .data(json!({ "host": host, "guidance": guidance, "key": generated_key, "priorDbgSettings": prior, "changeId": id }))
+                .command(cmds)
+                .docs(KERNEL_DOCS)
+                .warn("reboot the target for KDNET to take effect; Secure Boot OFF; the NIC must be KDNET-supported (e1000e, not virtio)")
+                .to_value(),
+        ))
     }
 }
 

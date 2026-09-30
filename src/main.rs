@@ -12,6 +12,7 @@ mod env_probe;
 mod envelope;
 mod gate;
 mod jobs;
+mod kernel;
 mod ledger;
 mod policy;
 mod proc;

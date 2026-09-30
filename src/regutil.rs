@@ -125,6 +125,53 @@ pub fn ifeo_restore(
     Ok(())
 }
 
+// --- CrashControl (kernel crash-dump configuration) under HKLM ---
+
+#[cfg(windows)]
+const CRASHCONTROL: &str = r"SYSTEM\CurrentControlSet\Control\CrashControl";
+
+/// Read `CrashDumpEnabled`. Reading HKLM works without elevation.
+#[cfg(windows)]
+pub fn crashcontrol_read() -> Option<u32> {
+    use winreg::enums::HKEY_LOCAL_MACHINE;
+    use winreg::RegKey;
+    RegKey::predef(HKEY_LOCAL_MACHINE)
+        .open_subkey(CRASHCONTROL)
+        .ok()?
+        .get_value::<u32, _>("CrashDumpEnabled")
+        .ok()
+}
+
+/// Write `CrashDumpEnabled` (needs elevation).
+#[cfg(windows)]
+pub fn crashcontrol_write(value: u32) -> std::io::Result<()> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_SET_VALUE};
+    use winreg::RegKey;
+    let k = RegKey::predef(HKEY_LOCAL_MACHINE).open_subkey_with_flags(CRASHCONTROL, KEY_SET_VALUE)?;
+    k.set_value("CrashDumpEnabled", &value)
+}
+
+#[cfg(windows)]
+pub fn crashcontrol_restore(prior: Option<u32>) -> std::io::Result<()> {
+    match prior {
+        Some(v) => crashcontrol_write(v),
+        None => Ok(()),
+    }
+}
+
+#[cfg(not(windows))]
+pub fn crashcontrol_read() -> Option<u32> {
+    None
+}
+#[cfg(not(windows))]
+pub fn crashcontrol_write(_value: u32) -> std::io::Result<()> {
+    Ok(())
+}
+#[cfg(not(windows))]
+pub fn crashcontrol_restore(_prior: Option<u32>) -> std::io::Result<()> {
+    Ok(())
+}
+
 #[cfg(not(windows))]
 pub fn ifeo_read(_image: &str) -> (Option<u32>, Option<u32>, bool) {
     (None, None, false)

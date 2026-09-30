@@ -22,6 +22,14 @@ pub enum RevertPlan {
         prior_page_heap: Option<u32>,
         created_key: bool,
     },
+    /// Restore `CrashControl\CrashDumpEnabled` to its prior value.
+    CrashControl { prior: Option<u32> },
+    /// Run a command to undo the change (e.g. `bcdedit /debug off`).
+    Command {
+        program: String,
+        args: Vec<String>,
+        describe: String,
+    },
     /// A change we can describe but not yet undo automatically.
     Manual { instructions: String },
 }
@@ -41,6 +49,28 @@ impl RevertPlan {
             } => {
                 regutil::ifeo_restore(image, *prior_global_flag, *prior_page_heap, *created_key)?;
                 Ok(())
+            }
+            RevertPlan::CrashControl { prior } => {
+                regutil::crashcontrol_restore(*prior)?;
+                Ok(())
+            }
+            RevertPlan::Command {
+                program,
+                args,
+                describe,
+            } => {
+                let out = std::process::Command::new(program)
+                    .args(args)
+                    .output()
+                    .map_err(|e| anyhow::anyhow!("revert '{describe}' failed to launch: {e}"))?;
+                if out.status.success() {
+                    Ok(())
+                } else {
+                    anyhow::bail!(
+                        "revert '{describe}' failed: {}",
+                        String::from_utf8_lossy(&out.stderr).trim()
+                    )
+                }
             }
             RevertPlan::Manual { instructions } => {
                 anyhow::bail!("manual revert required: {instructions}")

@@ -27,6 +27,9 @@ Tools today:
 | `symbols.show` / `symbols.configure` | Read / set `_NT_SYMBOL_PATH` (reversible via the ledger; `dry_run` + confirm token). |
 | `procmon.start` / `procmon.stop` | Start/stop a background Process Monitor capture to a `.pml` (needs Procmon staged + elevation). |
 | `job.list` / `job.status` / `job.stop` / `job.cancel` | Unified control for every background capture job. |
+| `kernel.status` | Crash-dump mode, detected hypervisor (Hyper-V / Proxmox / VMware / physical), and bcdedit debug settings. |
+| `kernel.setCrashDump` | Set the crash-dump mode via CrashControl (reversible; needs elevation). |
+| `kernel.serialDebugSetup` / `kernel.netDebugSetup` | Configure guest kernel debugging (serial or KDNET) + emit host-side wiring for the hypervisor (reversible; needs elevation + reboot). |
 | `changes.list` / `changes.revert` | The reversible-change ledger and one-call undo. |
 
 Resources: `heisenberg://env`, `heisenberg://policy`, `heisenberg://changes`,
