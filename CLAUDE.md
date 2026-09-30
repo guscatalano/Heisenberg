@@ -15,10 +15,11 @@ cargo clippy             # keep this clean
 
 ## Testing the live server
 
-Drive it with a **synchronous** stdio client (send a request, read one response
-line, repeat). Piping all requests then closing stdin makes rmcp cancel the last
-in-flight tool call — so a batch-and-EOF test drops responses. See the pattern in
-prior smoke tests: `initialize` → `notifications/initialized` → `tools/call`.
+Run the smoke test: `python scripts/smoke.py` (after `cargo build`). It drives
+the server the correct way — a **synchronous** stdio client (send a request, read
+one response line, repeat). Piping all requests then closing stdin makes rmcp
+cancel the last in-flight tool call, so a batch-and-EOF test drops responses.
+The handshake is `initialize` → `notifications/initialized` → `tools/call`.
 
 Useful env vars for testing:
 - `HEISENBERG_HOME` — state root (ledger/audit/dumps/jobs/cases + artifacts).
