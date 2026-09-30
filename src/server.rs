@@ -4,6 +4,7 @@
 //! (`symbols.configure`) that exercises the whole path.
 
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
@@ -12,13 +13,16 @@ use rmcp::service::RequestContext;
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::process::Command;
 
 use crate::audit::Audit;
-use crate::envelope::{error, ErrorKind, Outcome};
+use crate::dumps::DumpRegistry;
+use crate::envelope::{error, Artifact, ErrorKind, Outcome};
 use crate::ledger::{ChangeStatus, Ledger, RevertPlan};
 use crate::policy::{base_gate, BoxClass, EffectTier, Policy};
 use crate::store::Store;
-use crate::{docs, env_probe, gate, regutil};
+use crate::tools::Locator;
+use crate::{docs, env_probe, gate, proc, regutil};
 
 const SYMBOLS_TOKEN: &str = "set-symbol-path";
 const SYMBOL_PATH_DOCS: &str =
@@ -27,9 +31,10 @@ const SYMBOL_PATH_DOCS: &str =
 /// Shared server state: the immutable policy plus the on-disk ledger and audit.
 pub struct AppState {
     pub policy: Policy,
-    #[allow(dead_code)] // used by artifact-producing tools in a later phase.
     pub store: Store,
+    pub locator: Locator,
     pub ledger: Mutex<Ledger>,
+    pub dumps: Mutex<DumpRegistry>,
     pub audit: Audit,
 }
 
@@ -37,12 +42,15 @@ impl AppState {
     pub fn new(policy: Policy) -> Self {
         let store = Store::discover();
         let ledger = Ledger::load(store.ledger_path());
+        let dumps = DumpRegistry::load(store.dumps_path());
         let audit = Audit::open(store.audit_path());
         AppState {
             policy,
-            store,
+            locator: Locator::discover(),
             ledger: Mutex::new(ledger),
+            dumps: Mutex::new(dumps),
             audit,
+            store,
         }
     }
 }
@@ -78,6 +86,66 @@ pub struct SymbolsConfigureArgs {
 pub struct ChangesRevertArgs {
     /// The change id to undo (from changes.list).
     pub id: String,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DumpCaptureArgs {
+    /// Target process id (preferred — unambiguous).
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Target process name, e.g. "notepad.exe". Rejected if it matches many.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Full-memory dump (default) vs a minidump.
+    #[serde(default = "default_true")]
+    pub full: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DumpAnalyzeArgs {
+    /// A dump id from dump.capture (or heisenberg://dumps/<id>), or a file path.
+    pub dump: String,
+    /// Optional cdb command string (default: "!analyze -v; ~*k; lm t; q").
+    #[serde(default)]
+    pub commands: Option<String>,
+}
+
+fn comsvcs_path() -> std::path::PathBuf {
+    let sr = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
+    std::path::PathBuf::from(sr).join("System32").join("comsvcs.dll")
+}
+
+/// Pull a handful of well-known fields out of cdb's `!analyze -v` text.
+fn parse_analysis(raw: &str) -> serde_json::Value {
+    let grab = |key: &str| -> Option<String> {
+        raw.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix(key)
+                .map(|rest| rest.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    };
+    json!({
+        "exceptionCode": grab("ExceptionCode:"),
+        "faultingModule": grab("MODULE_NAME:").or_else(|| grab("FAULTING_MODULE:")),
+        "faultingIp": grab("FAULTING_IP:"),
+        "processName": grab("PROCESS_NAME:"),
+        "failureBucket": grab("FAILURE_BUCKET_ID:"),
+        "bugcheck": grab("BUGCHECK_CODE:"),
+    })
+}
+
+fn last_chars(s: &str, n: usize) -> String {
+    let v: Vec<char> = s.chars().collect();
+    if v.len() <= n {
+        s.to_string()
+    } else {
+        v[v.len() - n..].iter().collect()
+    }
 }
 
 fn parse_tier(s: &str) -> Option<EffectTier> {
@@ -398,6 +466,287 @@ impl Heisenberg {
         };
         Ok(text(v))
     }
+
+    #[tool(
+        name = "tools.list",
+        description = "Inventory the external tools Heisenberg drives: which are found (with path) and which are missing, each with its doc link. Read-only."
+    )]
+    async fn tools_list(&self) -> Result<CallToolResult, McpError> {
+        let inv = self.state.locator.inventory();
+        let found = inv.iter().filter(|t| t["found"] == json!(true)).count();
+        let v = Outcome::new("tools.list", format!("{}/{} known tools found", found, inv.len()))
+            .data(json!({ "tools": inv }))
+            .to_value();
+        Ok(text(v))
+    }
+
+    #[tool(
+        name = "dump.capture",
+        description = "Capture a user-mode process dump (full by default, or mini) by pid or name. Auto-selects ProcDump if staged, else comsvcs MiniDump. Read-only; disk pre-checked. Full dumps are marked high-sensitivity."
+    )]
+    async fn dump_capture(
+        &self,
+        Parameters(a): Parameters<DumpCaptureArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.capture";
+        let docs = "https://learn.microsoft.com/sysinternals/downloads/procdump";
+
+        let pid = match proc::resolve(a.pid, a.name.as_deref()) {
+            Ok(p) => p,
+            Err(proc::TargetError::NotFound(m)) => {
+                self.state.audit.record(tool, &format!("target not found: {m}"), None, "error", None);
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::TargetNotFound,
+                    format!("no process matched {m}"),
+                    "pass a valid pid or an exact process name",
+                    Some(docs),
+                )));
+            }
+            Err(proc::TargetError::Ambiguous { name, pids }) => {
+                self.state.audit.record(tool, &format!("ambiguous target {name}"), None, "error", None);
+                let mut v = error(
+                    tool,
+                    ErrorKind::AmbiguousTarget,
+                    format!("'{name}' matches {} processes", pids.len()),
+                    "re-call with a specific pid",
+                    Some(docs),
+                );
+                v["error"]["candidates"] = json!(pids);
+                return Ok(text(v));
+            }
+        };
+
+        // Disk pre-check: estimate from the target's working set.
+        let dir = self.state.store.artifacts_dir();
+        let est = proc::working_set(pid).unwrap_or(64 * 1024 * 1024);
+        let need = if a.full {
+            est + est / 2 + 16 * 1024 * 1024
+        } else {
+            32 * 1024 * 1024
+        };
+        if let Some(free) = proc::free_bytes(&dir) {
+            if free < need {
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::InsufficientDiskSpace,
+                    format!("need ~{} MB, only {} MB free", need / 1048576, free / 1048576),
+                    "free space or point HEISENBERG_HOME at another drive",
+                    Some(docs),
+                )));
+            }
+        }
+
+        let kind = if a.full { "full" } else { "mini" };
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let outpath = dir.join(format!("pid{pid}_{ts}.dmp"));
+
+        let mut warnings: Vec<String> = Vec::new();
+        let (backend, cmd_str, mut cmd) = if let Some(pd) = self.state.locator.find("procdump.exe") {
+            let mode = if a.full { "-ma" } else { "-mp" };
+            let s = format!("{} -accepteula {} {} \"{}\"", pd.display(), mode, pid, outpath.display());
+            let mut c = Command::new(&pd);
+            c.args(["-accepteula", mode]).arg(pid.to_string()).arg(&outpath);
+            ("procdump", s, c)
+        } else {
+            let comsvcs = comsvcs_path();
+            if !a.full {
+                warnings.push("comsvcs MiniDump writes a full dump; 'mini' was upgraded to full".to_string());
+            }
+            let s = format!("rundll32.exe {},MiniDump {} \"{}\" full", comsvcs.display(), pid, outpath.display());
+            let mut c = Command::new("rundll32.exe");
+            c.arg(format!("{},MiniDump", comsvcs.display()))
+                .arg(pid.to_string())
+                .arg(&outpath)
+                .arg("full");
+            ("comsvcs", s, c)
+        };
+
+        let output = match tokio::time::timeout(Duration::from_secs(180), cmd.output()).await {
+            Err(_) => {
+                self.state.audit.record(tool, "capture timed out", None, "timeout", None);
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::Timeout,
+                    "dump capture timed out after 180s",
+                    "retry, or capture a mini dump",
+                    Some(docs),
+                )));
+            }
+            Ok(Err(e)) => {
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::Internal,
+                    format!("failed to launch {backend}: {e}"),
+                    "check the backend tool is present",
+                    Some(docs),
+                )));
+            }
+            Ok(Ok(o)) => o,
+        };
+
+        if !output.status.success() || !outpath.is_file() {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let denied = combined.to_ascii_lowercase().contains("access is denied");
+            let (kinderr, remedy) = if denied {
+                (
+                    ErrorKind::AccessDenied,
+                    "run elevated (SeDebugPrivilege) to dump another user/session or protected process",
+                )
+            } else {
+                (ErrorKind::AnalysisFailed, "check the target pid and that the backend can dump it")
+            };
+            self.state.audit.record(tool, &format!("capture failed via {backend}"), None, "failed", None);
+            let mut v = error(tool, kinderr, format!("{backend} failed to capture pid {pid}"), remedy, Some(docs));
+            v["error"]["output"] = json!(combined.trim());
+            return Ok(text(v));
+        }
+
+        let bytes = std::fs::metadata(&outpath).map(|m| m.len()).unwrap_or(0);
+        let rec = {
+            let mut reg = self.state.dumps.lock().unwrap();
+            reg.add(outpath.display().to_string(), pid, kind, backend, bytes)
+        };
+        self.state.audit.record(
+            tool,
+            &format!("captured {kind} dump of pid {pid} ({bytes} bytes)"),
+            None,
+            "captured",
+            Some(&rec.id),
+        );
+
+        let mut out = Outcome::new(
+            tool,
+            format!(
+                "captured {kind} dump of pid {pid} via {backend} ({:.1} MB)",
+                bytes as f64 / 1048576.0
+            ),
+        )
+        .data(json!({
+            "pid": pid, "kind": kind, "backend": backend,
+            "bytes": bytes, "path": outpath.display().to_string(), "dumpId": rec.id
+        }))
+        .artifact(Artifact {
+            kind: "dump".to_string(),
+            path: outpath.display().to_string(),
+            bytes,
+            resource: format!("heisenberg://dumps/{}", rec.id),
+            sensitivity: Some(rec.sensitivity.clone()),
+        })
+        .command(cmd_str)
+        .docs(docs);
+        if rec.sensitivity == "high" {
+            out = out.warn(
+                "full dump may contain passwords/keys/PII; treat as high-sensitivity and do not transfer off-box unreviewed",
+            );
+        }
+        for w in warnings {
+            out = out.warn(w);
+        }
+        Ok(text(out.to_value()))
+    }
+
+    #[tool(
+        name = "dump.analyze",
+        description = "Open a user-mode dump in cdb and run analysis (default: !analyze -v, all-thread stacks, modules). Accepts a dump id from dump.capture or a file path. Read-only; needs cdb from the Debugging Tools for Windows."
+    )]
+    async fn dump_analyze(
+        &self,
+        Parameters(a): Parameters<DumpAnalyzeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.analyze";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/";
+
+        let path = {
+            let reg = self.state.dumps.lock().unwrap();
+            let id = a.dump.trim_start_matches("heisenberg://dumps/");
+            reg.get(id).map(|r| r.path.clone()).unwrap_or_else(|| a.dump.clone())
+        };
+        if !std::path::Path::new(&path).is_file() {
+            return Ok(text(error(
+                tool,
+                ErrorKind::TargetNotFound,
+                format!("no dump at {path}"),
+                "capture one with dump.capture, or pass a valid file path",
+                Some(docs),
+            )));
+        }
+
+        let cdb = match self.state.locator.find("cdb.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(
+                    tool,
+                    ErrorKind::ToolNotInstalled,
+                    "cdb.exe not found",
+                    "install the Debugging Tools for Windows (winget install Microsoft.WinDbg) or stage it in --tools-dir",
+                    Some(docs),
+                );
+                v["error"]["wingetId"] = json!("Microsoft.WinDbg");
+                return Ok(text(v));
+            }
+        };
+
+        let sympath = regutil::get_hkcu_env("_NT_SYMBOL_PATH").unwrap_or_else(|| {
+            format!(
+                "srv*{}*https://msdl.microsoft.com/download/symbols",
+                self.state.store.root.join("symbols").display()
+            )
+        });
+        let cmds = a
+            .commands
+            .clone()
+            .unwrap_or_else(|| "!analyze -v; ~*k; lm t; q".to_string());
+        let cmd_str = format!(
+            "{} -z \"{}\" -y \"{}\" -c \"{}\"",
+            cdb.display(),
+            path,
+            sympath,
+            cmds
+        );
+
+        let mut c = Command::new(&cdb);
+        c.arg("-z").arg(&path).arg("-y").arg(&sympath).arg("-c").arg(&cmds);
+        let output = match tokio::time::timeout(Duration::from_secs(300), c.output()).await {
+            Err(_) => {
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::Timeout,
+                    "cdb analysis timed out after 300s (symbol download can be slow)",
+                    "retry once symbols are cached, or pass a narrower command set",
+                    Some(docs),
+                )))
+            }
+            Ok(Err(e)) => {
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::Internal,
+                    format!("failed to launch cdb: {e}"),
+                    "check the cdb path",
+                    Some(docs),
+                )))
+            }
+            Ok(Ok(o)) => o,
+        };
+
+        let raw = String::from_utf8_lossy(&output.stdout).to_string();
+        let parsed = parse_analysis(&raw);
+        let sym_missing = raw.contains("symbols could not be loaded")
+            || raw.contains("Symbol file could not be found");
+        let mut out = Outcome::new(tool, format!("analyzed {path}"))
+            .data(json!({ "path": path, "parsed": parsed, "raw": last_chars(&raw, 8000) }))
+            .command(cmd_str)
+            .docs(docs);
+        if sym_missing {
+            out = out.warn("some symbols could not be loaded; stacks may be incomplete");
+        }
+        self.state.audit.record(tool, &format!("analyzed {path}"), None, "analyzed", None);
+        Ok(text(out.to_value()))
+    }
 }
 
 #[tool_handler]
@@ -432,6 +781,8 @@ impl ServerHandler for Heisenberg {
             Resource::new("heisenberg://policy", "Effective safety policy".to_string()),
             Resource::new("heisenberg://changes", "Reversible-change ledger".to_string()),
             Resource::new("heisenberg://audit", "Audit journal (recent entries)".to_string()),
+            Resource::new("heisenberg://dumps", "Captured dumps".to_string()),
+            Resource::new("heisenberg://tools", "External tool inventory".to_string()),
         ];
         for (key, name, _, _) in docs::DOCS {
             resources.push(Resource::new(
@@ -468,6 +819,18 @@ impl ServerHandler for Heisenberg {
             "heisenberg://changes" => serde_json::to_string_pretty(&self.changes_json()).ok(),
             "heisenberg://audit" => {
                 serde_json::to_string_pretty(&json!({ "entries": self.state.audit.tail(200) })).ok()
+            }
+            "heisenberg://dumps" => {
+                let reg = self.state.dumps.lock().unwrap();
+                serde_json::to_string_pretty(&json!({ "dumps": reg.list() })).ok()
+            }
+            "heisenberg://tools" => {
+                serde_json::to_string_pretty(&json!({ "tools": self.state.locator.inventory() })).ok()
+            }
+            other if other.starts_with("heisenberg://dumps/") => {
+                let id = &other["heisenberg://dumps/".len()..];
+                let reg = self.state.dumps.lock().unwrap();
+                reg.get(id).map(|r| serde_json::to_string_pretty(r).unwrap_or_default())
             }
             other if other.starts_with("docs://") => {
                 let key = &other["docs://".len()..];

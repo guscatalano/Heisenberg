@@ -7,14 +7,17 @@
 mod audit;
 mod config;
 mod docs;
+mod dumps;
 mod env_probe;
 mod envelope;
 mod gate;
 mod ledger;
 mod policy;
+mod proc;
 mod regutil;
 mod server;
 mod store;
+mod tools;
 
 use anyhow::Result;
 use rmcp::{transport::stdio, ServiceExt};

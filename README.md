@@ -9,20 +9,26 @@ Full design plan: <https://claude.ai/code/artifact/00a8d7df-6da0-4f1b-a9f9-2cb87
 
 ## Status
 
-**Phase 1 (foundation) — implemented.** The static single-binary `rmcp` server,
-the `env.check` capability probe, the box-class safety spine, and the
-`heisenberg://` / `docs://` resources. Later phases (dump capture/analysis,
-gflags, procmon, kernel, TTD, logs, session-0) are planned; see the doc.
+**Phases 1–3 — implemented.** The static single-binary `rmcp` server, the
+`env.check` probe, the box-class safety spine with *enforcement*, the reversible
+change ledger + audit journal, and the first capture-then-inspect loop. Later
+phases (gflags, procmon, kernel, TTD, logs, session-0) are planned; see the doc.
 
 Tools today:
 
 | Tool | What it does |
 |------|--------------|
 | `env.check` | Probe OS build/edition, architecture (incl. WOW64), integrity level, privileges (SeDebug/SeTcb), session id, derived capabilities. Read-only. |
-| `policy.show` | Effective box class, its source/trust, per-tool overrides, and the full gate matrix. |
-| `gate.check` | What gate a proposed `tool` + effect tier would face on this box (allow / confirm-token / human-approval / deny), without running anything. |
+| `policy.show` / `gate.check` | Show the box class + gate matrix; test what gate a proposed tool+tier would face, without running anything. |
+| `tools.list` | Inventory the external tools Heisenberg drives — found (with path) vs missing — each with its doc link. |
+| `dump.capture` | Capture a user-mode dump (full/mini) by pid or name. ProcDump if staged, else comsvcs. Disk pre-checked; full dumps marked high-sensitivity. |
+| `dump.analyze` | Open a dump in cdb (`!analyze -v`, stacks, modules) and return parsed + raw. Needs the Debugging Tools for Windows. |
+| `symbols.show` / `symbols.configure` | Read / set `_NT_SYMBOL_PATH` (reversible via the ledger; `dry_run` + confirm token). |
+| `changes.list` / `changes.revert` | The reversible-change ledger and one-call undo. |
 
-Resources: `heisenberg://env`, `heisenberg://policy`, `docs://<tool>`.
+Resources: `heisenberg://env`, `heisenberg://policy`, `heisenberg://changes`,
+`heisenberg://audit`, `heisenberg://dumps` (+ `/<id>`), `heisenberg://tools`,
+`docs://<tool>`.
 
 ## Build
 
