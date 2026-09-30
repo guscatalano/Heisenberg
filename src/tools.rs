@@ -17,6 +17,10 @@ pub const KNOWN_TOOLS: &[(&str, &str)] = &[
     ("dotnet-dump", "dotnet-dump.exe"),
     ("dotnet-gcdump", "dotnet-gcdump.exe"),
     ("dotnet-trace", "dotnet-trace.exe"),
+    ("umdh", "umdh.exe"),
+    ("autoruns", "autorunsc.exe"),
+    ("psexec", "PsExec.exe"),
+    ("poolmon", "poolmon.exe"),
 ];
 
 pub struct Locator {

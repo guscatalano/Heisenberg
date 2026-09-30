@@ -33,6 +33,11 @@ Tools today:
 | `gflags.get` / `gflags.set` | Show / enable full page heap for an image via IFEO (reversible via the ledger; `dry_run` + confirm token; needs elevation). Disable by reverting the change. |
 | `appverifier.enable` | Enable Application Verifier for an image via IFEO (reversible; needs elevation). |
 | `ttd.record` / `ttd.stop` / `ttd.replay` | Record a process to a Time Travel Debugging `.run` trace (a `job.*` capture) and replay it in cdb. |
+| `leak.heapTrackStart` / `leak.heapSnapshot` / `leak.heapDiff` | Enable the UMDH stack DB (IFEO), snapshot a heap, and diff snapshots to find leaks. |
+| `boot.trace` | Configure a WPR boot trace (arm / collect / cancel) for pre-login and startup issues. |
+| `gpu.tdrAnalyze` | Analyze a kernel dump for a GPU TDR (VIDEO_TDR_FAILURE 0x116/0x117). |
+| `inspect.autoruns` | Enumerate autostart / persistence points (Autoruns) as CSV. |
+| `remote.logCollect` / `remote.dumpCapture` | Query event logs (wevtutil /r) or capture a dump (PsExec + ProcDump) on a remote host. |
 | `dotnet.dump` / `dotnet.gcHeap` / `dotnet.analyze` | Managed (.NET) dumps, GC-heap snapshots, and SOS analysis via the dotnet diagnostics tools. |
 | `symbols.show` / `symbols.configure` | Read / set `_NT_SYMBOL_PATH` (reversible via the ledger; `dry_run` + confirm token). |
 | `procmon.start` / `procmon.stop` | Start/stop a background Process Monitor capture to a `.pml` (needs Procmon staged + elevation). |

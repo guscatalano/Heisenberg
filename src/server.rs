@@ -71,6 +71,8 @@ const APPVERIF_DOCS: &str =
     "https://learn.microsoft.com/windows-hardware/drivers/devtest/application-verifier";
 /// FLG_APPLICATION_VERIFIER in the IFEO GlobalFlag.
 const FLG_APPLICATION_VERIFIER: u32 = 0x100;
+/// FLG_USER_STACK_TRACE_DB ("ust") in the IFEO GlobalFlag — needed for UMDH.
+const FLG_USER_STACK_TRACE_DB: u32 = 0x1000;
 
 /// Shared server state: the immutable policy plus the on-disk ledger and audit.
 pub struct AppState {
@@ -169,6 +171,52 @@ pub struct GflagsGetArgs {
 
 fn default_dbgsrv_port() -> u32 {
     5005
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LeakDiffArgs {
+    /// Baseline UMDH snapshot path (from leak.heapSnapshot).
+    pub baseline: String,
+    /// Later UMDH snapshot path to diff against the baseline.
+    pub current: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BootTraceArgs {
+    /// "arm" (configure a boot trace; needs reboot), "collect" (finalize after
+    /// reboot), or "cancel".
+    pub action: String,
+    /// WPR profile for "arm" (default "GeneralProfile").
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub confirm: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemoteLogArgs {
+    /// Remote host name or IP.
+    pub host: String,
+    #[serde(default = "default_channel")]
+    pub channel: String,
+    #[serde(default = "default_count")]
+    pub count: u32,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RemoteDumpArgs {
+    /// Remote host name or IP.
+    pub host: String,
+    /// Target pid on the remote host.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Or target process name on the remote host.
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3301,6 +3349,295 @@ impl Heisenberg {
                 ))
             }
             Err(e) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch dbgsrv: {e}"), "check the dbgsrv path", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "leak.heapTrackStart",
+        description = "Enable the user-mode stack-trace DB (IFEO GlobalFlag 'ust') for an image so UMDH can attribute heap allocations. State-changing, reversible; needs elevation. Restart the target, then use leak.heapSnapshot. dry_run + confirm."
+    )]
+    async fn leak_heap_track_start(
+        &self,
+        Parameters(a): Parameters<AppVerifierArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "leak.heapTrackStart";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/umdh";
+        let subkey = format!(
+            r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options\{}",
+            a.image
+        );
+        let prior_gf = regutil::hklm_read_dword(&subkey, "GlobalFlag");
+        let exists = regutil::hklm_key_exists(&subkey);
+        let new_gf = prior_gf.unwrap_or(0) | FLG_USER_STACK_TRACE_DB;
+        let cmd = format!("gflags /i {} +ust", a.image);
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would enable heap stack DB for {} (gate: {:?})", a.image, decision.gate))
+                    .data(json!({ "image": a.image, "priorGlobalFlag": prior_gf, "wouldSet": new_gf, "gate": decision }))
+                    .command(cmd).docs(docs).warn("dry-run: no change made").to_value(),
+            ));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing IFEO needs an elevated token", "re-run elevated", Some(docs))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "enable-heap-track", a.confirm.as_deref()) {
+            Ok(d) => d,
+            Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs)))); }
+        };
+        let id = { let mut l = self.state.ledger.lock().unwrap(); l.begin(tool, &format!("enable heap stack DB for {}", a.image), RevertPlan::RegRestore { subkey: subkey.clone(), strings: vec![], dwords: vec![("GlobalFlag".to_string(), prior_gf)], created_key: !exists }) };
+        match regutil::hklm_set_dword(&subkey, "GlobalFlag", new_gf) {
+            Ok(_) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(tool, &format!("ust enabled for {}", a.image), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                Ok(text(Outcome::new(tool, format!("enabled heap stack DB for {}; change {id}", a.image)).data(json!({ "image": a.image, "globalFlag": new_gf, "changeId": id })).command(cmd).docs(docs).warn("restart the target so the stack DB takes effect, then snapshot with leak.heapSnapshot; revert with changes.revert").to_value()))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                let (k, remedy) = if e.kind() == std::io::ErrorKind::PermissionDenied { (ErrorKind::RequiresElevation, "re-run elevated") } else { (ErrorKind::Internal, "check IFEO permissions") };
+                Ok(text(error(tool, k, format!("failed to write IFEO: {e}"), remedy, Some(docs))))
+            }
+        }
+    }
+
+    #[tool(
+        name = "leak.heapSnapshot",
+        description = "Take a UMDH heap snapshot of a process (needs ust enabled via leak.heapTrackStart and the target restarted). Read-only; needs umdh."
+    )]
+    async fn leak_heap_snapshot(
+        &self,
+        Parameters(a): Parameters<DotnetTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "leak.heapSnapshot";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/umdh";
+        let umdh = match self.state.locator.find("umdh.exe") {
+            Some(p) => p,
+            None => { let mut v = error(tool, ErrorKind::ToolNotInstalled, "umdh.exe not found", "install the Debugging Tools for Windows", Some(docs)); v["error"]["wingetId"] = json!("Microsoft.WinDbg"); return Ok(text(v)); }
+        };
+        let pid = match proc::resolve(a.pid, a.name.as_deref()) {
+            Ok(p) => p,
+            Err(proc::TargetError::NotFound(m)) => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no process matched {m}"), "pass a pid or name", Some(docs)))),
+            Err(proc::TargetError::Ambiguous { name, pids }) => { let mut v = error(tool, ErrorKind::AmbiguousTarget, format!("'{name}' matches {} processes", pids.len()), "pass a specific pid", Some(docs)); v["error"]["candidates"] = json!(pids); return Ok(text(v)); }
+        };
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let out = self.state.store.artifacts_dir().join(format!("umdh_{pid}_{ts}.log"));
+        let output = tokio::time::timeout(Duration::from_secs(120), Command::new(&umdh).arg(format!("-p:{pid}")).arg(format!("-f:{}", out.display())).output()).await;
+        match output {
+            Ok(Ok(o)) if o.status.success() && out.is_file() => {
+                let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                self.state.audit.record(tool, &format!("umdh snapshot of pid {pid}"), None, "captured", None);
+                Ok(text(Outcome::new(tool, format!("UMDH snapshot of pid {pid} ({bytes} bytes)")).data(json!({ "pid": pid, "path": out.display().to_string(), "bytes": bytes })).artifact(Artifact { kind: "umdh".to_string(), path: out.display().to_string(), bytes, resource: out.display().to_string(), sensitivity: Some("low".to_string()) }).docs(docs).warn("take a baseline and a later snapshot, then diff with leak.heapDiff").to_value()))
+            }
+            Ok(Ok(o)) => Ok(text(error(tool, ErrorKind::AnalysisFailed, format!("umdh failed for pid {pid}: {}", String::from_utf8_lossy(&o.stderr).trim()), "ensure ust is enabled (leak.heapTrackStart) and the target was restarted", Some(docs)))),
+            Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch umdh: {e}"), "check the umdh path", Some(docs)))),
+            Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "umdh timed out", "retry", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "leak.heapDiff",
+        description = "Diff two UMDH snapshots to surface leaked allocation stacks. Read-only; needs umdh."
+    )]
+    async fn leak_heap_diff(
+        &self,
+        Parameters(a): Parameters<LeakDiffArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "leak.heapDiff";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/umdh";
+        let umdh = match self.state.locator.find("umdh.exe") {
+            Some(p) => p,
+            None => return Ok(text(error(tool, ErrorKind::ToolNotInstalled, "umdh.exe not found", "install the Debugging Tools for Windows", Some(docs)))),
+        };
+        if !std::path::Path::new(&a.baseline).is_file() || !std::path::Path::new(&a.current).is_file() {
+            return Ok(text(error(tool, ErrorKind::TargetNotFound, "baseline or current snapshot not found", "pass two valid UMDH snapshot paths", Some(docs))));
+        }
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let out = self.state.store.artifacts_dir().join(format!("umdh_diff_{ts}.log"));
+        let output = tokio::time::timeout(Duration::from_secs(120), Command::new(&umdh).arg(&a.baseline).arg(&a.current).arg(format!("-f:{}", out.display())).output()).await;
+        match output {
+            Ok(Ok(o)) if o.status.success() && out.is_file() => {
+                let raw = std::fs::read_to_string(&out).unwrap_or_default();
+                self.state.audit.record(tool, "umdh diff", None, "analyzed", None);
+                Ok(text(Outcome::new(tool, format!("UMDH diff -> {}", out.display())).data(json!({ "path": out.display().to_string(), "raw": last_chars(&raw, 8000) })).artifact(Artifact { kind: "umdh-diff".to_string(), path: out.display().to_string(), bytes: raw.len() as u64, resource: out.display().to_string(), sensitivity: Some("low".to_string()) }).docs(docs).to_value()))
+            }
+            Ok(Ok(o)) => Ok(text(error(tool, ErrorKind::AnalysisFailed, format!("umdh diff failed: {}", String::from_utf8_lossy(&o.stderr).trim()), "ensure both snapshots are valid", Some(docs)))),
+            Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch umdh: {e}"), "check umdh", Some(docs)))),
+            Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "umdh diff timed out", "retry", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "boot.trace",
+        description = "Configure a WPR boot trace (action: arm | collect | cancel). 'arm' needs a reboot; 'collect' finalizes the .etl after reboot. State-changing; needs elevation. dry_run + confirm."
+    )]
+    async fn boot_trace(
+        &self,
+        Parameters(a): Parameters<BootTraceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "boot.trace";
+        let docs = WPR_DOCS;
+        let action = a.action.to_lowercase();
+        if !matches!(action.as_str(), "arm" | "collect" | "cancel") {
+            return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("unknown action '{}'", a.action), "use arm|collect|cancel", Some(docs))));
+        }
+        let profile = a.profile.clone().unwrap_or_else(|| "GeneralProfile".to_string());
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            let preview = match action.as_str() {
+                "arm" => format!("wpr -boottrace -addboot {profile} -filemode"),
+                "collect" => "wpr -boottrace -stopboot <out.etl>".to_string(),
+                _ => "wpr -boottrace -cancelboot".to_string(),
+            };
+            return Ok(text(Outcome::new(tool, format!("[dry-run] boot.trace {action} (gate: {:?})", decision.gate)).data(json!({ "action": action, "profile": profile, "gate": decision })).command(preview).docs(docs).warn("dry-run: no change made").to_value()));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "WPR boot trace needs an elevated token", "re-run elevated", Some(docs))));
+        }
+        match action.as_str() {
+            "arm" => {
+                let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "boot-trace", a.confirm.as_deref()) {
+                    Ok(d) => d,
+                    Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs)))); }
+                };
+                let id = { let mut l = self.state.ledger.lock().unwrap(); l.begin(tool, "arm WPR boot trace", RevertPlan::Command { program: "wpr".to_string(), args: vec!["-boottrace".to_string(), "-cancelboot".to_string()], describe: "cancel the armed boot trace".to_string() }) };
+                let (ok, o) = self.run_capture("wpr", &["-boottrace", "-addboot", &profile, "-filemode"], 60).await;
+                if ok {
+                    self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                    self.state.audit.record(tool, "boot trace armed", Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                    Ok(text(Outcome::new(tool, format!("armed WPR boot trace ({profile}); change {id}")).data(json!({ "profile": profile, "changeId": id })).command(format!("wpr -boottrace -addboot {profile} -filemode")).docs(docs).warn("reboot the machine, then run boot.trace action=collect to write the .etl; or changes.revert / action=cancel to abort").to_value()))
+                } else {
+                    self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                    Ok(text(error(tool, ErrorKind::Internal, format!("wpr -addboot failed: {}", o.trim()), "run elevated; check the profile", Some(docs))))
+                }
+            }
+            "collect" => {
+                let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+                let etl = self.state.store.artifacts_dir().join(format!("boot_{ts}.etl"));
+                let (ok, o) = self.run_capture("wpr", &["-boottrace", "-stopboot", &etl.display().to_string()], 300).await;
+                if ok && etl.is_file() {
+                    let bytes = std::fs::metadata(&etl).map(|m| m.len()).unwrap_or(0);
+                    self.state.audit.record(tool, "boot trace collected", None, "collected", None);
+                    Ok(text(Outcome::new(tool, format!("collected boot trace -> {} ({:.1} MB)", etl.display(), bytes as f64 / 1048576.0)).data(json!({ "path": etl.display().to_string(), "bytes": bytes })).artifact(Artifact { kind: "trace".to_string(), path: etl.display().to_string(), bytes, resource: etl.display().to_string(), sensitivity: Some("medium".to_string()) }).docs(docs).to_value()))
+                } else {
+                    Ok(text(error(tool, ErrorKind::Internal, format!("wpr -stopboot failed: {}", o.trim()), "was a boot trace armed and the machine rebooted?", Some(docs))))
+                }
+            }
+            _ => {
+                let (ok, o) = self.run_capture("wpr", &["-boottrace", "-cancelboot"], 60).await;
+                self.state.audit.record(tool, "boot trace cancelled", None, if ok { "cancelled" } else { "failed" }, None);
+                if ok { Ok(text(Outcome::new(tool, "cancelled the armed boot trace").docs(docs).to_value())) }
+                else { Ok(text(error(tool, ErrorKind::Internal, format!("wpr -cancelboot failed: {}", o.trim()), "no boot trace may be armed", Some(docs)))) }
+            }
+        }
+    }
+
+    #[tool(
+        name = "remote.logCollect",
+        description = "Query an event-log channel on a REMOTE host via wevtutil /r. Read-only; needs network reachability and permissions on the target."
+    )]
+    async fn remote_log_collect(
+        &self,
+        Parameters(a): Parameters<RemoteLogArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "remote.logCollect";
+        let docs = WEVTUTIL_DOCS;
+        let rflag = format!("/r:{}", a.host);
+        let cflag = format!("/c:{}", a.count);
+        let (ok, o) = self.run_capture("wevtutil", &["qe", a.channel.as_str(), &rflag, &cflag, "/rd:true", "/f:text"], 60).await;
+        if !ok {
+            let low = o.to_lowercase();
+            let k = if low.contains("access is denied") { ErrorKind::AccessDenied } else if low.contains("rpc") || low.contains("could not connect") { ErrorKind::Internal } else { ErrorKind::InvalidArgument };
+            return Ok(text(error(tool, k, format!("remote wevtutil failed: {}", o.trim()), "check the host, network, and permissions (WinRM/RPC)", Some(docs))));
+        }
+        let events = o.matches("Event[").count();
+        Ok(text(Outcome::new(tool, format!("{events} event(s) from {} on {}", a.channel, a.host)).data(json!({ "host": a.host, "channel": a.channel, "count": events, "raw": last_chars(&o, 8000) })).docs(docs).to_value()))
+    }
+
+    #[tool(
+        name = "remote.dumpCapture",
+        description = "Capture a full dump of a process on a REMOTE host via PsExec + ProcDump (both must be available on the target); the dump lands on the remote host for UNC retrieval. State-changing on the remote; needs PsExec + admin on the target. confirm per box class."
+    )]
+    async fn remote_dump_capture(
+        &self,
+        Parameters(a): Parameters<RemoteDumpArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "remote.dumpCapture";
+        let docs = "https://learn.microsoft.com/sysinternals/downloads/psexec";
+        let ps = match self.state.locator.find("PsExec.exe") {
+            Some(p) => p,
+            None => { let mut v = error(tool, ErrorKind::ToolNotInstalled, "PsExec.exe not found", "stage Sysinternals PsExec in --tools-dir", Some(docs)); v["error"]["wingetId"] = json!("Microsoft.Sysinternals.PsExec"); return Ok(text(v)); }
+        };
+        let target = match (a.pid, &a.name) {
+            (Some(p), _) => p.to_string(),
+            (None, Some(n)) => n.clone(),
+            (None, None) => return Ok(text(error(tool, ErrorKind::InvalidArgument, "no pid or name given", "pass pid or name of the remote process", Some(docs)))),
+        };
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "remote-dump", a.confirm.as_deref()) {
+            Ok(d) => d,
+            Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs)))); }
+        };
+        let remote_path = format!(r"C:\Windows\Temp\heisenberg_{target}.dmp");
+        let host_arg = format!(r"\\{}", a.host);
+        let (ok, o) = self.run_capture(
+            &ps.display().to_string(),
+            &[&host_arg, "-s", "-nobanner", "-accepteula", "procdump", "-accepteula", "-ma", &target, &remote_path],
+            180,
+        ).await;
+        self.state.audit.record(tool, &format!("remote dump of {target} on {}", a.host), Some(&format!("{:?}", decision.gate)), if ok { "captured" } else { "failed" }, None);
+        if ok {
+            Ok(text(Outcome::new(tool, format!("captured remote dump of {target} on {}", a.host)).data(json!({ "host": a.host, "target": target, "remotePath": remote_path, "unc": format!(r"\\{}\C$\Windows\Temp\heisenberg_{target}.dmp", a.host) })).command(format!("psexec \\\\{} -s procdump -ma {target} {remote_path}", a.host)).docs(docs).warn("the dump is on the REMOTE host; retrieve it via UNC (\\\\host\\C$\\...). Full dumps are high-sensitivity.").to_value()))
+        } else {
+            Ok(text(error(tool, ErrorKind::AnalysisFailed, format!("remote capture failed: {}", o.trim()), "ensure PsExec admin access and ProcDump on the target", Some(docs))))
+        }
+    }
+
+    #[tool(
+        name = "gpu.tdrAnalyze",
+        description = "Analyze a kernel dump for a GPU TDR / display timeout (bugcheck 0x116 VIDEO_TDR_FAILURE / 0x117 VIDEO_TDR_TIMEOUT). Read-only; needs cdb."
+    )]
+    async fn gpu_tdr_analyze(
+        &self,
+        Parameters(a): Parameters<DumpAnalyzeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "gpu.tdrAnalyze";
+        let cmds = a.commands.clone().unwrap_or_else(|| "!analyze -v; q".to_string());
+        match self.run_cdb_on(tool, &a.dump, &cmds).await {
+            Ok((path, raw, cmd_str)) => {
+                let up = raw.to_uppercase();
+                let tdr = up.contains("VIDEO_TDR") || raw.contains("0x116") || raw.contains("0x117");
+                let mut out = Outcome::new(tool, format!("{}TDR analysis of {path}", if tdr { "" } else { "no " }))
+                    .data(json!({ "path": path, "tdrDetected": tdr, "raw": last_chars(&raw, 8000) }))
+                    .command(cmd_str)
+                    .docs("https://learn.microsoft.com/windows-hardware/drivers/display/tdr-debugging");
+                if tdr { out = out.warn("VIDEO_TDR detected — a GPU stopped responding and was reset; inspect the graphics driver and !analyze output"); }
+                self.state.audit.record(tool, &format!("tdr analysis {path}"), None, "analyzed", None);
+                Ok(text(out.to_value()))
+            }
+            Err(ct) => Ok(ct),
+        }
+    }
+
+    #[tool(
+        name = "inspect.autoruns",
+        description = "Enumerate autostart / persistence points (Autoruns) as CSV. Read-only; needs autorunsc staged."
+    )]
+    async fn inspect_autoruns(&self) -> Result<CallToolResult, McpError> {
+        let tool = "inspect.autoruns";
+        let docs = "https://learn.microsoft.com/sysinternals/downloads/autoruns";
+        let ar = match self.state.locator.find("autorunsc.exe") {
+            Some(p) => p,
+            None => { let mut v = error(tool, ErrorKind::ToolNotInstalled, "autorunsc.exe not found", "stage Sysinternals Autoruns in --tools-dir", Some(docs)); v["error"]["wingetId"] = json!("Microsoft.Sysinternals.Autoruns"); return Ok(text(v)); }
+        };
+        let output = tokio::time::timeout(Duration::from_secs(120), Command::new(&ar).args(["-accepteula", "-nobanner", "-a", "*", "-c"]).output()).await;
+        match output {
+            Ok(Ok(o)) => {
+                let raw = String::from_utf8_lossy(&o.stdout).to_string();
+                let entries = raw.lines().count().saturating_sub(1);
+                self.state.audit.record(tool, "autoruns enumerated", None, "captured", None);
+                Ok(text(Outcome::new(tool, format!("{entries} autostart entries")).data(json!({ "entries": entries, "csv": last_chars(&raw, 8000) })).docs(docs).to_value()))
+            }
+            Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch autorunsc: {e}"), "check the autorunsc path", Some(docs)))),
+            Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "autorunsc timed out", "retry", Some(docs)))),
         }
     }
 }
