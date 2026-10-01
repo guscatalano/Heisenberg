@@ -21,6 +21,7 @@ pub const KNOWN_TOOLS: &[(&str, &str)] = &[
     ("autoruns", "autorunsc.exe"),
     ("psexec", "PsExec.exe"),
     ("poolmon", "poolmon.exe"),
+    ("groundhog", "groundhog-agent.exe"),
 ];
 
 /// How a known tool is installed.

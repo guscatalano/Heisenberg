@@ -38,6 +38,7 @@ const FLG_HEAP_PAGE_ALLOCS: u32 = 0x0200_0000;
 const PAGE_HEAP_FULL: u32 = 0x3;
 
 const PROCMON_DOCS: &str = "https://learn.microsoft.com/sysinternals/downloads/procmon";
+const GROUNDHOG_DOCS: &str = "https://github.com/guscatalano/Groundhog";
 
 const KERNEL_TOKEN: &str = "kernel-debug-setup";
 const CRASHDUMP_TOKEN: &str = "set-crash-dump";
@@ -171,6 +172,18 @@ pub struct GflagsGetArgs {
 
 fn default_dbgsrv_port() -> u32 {
     5005
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ProvisionArgs {
+    /// Groundhog profile or Groundhogfile path/URL (default: the windows-internals
+    /// library — Sysinternals, WinDbg, WPT, symbols, crash dumps).
+    #[serde(default)]
+    pub profile: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1010,6 +1023,83 @@ impl Heisenberg {
                 ErrorKind::ToolInstallFailed
             };
             let mut v = error(tool, k, format!("install of {} failed", a.tool), "check network/winget availability; on air-gapped boxes stage a --tools-dir bundle", Some(docs));
+            v["error"]["output"] = json!(last_chars(&out, 3000));
+            Ok(text(v))
+        }
+    }
+
+    #[tool(
+        name = "env.provision",
+        description = "Provision the whole debugging environment in one step via Groundhog (if installed): applies a Groundhogfile profile (default the windows-internals library: Sysinternals, WinDbg, WPT, _NT_SYMBOL_PATH, WER crash dumps). State-changing, gated; needs elevation. ToolNotInstalled if groundhog-agent isn't present. dry_run + confirm."
+    )]
+    async fn env_provision(
+        &self,
+        Parameters(a): Parameters<ProvisionArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "env.provision";
+        let agent = self
+            .state
+            .locator
+            .find("groundhog-agent.exe")
+            .or_else(|| self.state.locator.find("groundhog.exe"));
+        let agent = match agent {
+            Some(p) => p,
+            None => {
+                return Ok(text(error(
+                    tool,
+                    ErrorKind::ToolNotInstalled,
+                    "groundhog-agent not found",
+                    "install Groundhog (https://github.com/guscatalano/Groundhog); or use tools.install for individual tools",
+                    Some(GROUNDHOG_DOCS),
+                )))
+            }
+        };
+        let profile = a.profile.clone().unwrap_or_else(|| "groundhog:windows-internals".to_string());
+        let cmd = format!("{} apply {}", agent.display(), profile);
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would apply Groundhog profile '{profile}' (gate: {:?})", decision.gate))
+                    .data(json!({ "agent": agent.display().to_string(), "profile": profile, "gate": decision }))
+                    .command(cmd)
+                    .docs(GROUNDHOG_DOCS)
+                    .warn("dry-run: no change made")
+                    .to_value(),
+            ));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "the windows-internals profile writes HKLM (crash dumps); needs an elevated token", "re-run Heisenberg elevated", Some(GROUNDHOG_DOCS))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "provision-environment", a.confirm.as_deref()) {
+            Ok(d) => d,
+            Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(GROUNDHOG_DOCS)))); }
+        };
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                &format!("Groundhog apply {profile}"),
+                RevertPlan::Manual {
+                    instructions: "Groundhog applies are declarative/idempotent; to undo, apply a prior profile or remove the installed items (C:\\Tools\\Sysinternals, _NT_SYMBOL_PATH, WER LocalDumps, CrashControl).".to_string(),
+                },
+            )
+        };
+        let (ok, out) = self.run_capture(&agent.display().to_string(), &["apply", &profile], 900).await;
+        if ok {
+            self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+            self.state.audit.record(tool, &format!("provisioned via Groundhog ({profile})"), Some(&format!("{:?}", decision.gate)), "provisioned", Some(&id));
+            Ok(text(
+                Outcome::new(tool, format!("provisioned the environment via Groundhog profile '{profile}'; change {id}"))
+                    .data(json!({ "profile": profile, "changeId": id, "output": last_chars(&out, 3000) }))
+                    .command(cmd)
+                    .docs(GROUNDHOG_DOCS)
+                    .warn("re-run tools.list / env.check to confirm the toolchain resolves; some PATH/env changes need a new shell")
+                    .to_value(),
+            ))
+        } else {
+            self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+            let mut v = error(tool, ErrorKind::ToolInstallFailed, format!("Groundhog apply of '{profile}' failed"), "check the profile name/URL and network; see the Groundhog output", Some(GROUNDHOG_DOCS));
             v["error"]["output"] = json!(last_chars(&out, 3000));
             Ok(text(v))
         }
