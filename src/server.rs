@@ -7,11 +7,15 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use rmcp::handler::server::router::prompt::PromptRouter;
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::*;
 use rmcp::service::RequestContext;
-use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, RoleServer, ServerHandler};
+use rmcp::{
+    prompt, prompt_handler, prompt_router, schemars, tool, tool_handler, tool_router,
+    ErrorData as McpError, RoleServer, ServerHandler,
+};
 use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
@@ -132,6 +136,8 @@ pub struct Heisenberg {
     state: Arc<AppState>,
     #[allow(dead_code)] // read by the generated ServerHandler (tool_handler macro).
     tool_router: ToolRouter<Heisenberg>,
+    #[allow(dead_code)] // read by the generated ServerHandler (prompt_handler macro).
+    prompt_router: PromptRouter<Heisenberg>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -194,6 +200,14 @@ pub struct GflagsGetArgs {
 
 fn default_dbgsrv_port() -> u32 {
     5005
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PromptTargetArgs {
+    /// Target for the playbook: a pid, process name, image name, or dump id/path
+    /// (whichever the scenario needs).
+    #[serde(default)]
+    pub target: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -648,6 +662,7 @@ impl Heisenberg {
         Self {
             state: Arc::new(AppState::new(policy)),
             tool_router: Self::tool_router(),
+            prompt_router: Self::prompt_router(),
         }
     }
 
@@ -3948,7 +3963,224 @@ impl Heisenberg {
     }
 }
 
+fn user_msg(text: String) -> Vec<PromptMessage> {
+    vec![PromptMessage::new_text(Role::User, text)]
+}
+
+#[prompt_router]
+impl Heisenberg {
+    #[prompt(
+        name = "triage-broken-box",
+        description = "First-response triage playbook for a broken or unfamiliar Windows box."
+    )]
+    async fn p_triage(&self) -> Result<Vec<PromptMessage>, McpError> {
+        Ok(user_msg(
+            "Triage this Windows box, breadth-first and read-only:\n\
+             1. system.triage — services, boot config, drivers, hypervisor, and log locations.\n\
+             2. env.check — OS build/edition, arch, integrity, privileges (SeDebug/SeTcb), session.\n\
+             3. kernel.status — crash-dump mode + whether kernel debugging is configured.\n\
+             4. tools.list — what debugging tools are present; run env.provision or tools.install for gaps.\n\
+             5. logs.eventQuery (System, then Application) — recent errors; export with logs.eventExport.\n\
+             6. inspect.processTree / inspect.network — what's running and talking.\n\
+             7. collect.package — bundle the findings into a portable case.\n\
+             Report what's abnormal and propose the next, narrower step."
+                .to_string(),
+        ))
+    }
+
+    #[prompt(
+        name = "diagnose-crash",
+        description = "Investigate a crashing process (live target) or an existing crash dump."
+    )]
+    async fn p_crash(
+        &self,
+        Parameters(a): Parameters<PromptTargetArgs>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let t = a.target.unwrap_or_else(|| "<pid | name | dump-id>".to_string());
+        Ok(user_msg(format!(
+            "Diagnose the crash for '{t}':\n\
+             1. If it's a live process: dump.capture {{pid|name}} (full). For an intermittent crash, \
+             instead arm dump.onTrigger (on=unhandled) or dump.onCrashInstall, then reproduce.\n\
+             2. Ensure symbols: symbols.show; if unset, symbols.configure to the msdl public server.\n\
+             3. dump.analyze on the dump — read the exceptionCode, faultingModule and the faulting stack.\n\
+             4. inspect.verify the faulting module (signature/version) if a bad/mismatched DLL is suspected.\n\
+             5. If managed (.NET): dotnet.analyze for the CLR stack.\n\
+             Summarize the faulting frame and the likely cause."
+        )))
+    }
+
+    #[prompt(
+        name = "diagnose-hang",
+        description = "Investigate a hung/unresponsive process (deadlock or waiting)."
+    )]
+    async fn p_hang(
+        &self,
+        Parameters(a): Parameters<PromptTargetArgs>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let t = a.target.unwrap_or_else(|| "<pid | name>".to_string());
+        Ok(user_msg(format!(
+            "Diagnose the hang for '{t}':\n\
+             1. dump.capture {{pid|name}} (full) while it's hung.\n\
+             2. analyze.deadlock — lock/critical-section/monitor wait chains across all threads.\n\
+             3. If no lock cycle, read ~*k (all-thread stacks via dump.analyze) for what threads are waiting on.\n\
+             4. If managed: dotnet.analyze (sync blocks / async) with analyze.async.\n\
+             Name the blocking chain or the wait, and which thread owns the resource."
+        )))
+    }
+
+    #[prompt(
+        name = "diagnose-deadlock",
+        description = "Find a lock/critical-section/monitor deadlock in a dump."
+    )]
+    async fn p_deadlock(
+        &self,
+        Parameters(a): Parameters<PromptTargetArgs>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let t = a.target.unwrap_or_else(|| "<pid | name | dump-id>".to_string());
+        Ok(user_msg(format!(
+            "Hunt a deadlock for '{t}':\n\
+             1. Get a dump (dump.capture) if you don't have one.\n\
+             2. analyze.deadlock — !locks, !cs, !syncblk, and all-thread stacks.\n\
+             3. For each held lock, identify the owning thread and what it is itself waiting on.\n\
+             Report the cycle (thread A holds X waits Y; thread B holds Y waits X)."
+        )))
+    }
+
+    #[prompt(
+        name = "diagnose-high-cpu",
+        description = "Attribute high CPU to a thread/module."
+    )]
+    async fn p_highcpu(
+        &self,
+        Parameters(a): Parameters<PromptTargetArgs>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let t = a.target.unwrap_or_else(|| "<pid | name>".to_string());
+        Ok(user_msg(format!(
+            "Diagnose high CPU for '{t}':\n\
+             1. dump.capture {{pid|name}} (full) during the spike — or dump.onTrigger (on=cpu, threshold).\n\
+             2. analyze.highCpu — !runaway to rank threads by CPU, then their stacks.\n\
+             3. For a time-based view, logs.etwStart with the CPU profile, reproduce, logs.etwStop, hand the .etl to WPA/findneedle.\n\
+             Name the hot thread and the function/module burning CPU."
+        )))
+    }
+
+    #[prompt(
+        name = "diagnose-leak",
+        description = "Investigate a memory or handle leak."
+    )]
+    async fn p_leak(
+        &self,
+        Parameters(a): Parameters<PromptTargetArgs>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let t = a.target.unwrap_or_else(|| "<image.exe | pid>".to_string());
+        Ok(user_msg(format!(
+            "Investigate a leak in '{t}':\n\
+             HEAP (native): leak.heapTrackStart <image> to enable the stack DB, restart the target, then \
+             leak.heapSnapshot for a baseline, let it leak, snapshot again, and leak.heapDiff the two.\n\
+             HANDLES: dump.capture then analyze.handles (!handle summary) — watch for a growing type.\n\
+             MANAGED (.NET): dotnet.gcHeap for a GC snapshot (diff two), or dotnet.analyze (!dumpheap -stat).\n\
+             Report the allocation site / handle type that grows, and revert any gflags with changes.revert."
+        )))
+    }
+
+    #[prompt(
+        name = "diagnose-service-start",
+        description = "Debug a Windows service that crashes or hangs at startup."
+    )]
+    async fn p_service(
+        &self,
+        Parameters(a): Parameters<PromptTargetArgs>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let t = a.target.unwrap_or_else(|| "<service-image.exe>".to_string());
+        Ok(user_msg(format!(
+            "Debug startup failure of service '{t}':\n\
+             1. logs.eventQuery (System) for the SCM error (timeout vs crash).\n\
+             2. service.startupDebug <image> to attach a debugger at process start (reversible via changes.revert); \
+             if it times out at start, also raise ServicesPipeTimeout (noted by the tool).\n\
+             3. Or dump.onCrashInstall <image> so a startup crash auto-dumps, then dump.analyze.\n\
+             4. Services run in session 0 — if a UI is needed, session.launchInUser (needs SYSTEM/SeTcb).\n\
+             Report whether it's a crash (and the faulting frame) or a timeout (and what it's blocked on)."
+        )))
+    }
+
+    #[prompt(
+        name = "app-wont-launch",
+        description = "Investigate an application that fails to start."
+    )]
+    async fn p_wontlaunch(
+        &self,
+        Parameters(a): Parameters<PromptTargetArgs>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let t = a.target.unwrap_or_else(|| "<image.exe>".to_string());
+        Ok(user_msg(format!(
+            "Investigate why '{t}' won't launch:\n\
+             1. gflags.get <image> — a leftover IFEO Debugger or full page heap can block/redirect startup.\n\
+             2. inspect.verify <path> — signature/version of the exe and suspect DLLs (DLL-hell / blocked binary).\n\
+             3. logs.eventQuery (Application) for the load error (SideBySide, 0xc0000135 missing DLL, etc.).\n\
+             4. Capture a startup crash with dump.onCrashInstall, or set postmortem.aeDebug and reproduce.\n\
+             Report the blocking cause (bad IFEO, missing/mismatched DLL, AV, crash)."
+        )))
+    }
+
+    #[prompt(
+        name = "analyze-existing-dump",
+        description = "Analyze a user-mode or kernel dump you already have."
+    )]
+    async fn p_existing(
+        &self,
+        Parameters(a): Parameters<PromptTargetArgs>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let t = a.target.unwrap_or_else(|| "<dump-id | path>".to_string());
+        Ok(user_msg(format!(
+            "Analyze dump '{t}':\n\
+             1. symbols.show; symbols.configure to the public server if needed (analyze an off-box dump with the \
+             matching image/symbol paths).\n\
+             2. dump.analyze — !analyze -v, stacks, modules; read the verdict.\n\
+             3. Pivot by symptom: analyze.deadlock / analyze.highCpu / analyze.handles / analyze.verifierStop, \
+             or dotnet.analyze for managed.\n\
+             Report the root cause with the faulting/owning frame."
+        )))
+    }
+
+    #[prompt(
+        name = "analyze-bugcheck",
+        description = "Analyze a kernel crash (BSOD / memory.dmp)."
+    )]
+    async fn p_bugcheck(
+        &self,
+        Parameters(a): Parameters<PromptTargetArgs>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let t = a.target.unwrap_or_else(|| r"C:\Windows\MEMORY.DMP".to_string());
+        Ok(user_msg(format!(
+            "Analyze the bugcheck in '{t}':\n\
+             1. kernel.status — confirm the crash-dump mode; the dump is usually C:\\Windows\\MEMORY.DMP or \\Minidump.\n\
+             2. symbols.configure to the public server.\n\
+             3. dump.analyze — !analyze -v gives the bugcheck code and the culprit driver/module.\n\
+             4. If a GPU timeout (0x116/0x117), use gpu.tdrAnalyze; if a Driver Verifier stop, analyze.verifierStop.\n\
+             Report the bugcheck code and the driver at fault."
+        )))
+    }
+
+    #[prompt(
+        name = "diagnose-verifier-stop",
+        description = "Decode a Driver/Application Verifier stop."
+    )]
+    async fn p_verifier(
+        &self,
+        Parameters(a): Parameters<PromptTargetArgs>,
+    ) -> Result<Vec<PromptMessage>, McpError> {
+        let t = a.target.unwrap_or_else(|| "<dump-id | path>".to_string());
+        Ok(user_msg(format!(
+            "Decode the Verifier stop in '{t}':\n\
+             1. analyze.verifierStop — !analyze -v + !verifier to name the exact rule violated.\n\
+             2. For user-mode App Verifier, enable checks with appverifier.enable <image> (reversible), reproduce, re-dump.\n\
+             Report the violated rule and the offending call."
+        )))
+    }
+}
+
 #[tool_handler]
+#[prompt_handler]
 impl ServerHandler for Heisenberg {
     fn get_info(&self) -> ServerConfig {
         let mut info = Implementation::from_build_env();
@@ -3958,6 +4190,7 @@ impl ServerHandler for Heisenberg {
             ServerCapabilities::builder()
                 .enable_tools()
                 .enable_resources()
+                .enable_prompts()
                 .build(),
         )
         .with_server_info(info)
