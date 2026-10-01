@@ -1385,7 +1385,13 @@ impl Heisenberg {
             Ok(Ok(o)) => o,
         };
 
-        if !output.status.success() || !outpath.is_file() {
+        // The dump file on disk is the source of truth, not the exit code:
+        // ProcDump returns nonzero in cases where the dump was still written, and
+        // rundll32 (comsvcs) exit codes are meaningless. Treat a non-empty dump as
+        // success regardless of status; only error when no usable dump landed.
+        let bytes = std::fs::metadata(&outpath).map(|m| m.len()).unwrap_or(0);
+        let produced = outpath.is_file() && bytes > 0;
+        if !produced {
             let combined = format!(
                 "{}\n{}",
                 String::from_utf8_lossy(&output.stdout),
@@ -1403,10 +1409,15 @@ impl Heisenberg {
             self.state.audit.record(tool, &format!("capture failed via {backend}"), None, "failed", None);
             let mut v = error(tool, kinderr, format!("{backend} failed to capture pid {pid}"), remedy, Some(docs));
             v["error"]["output"] = json!(combined.trim());
+            v["error"]["exitCode"] = json!(output.status.code());
             return Ok(text(v));
         }
-
-        let bytes = std::fs::metadata(&outpath).map(|m| m.len()).unwrap_or(0);
+        if !output.status.success() {
+            warnings.push(format!(
+                "{backend} exited with status {:?} but produced a {bytes}-byte dump; using it",
+                output.status.code()
+            ));
+        }
         // comsvcs MiniDump ACLs the dump to SYSTEM+Administrators only; grant the
         // capturing user read so cdb (and dump.analyze) can open it without elevation.
         if backend == "comsvcs" {
