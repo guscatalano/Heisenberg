@@ -210,6 +210,36 @@ pub struct PromptTargetArgs {
     pub target: Option<String>,
 }
 
+fn default_dur() -> u64 {
+    10
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DotnetTimedArgs {
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Collection duration in seconds (default 10).
+    #[serde(default = "default_dur")]
+    pub duration_sec: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ForeignDumpArgs {
+    /// Dump id (from dump.capture) or a file path — typically captured off-box.
+    pub dump: String,
+    /// Path to the matching image(s) for `.exepath+`.
+    #[serde(default)]
+    pub image_path: Option<String>,
+    /// Symbol path for `.sympath` (e.g. a pre-seeded cache for that build).
+    #[serde(default)]
+    pub sym_path: Option<String>,
+    /// cdb commands (default: "!analyze -v; lm; q").
+    #[serde(default)]
+    pub commands: Option<String>,
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ProvisionArgs {
     /// Groundhog profile or Groundhogfile path/URL (default: the windows-internals
@@ -3961,6 +3991,154 @@ impl Heisenberg {
             Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "autorunsc timed out", "retry", Some(docs)))),
         }
     }
+
+    #[tool(
+        name = "dotnet.trace",
+        description = "Collect a timed CPU/allocation trace of a .NET process (dotnet-trace) to a .nettrace. Read-only; needs the dotnet-trace global tool."
+    )]
+    async fn dotnet_trace(
+        &self,
+        Parameters(a): Parameters<DotnetTimedArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dotnet.trace";
+        let dt = match self.state.locator.find("dotnet-trace.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(tool, ErrorKind::ToolNotInstalled, "dotnet-trace not found", "install it: dotnet tool install -g dotnet-trace", Some(DOTNET_DOCS));
+                v["error"]["install"] = json!("dotnet tool install -g dotnet-trace");
+                return Ok(text(v));
+            }
+        };
+        let pid = match proc::resolve(a.pid, a.name.as_deref()) {
+            Ok(p) => p,
+            Err(proc::TargetError::NotFound(m)) => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no process matched {m}"), "pass a pid or name", Some(DOTNET_DOCS)))),
+            Err(proc::TargetError::Ambiguous { name, pids }) => { let mut v = error(tool, ErrorKind::AmbiguousTarget, format!("'{name}' matches {} processes", pids.len()), "pass a specific pid", Some(DOTNET_DOCS)); v["error"]["candidates"] = json!(pids); return Ok(text(v)); }
+        };
+        let secs = a.duration_sec.clamp(1, 600);
+        let dur = format!("{:02}:{:02}:{:02}", secs / 3600, (secs % 3600) / 60, secs % 60);
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let out = self.state.store.artifacts_dir().join(format!("trace_{pid}_{ts}.nettrace"));
+        let cmd = format!("dotnet-trace collect -p {pid} --duration {dur} -o \"{}\"", out.display());
+        let output = tokio::time::timeout(Duration::from_secs(secs + 90), Command::new(&dt).arg("collect").arg("-p").arg(pid.to_string()).arg("--duration").arg(&dur).arg("-o").arg(&out).output()).await;
+        match output {
+            Ok(Ok(o)) if o.status.success() && out.is_file() => {
+                let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                self.state.audit.record(tool, &format!("traced pid {pid} for {secs}s"), None, "captured", None);
+                Ok(text(Outcome::new(tool, format!("collected a {secs}s .NET trace of pid {pid} ({:.1} MB)", bytes as f64 / 1048576.0)).data(json!({ "pid": pid, "durationSec": secs, "path": out.display().to_string(), "bytes": bytes })).artifact(Artifact { kind: "nettrace".to_string(), path: out.display().to_string(), bytes, resource: out.display().to_string(), sensitivity: Some("medium".to_string()) }).command(cmd).docs(DOTNET_DOCS).to_value()))
+            }
+            Ok(Ok(o)) => Ok(text(error(tool, ErrorKind::AnalysisFailed, format!("dotnet-trace failed: {}", String::from_utf8_lossy(&o.stderr).trim()), "ensure the target is a .NET process", Some(DOTNET_DOCS)))),
+            Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch dotnet-trace: {e}"), "check the tool", Some(DOTNET_DOCS)))),
+            Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "dotnet-trace timed out", "retry with a shorter duration", Some(DOTNET_DOCS)))),
+        }
+    }
+
+    #[tool(
+        name = "dotnet.counters",
+        description = "Collect .NET performance counters for a duration (dotnet-counters) to CSV. Read-only; needs the dotnet-counters global tool."
+    )]
+    async fn dotnet_counters(
+        &self,
+        Parameters(a): Parameters<DotnetTimedArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dotnet.counters";
+        let dc = match self.state.locator.find("dotnet-counters.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(tool, ErrorKind::ToolNotInstalled, "dotnet-counters not found", "install it: dotnet tool install -g dotnet-counters", Some(DOTNET_DOCS));
+                v["error"]["install"] = json!("dotnet tool install -g dotnet-counters");
+                return Ok(text(v));
+            }
+        };
+        let pid = match proc::resolve(a.pid, a.name.as_deref()) {
+            Ok(p) => p,
+            Err(proc::TargetError::NotFound(m)) => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no process matched {m}"), "pass a pid or name", Some(DOTNET_DOCS)))),
+            Err(proc::TargetError::Ambiguous { name, pids }) => { let mut v = error(tool, ErrorKind::AmbiguousTarget, format!("'{name}' matches {} processes", pids.len()), "pass a specific pid", Some(DOTNET_DOCS)); v["error"]["candidates"] = json!(pids); return Ok(text(v)); }
+        };
+        let secs = a.duration_sec.clamp(1, 600);
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let out = self.state.store.artifacts_dir().join(format!("counters_{pid}_{ts}.csv"));
+        // dotnet-counters collect runs until stopped; bound it by killing after the duration.
+        let mut c = Command::new(&dc);
+        c.arg("collect").arg("-p").arg(pid.to_string()).arg("--format").arg("csv").arg("-o").arg(&out).kill_on_drop(true);
+        match c.spawn() {
+            Ok(mut child) => {
+                tokio::time::sleep(Duration::from_secs(secs)).await;
+                let _ = child.start_kill();
+                let _ = child.wait().await;
+                if out.is_file() {
+                    let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                    self.state.audit.record(tool, &format!("counters pid {pid} for {secs}s"), None, "captured", None);
+                    Ok(text(Outcome::new(tool, format!("collected {secs}s of .NET counters for pid {pid}")).data(json!({ "pid": pid, "durationSec": secs, "path": out.display().to_string(), "bytes": bytes })).artifact(Artifact { kind: "counters-csv".to_string(), path: out.display().to_string(), bytes, resource: out.display().to_string(), sensitivity: Some("low".to_string()) }).command(format!("dotnet-counters collect -p {pid} --format csv -o <csv> (stopped after {secs}s)")).docs(DOTNET_DOCS).to_value()))
+                } else {
+                    Ok(text(error(tool, ErrorKind::AnalysisFailed, "no counters CSV produced", "ensure the target is a .NET process", Some(DOTNET_DOCS))))
+                }
+            }
+            Err(e) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch dotnet-counters: {e}"), "check the tool", Some(DOTNET_DOCS)))),
+        }
+    }
+
+    #[tool(
+        name = "inspect.access",
+        description = "Show effective access (ACLs / who can do what) for a file or directory via Sysinternals AccessChk. Read-only; needs accesschk."
+    )]
+    async fn inspect_access(
+        &self,
+        Parameters(a): Parameters<PathArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "inspect.access";
+        let docs = "https://learn.microsoft.com/sysinternals/downloads/accesschk";
+        let ac = match self.state.locator.find("accesschk.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(tool, ErrorKind::ToolNotInstalled, "accesschk.exe not found", "run tools.install sysinternals, or stage it in --tools-dir", Some(docs));
+                v["error"]["install"] = json!("tools.install sysinternals");
+                return Ok(text(v));
+            }
+        };
+        let (_ok, out) = self.run_capture(&ac.display().to_string(), &["-accepteula", "-nobanner", a.path.as_str()], 60).await;
+        Ok(text(Outcome::new(tool, format!("access for {}", a.path)).data(json!({ "path": a.path, "raw": last_chars(&out, 6000) })).docs(docs).to_value()))
+    }
+
+    #[tool(
+        name = "analyze.foreignDump",
+        description = "Analyze a dump captured on a different build/arch: set .exepath/.sympath to the matching images, then !analyze. Read-only; needs cdb."
+    )]
+    async fn analyze_foreign_dump(
+        &self,
+        Parameters(a): Parameters<ForeignDumpArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let mut cmds = String::new();
+        if let Some(ip) = &a.image_path {
+            cmds.push_str(&format!(".exepath+ {ip}; "));
+        }
+        if let Some(sp) = &a.sym_path {
+            cmds.push_str(&format!(".sympath {sp}; "));
+        }
+        cmds.push_str(&a.commands.clone().unwrap_or_else(|| "!analyze -v; lm; q".to_string()));
+        self.simple_analyze("analyze.foreignDump", &a.dump, None, &cmds).await
+    }
+
+    #[tool(
+        name = "audit.export",
+        description = "Export the append-only audit journal: path, entry count, and the recent entries. Read-only."
+    )]
+    async fn audit_export(&self) -> Result<CallToolResult, McpError> {
+        let path = self.state.store.audit_path();
+        let count = self.state.audit.tail(1_000_000).len();
+        let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let mut out = Outcome::new("audit.export", format!("{count} audit entries"))
+            .data(json!({ "path": path.display().to_string(), "count": count, "recent": self.state.audit.tail(50) }));
+        if bytes > 0 {
+            out = out.artifact(Artifact {
+                kind: "audit".to_string(),
+                path: path.display().to_string(),
+                bytes,
+                resource: "heisenberg://audit".to_string(),
+                sensitivity: Some("low".to_string()),
+            });
+        }
+        Ok(text(out.to_value()))
+    }
 }
 
 fn user_msg(text: String) -> Vec<PromptMessage> {
@@ -4215,6 +4393,8 @@ impl ServerHandler for Heisenberg {
             Resource::new("heisenberg://audit", "Audit journal (recent entries)".to_string()),
             Resource::new("heisenberg://dumps", "Captured dumps".to_string()),
             Resource::new("heisenberg://captures", "Background capture jobs".to_string()),
+            Resource::new("heisenberg://cases", "Exported case bundles".to_string()),
+            Resource::new("heisenberg://sessions", "Open debug sessions".to_string()),
             Resource::new("heisenberg://tools", "External tool inventory".to_string()),
         ];
         for (key, name, _, _) in docs::DOCS {
@@ -4263,6 +4443,23 @@ impl ServerHandler for Heisenberg {
             "heisenberg://captures" => {
                 let j = self.state.jobs.lock().unwrap();
                 serde_json::to_string_pretty(&json!({ "jobs": j.list() })).ok()
+            }
+            "heisenberg://cases" => {
+                let dir = self.state.store.cases_dir();
+                let mut cases: Vec<serde_json::Value> = Vec::new();
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for e in rd.flatten() {
+                        let p = e.path();
+                        let bytes = e.metadata().map(|m| m.len()).ok();
+                        cases.push(json!({ "name": p.file_name().and_then(|n| n.to_str()).unwrap_or(""), "path": p.display().to_string(), "bytes": bytes }));
+                    }
+                }
+                serde_json::to_string_pretty(&json!({ "cases": cases })).ok()
+            }
+            "heisenberg://sessions" => {
+                // Persistent debug sessions (dump.command/ttd.replay) are not yet
+                // kept alive, so this is currently always empty.
+                serde_json::to_string_pretty(&json!({ "sessions": [] })).ok()
             }
             other if other.starts_with("heisenberg://dumps/") => {
                 let id = &other["heisenberg://dumps/".len()..];

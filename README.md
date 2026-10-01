@@ -25,14 +25,14 @@ Tools today:
 | `env.provision` | Provision the whole toolchain in one step via [Groundhog](https://github.com/guscatalano/Groundhog) if installed (default profile: windows-internals — Sysinternals, WinDbg, WPT, symbols, crash dumps). Falls back to `tools.install` when absent. |
 | `tools.addFolder` / `tools.removeFolder` | Add/remove a folder in the tool search path (searched first, persisted across restarts). |
 | `system.triage` | First-response gather on a broken box: systeminfo, services, tasklist, boot config, drivers, hypervisor, log locations. |
-| `inspect.processTree` / `inspect.network` / `inspect.verify` | Process tree (pid/ppid), active connections (netstat), and Authenticode signature checks. |
+| `inspect.processTree` / `inspect.network` / `inspect.verify` / `inspect.access` | Process tree (pid/ppid), active connections (netstat), Authenticode checks, and effective-ACL checks (AccessChk). |
 | `dump.capture` | Capture a user-mode dump (full/mini) by pid or name. ProcDump if staged, else comsvcs. Disk pre-checked; full dumps marked high-sensitivity. |
 | `dump.onCrashInstall` | Configure WER LocalDumps so future crashes of an image (or all) auto-dump (reversible; needs elevation). |
 | `dump.onTrigger` | Arm ProcDump to dump on a trigger (exception / CPU / hang) as a background `job.*` capture. |
 | `service.startupDebug` | Attach a debugger to an image at process start (IFEO Debugger) for startup crashes/hangs (reversible; needs elevation). |
 | `postmortem.aeDebug` | Set the AeDebug JIT debugger so any unhandled crash drops to a scripted dump (reversible; needs elevation). |
 | `dump.analyze` | Open a dump in cdb (`!analyze -v`, stacks, modules) and return parsed + raw. Needs the Debugging Tools for Windows. |
-| `analyze.deadlock` / `analyze.highCpu` / `analyze.handles` / `analyze.async` / `analyze.verifierStop` | Targeted cdb analyses of a dump (lock contention, CPU by thread, handle leaks, .NET async, verifier stops). |
+| `analyze.deadlock` / `analyze.highCpu` / `analyze.handles` / `analyze.async` / `analyze.verifierStop` / `analyze.foreignDump` | Targeted cdb analyses of a dump (lock contention, CPU by thread, handle leaks, .NET async, verifier stops, off-box dumps with matched symbols). |
 | `gflags.get` / `gflags.set` | Show / enable full page heap for an image via IFEO (reversible via the ledger; `dry_run` + confirm token; needs elevation). Disable by reverting the change. |
 | `appverifier.enable` | Enable Application Verifier for an image via IFEO (reversible; needs elevation). |
 | `ttd.record` / `ttd.stop` / `ttd.replay` | Record a process to a Time Travel Debugging `.run` trace (a `job.*` capture) and replay it in cdb. |
@@ -41,7 +41,7 @@ Tools today:
 | `gpu.tdrAnalyze` | Analyze a kernel dump for a GPU TDR (VIDEO_TDR_FAILURE 0x116/0x117). |
 | `inspect.autoruns` | Enumerate autostart / persistence points (Autoruns) as CSV. |
 | `remote.logCollect` / `remote.dumpCapture` | Query event logs (wevtutil /r) or capture a dump (PsExec + ProcDump) on a remote host. |
-| `dotnet.dump` / `dotnet.gcHeap` / `dotnet.analyze` | Managed (.NET) dumps, GC-heap snapshots, and SOS analysis via the dotnet diagnostics tools. |
+| `dotnet.dump` / `dotnet.gcHeap` / `dotnet.analyze` / `dotnet.trace` / `dotnet.counters` | Managed (.NET) dumps, GC-heap snapshots, SOS analysis, timed CPU traces, and perf counters. |
 | `symbols.show` / `symbols.configure` | Read / set `_NT_SYMBOL_PATH` (reversible via the ledger; `dry_run` + confirm token). |
 | `procmon.start` / `procmon.stop` | Start/stop a background Process Monitor capture to a `.pml` (needs Procmon staged + elevation). |
 | `job.list` / `job.status` / `job.stop` / `job.cancel` | Unified control for every background capture job. |
@@ -54,13 +54,17 @@ Tools today:
 | `session.launchInUser` | Launch a process from session 0 / SYSTEM into the active user session (needs SeTcbPrivilege). |
 | `remote.debugServer` | Start a dbgsrv process server (a `job.*` capture) so a remote WinDbg can debug this box; returns the connect string. |
 | `changes.list` / `changes.revert` | The reversible-change ledger and one-call undo. |
+| `audit.export` | Export the append-only audit journal (path, count, recent entries). |
 | `collect.package` | Bundle a portable case (env + policy + ledger + jobs + dumps + audit) into a zipped manifest. |
 | `report.generate` | Human-readable Markdown incident report from the current state. |
 | `artifacts.purge` | Reclaim disk by deleting captured artifacts (dry-run by default; optional age filter). |
 
 Resources: `heisenberg://env`, `heisenberg://policy`, `heisenberg://changes`,
 `heisenberg://audit`, `heisenberg://dumps` (+ `/<id>`), `heisenberg://captures`
-(+ `/<id>`), `heisenberg://tools`, `docs://<tool>`.
+(+ `/<id>`), `heisenberg://cases`, `heisenberg://sessions`, `heisenberg://tools`,
+`docs://<tool>`. Plus 11 guided **prompts** (triage-broken-box, diagnose-crash/hang/
+deadlock/high-cpu/leak, diagnose-service-start, app-wont-launch, analyze-existing-dump/
+bugcheck, diagnose-verifier-stop).
 
 ## Build
 
