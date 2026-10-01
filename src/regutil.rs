@@ -274,6 +274,78 @@ pub fn hklm_restore(
     Ok(())
 }
 
+// --- Live PATH from the registry (so tools installed after startup resolve) ---
+
+/// Expand `%VAR%` references in a string via the Win32 environment.
+#[cfg(windows)]
+fn expand_env(s: &str) -> String {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Environment::ExpandEnvironmentStringsW;
+    let wide: Vec<u16> = s.encode_utf16().chain(std::iter::once(0)).collect();
+    unsafe {
+        let needed = ExpandEnvironmentStringsW(PCWSTR(wide.as_ptr()), None);
+        if needed == 0 {
+            return s.to_string();
+        }
+        let mut buf = vec![0u16; needed as usize];
+        let written = ExpandEnvironmentStringsW(PCWSTR(wide.as_ptr()), Some(&mut buf));
+        if written == 0 {
+            return s.to_string();
+        }
+        let n = (written as usize).saturating_sub(1).min(buf.len());
+        String::from_utf16_lossy(&buf[..n])
+    }
+}
+
+/// The persistent PATH directories from the registry — machine (Session Manager)
+/// then user (HKCU\Environment) — expanded and split. Read live so a PATH change
+/// made after the server started (e.g. by env.provision / an installer) is seen
+/// without a restart.
+#[cfg(windows)]
+pub fn registry_path_dirs() -> Vec<String> {
+    let mut out = Vec::new();
+    let raws = [
+        hklm_read_sz(
+            r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment",
+            "Path",
+        ),
+        get_hkcu_env("Path"),
+    ];
+    for raw in raws.into_iter().flatten() {
+        for part in expand_env(&raw).split(';') {
+            let p = part.trim();
+            if !p.is_empty() {
+                out.push(p.to_string());
+            }
+        }
+    }
+    out
+}
+
+#[cfg(not(windows))]
+pub fn registry_path_dirs() -> Vec<String> {
+    Vec::new()
+}
+
+#[cfg(test)]
+#[cfg(windows)]
+mod tests {
+    #[test]
+    fn expand_env_resolves_systemroot() {
+        let e = super::expand_env("%SystemRoot%\\System32");
+        assert!(e.to_lowercase().contains("windows"), "got {e}");
+    }
+
+    #[test]
+    fn registry_path_has_system32() {
+        let dirs = super::registry_path_dirs();
+        assert!(
+            dirs.iter().any(|d| d.to_lowercase().contains("system32")),
+            "registry PATH should include System32: {dirs:?}"
+        );
+    }
+}
+
 #[cfg(not(windows))]
 pub fn crashcontrol_read() -> Option<u32> {
     None

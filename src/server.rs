@@ -1094,7 +1094,7 @@ impl Heisenberg {
                     .data(json!({ "profile": profile, "changeId": id, "output": last_chars(&out, 3000) }))
                     .command(cmd)
                     .docs(GROUNDHOG_DOCS)
-                    .warn("re-run tools.list / env.check to confirm the toolchain resolves; some PATH/env changes need a new shell")
+                    .warn("Heisenberg reads the registry PATH live, so tools.list should resolve the newly provisioned tools (C:\\Tools\\Sysinternals, etc.) without a restart")
                     .to_value(),
             ))
         } else {

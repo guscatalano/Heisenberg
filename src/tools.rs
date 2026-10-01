@@ -88,8 +88,10 @@ impl Locator {
         Locator { dirs }
     }
 
-    /// Find an executable by file name (e.g. "procdump.exe"): staged dirs first,
-    /// then `PATH`.
+    /// Find an executable by file name (e.g. "procdump.exe"): staged + known dirs
+    /// first, then the process `PATH`, then the *registry* PATH (read live, so a
+    /// tool installed after startup — e.g. by env.provision — resolves without a
+    /// restart).
     pub fn find(&self, exe: &str) -> Option<PathBuf> {
         for d in &self.dirs {
             let p = d.join(exe);
@@ -103,6 +105,12 @@ impl Locator {
                 if p.is_file() {
                     return Some(p);
                 }
+            }
+        }
+        for d in crate::regutil::registry_path_dirs() {
+            let p = PathBuf::from(&d).join(exe);
+            if p.is_file() {
+                return Some(p);
             }
         }
         None
@@ -148,6 +156,10 @@ fn known_dirs() -> Vec<PathBuf> {
     }
     // Managed dir where tools.install extracts direct-download tools.
     v.push(PathBuf::from(MANAGED_TOOLS_DIR));
+    // Groundhog's default install locations under C:\Tools.
+    v.push(PathBuf::from(r"C:\Tools\Sysinternals"));
+    v.push(PathBuf::from(r"C:\Tools\WinDbg"));
+    v.push(PathBuf::from(r"C:\Tools"));
     // dotnet global tools (dotnet-dump / -gcdump / -trace).
     if let Ok(up) = std::env::var("USERPROFILE") {
         v.push(PathBuf::from(&up).join(r".dotnet\tools"));
