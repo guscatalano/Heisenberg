@@ -54,6 +54,7 @@ Tools today:
 | `session.launchInUser` | Launch a process from session 0 / SYSTEM into the active user session (needs SeTcbPrivilege). |
 | `remote.debugServer` | Start a dbgsrv process server (a `job.*` capture) so a remote WinDbg can debug this box; returns the connect string. |
 | `changes.list` / `changes.revert` | The reversible-change ledger and one-call undo. |
+| `approvals.list` | Human-approval broker grants (for HumanApproval-gated actions on Critical boxes). |
 | `audit.export` | Export the append-only audit journal (path, count, recent entries). |
 | `collect.package` | Bundle a portable case (env + policy + ledger + jobs + dumps + audit) into a zipped manifest. |
 | `report.generate` | Human-readable Markdown incident report from the current state. |
@@ -114,6 +115,7 @@ absent/malformed/unverified, fails safe to `Critical`.
   ```powershell
   heisenberg keygen                       # prints a public + private key
   heisenberg sign policy.json priv.key    # writes policy.json.sig
+  heisenberg approve <tool>               # one-shot human approval (Critical boxes, 15 min)
   ```
 
 Gate matrix (box class × effect tier):

@@ -41,6 +41,10 @@ impl Store {
         self.root.join("folders.json")
     }
 
+    pub fn approvals_path(&self) -> PathBuf {
+        self.root.join("approvals.json")
+    }
+
     pub fn artifacts_dir(&self) -> PathBuf {
         self.root.join("artifacts")
     }

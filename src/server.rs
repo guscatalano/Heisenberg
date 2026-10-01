@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 use tokio::process::Command;
 
+use crate::approvals::Approvals;
 use crate::audit::Audit;
 use crate::dumps::DumpRegistry;
 use crate::envelope::{error, Artifact, ErrorKind, Outcome};
@@ -92,6 +93,8 @@ pub struct AppState {
     /// Operator-added tool search folders (persisted); shared with the locator.
     pub extra_folders: Arc<Mutex<Vec<PathBuf>>>,
     pub folders_path: PathBuf,
+    /// Out-of-band human-approval broker.
+    pub approvals: Approvals,
 }
 
 impl AppState {
@@ -117,6 +120,7 @@ impl AppState {
             dumps: Mutex::new(dumps),
             jobs: Mutex::new(jobs),
             audit,
+            approvals: Approvals::load(store.approvals_path()),
             extra_folders,
             folders_path,
             store,
@@ -762,6 +766,19 @@ impl Heisenberg {
     }
 
     #[tool(
+        name = "approvals.list",
+        description = "List the human-approval broker's grants (granted/used) for HumanApproval-gated actions. Read-only. Operators grant with the CLI: heisenberg approve <tool>."
+    )]
+    async fn approvals_list(&self) -> Result<CallToolResult, McpError> {
+        let items = self.state.approvals.list();
+        Ok(text(
+            Outcome::new("approvals.list", format!("{} approval record(s)", items.len()))
+                .data(json!({ "approvals": items }))
+                .to_value(),
+        ))
+    }
+
+    #[tool(
         name = "gate.check",
         description = "Ask the policy what gate a given tool + effect tier would face on this box (allow / confirm-token / human-approval / deny), without running anything."
     )]
@@ -842,6 +859,7 @@ impl Heisenberg {
             EffectTier::StateChanging,
             SYMBOLS_TOKEN,
             a.confirm.as_deref(),
+            &self.state.approvals,
         ) {
             Ok(d) => d,
             Err(b) => {
@@ -1125,7 +1143,7 @@ impl Heisenberg {
                     .to_value(),
             ));
         }
-        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "install-tool", a.confirm.as_deref()) {
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "install-tool", a.confirm.as_deref(), &self.state.approvals) {
             Ok(d) => d,
             Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs)))); }
         };
@@ -1202,7 +1220,7 @@ impl Heisenberg {
         if !env_probe::is_elevated() {
             return Ok(text(error(tool, ErrorKind::RequiresElevation, "the windows-internals profile writes HKLM (crash dumps); needs an elevated token", "re-run Heisenberg elevated", Some(GROUNDHOG_DOCS))));
         }
-        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "provision-environment", a.confirm.as_deref()) {
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "provision-environment", a.confirm.as_deref(), &self.state.approvals) {
             Ok(d) => d,
             Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(GROUNDHOG_DOCS)))); }
         };
@@ -1664,7 +1682,7 @@ impl Heisenberg {
         if !env_probe::is_elevated() {
             return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing IFEO needs an elevated token", "re-run Heisenberg elevated", Some(APPVERIF_DOCS))));
         }
-        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, APPVERIF_TOKEN, a.confirm.as_deref()) {
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, APPVERIF_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
             Ok(d) => d,
             Err(b) => {
                 self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
@@ -1787,6 +1805,7 @@ impl Heisenberg {
             EffectTier::StateChanging,
             GFLAGS_TOKEN,
             a.confirm.as_deref(),
+            &self.state.approvals,
         ) {
             Ok(d) => d,
             Err(b) => {
@@ -2268,6 +2287,7 @@ impl Heisenberg {
             EffectTier::StateChanging,
             CRASHDUMP_TOKEN,
             a.confirm.as_deref(),
+            &self.state.approvals,
         ) {
             Ok(d) => d,
             Err(b) => {
@@ -2347,7 +2367,7 @@ impl Heisenberg {
         if !env_probe::is_elevated() {
             return Ok(text(error(tool, ErrorKind::RequiresElevation, "bcdedit needs an elevated token", "re-run Heisenberg elevated", Some(KERNEL_DOCS))));
         }
-        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, KERNEL_TOKEN, a.confirm.as_deref()) {
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, KERNEL_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
             Ok(d) => d,
             Err(b) => {
                 self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
@@ -2418,7 +2438,7 @@ impl Heisenberg {
         if !env_probe::is_elevated() {
             return Ok(text(error(tool, ErrorKind::RequiresElevation, "bcdedit needs an elevated token", "re-run Heisenberg elevated", Some(KERNEL_DOCS))));
         }
-        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, KERNEL_TOKEN, a.confirm.as_deref()) {
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, KERNEL_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
             Ok(d) => d,
             Err(b) => {
                 self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
@@ -2717,6 +2737,7 @@ impl Heisenberg {
             EffectTier::StateChanging,
             SESSION_TOKEN,
             a.confirm.as_deref(),
+            &self.state.approvals,
         ) {
             Ok(d) => d,
             Err(b) => {
@@ -3378,7 +3399,7 @@ impl Heisenberg {
         if !env_probe::is_elevated() {
             return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing AeDebug needs an elevated token", "re-run Heisenberg elevated", Some(POSTMORTEM_DOCS))));
         }
-        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, AEDEBUG_TOKEN, a.confirm.as_deref()) {
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, AEDEBUG_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
             Ok(d) => d,
             Err(b) => {
                 self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
@@ -3460,7 +3481,7 @@ impl Heisenberg {
         if !env_probe::is_elevated() {
             return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing WER LocalDumps needs an elevated token", "re-run Heisenberg elevated", Some(POSTMORTEM_DOCS))));
         }
-        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, WER_TOKEN, a.confirm.as_deref()) {
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, WER_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
             Ok(d) => d,
             Err(b) => {
                 self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
@@ -3612,7 +3633,7 @@ impl Heisenberg {
         if !env_probe::is_elevated() {
             return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing IFEO needs an elevated token", "re-run Heisenberg elevated", Some(docs))));
         }
-        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "set-service-debugger", a.confirm.as_deref()) {
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "set-service-debugger", a.confirm.as_deref(), &self.state.approvals) {
             Ok(d) => d,
             Err(b) => {
                 self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
@@ -3732,7 +3753,7 @@ impl Heisenberg {
         if !env_probe::is_elevated() {
             return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing IFEO needs an elevated token", "re-run elevated", Some(docs))));
         }
-        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "enable-heap-track", a.confirm.as_deref()) {
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "enable-heap-track", a.confirm.as_deref(), &self.state.approvals) {
             Ok(d) => d,
             Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs)))); }
         };
@@ -3846,7 +3867,7 @@ impl Heisenberg {
         }
         match action.as_str() {
             "arm" => {
-                let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "boot-trace", a.confirm.as_deref()) {
+                let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "boot-trace", a.confirm.as_deref(), &self.state.approvals) {
                     Ok(d) => d,
                     Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs)))); }
                 };
@@ -3923,7 +3944,7 @@ impl Heisenberg {
             (None, Some(n)) => n.clone(),
             (None, None) => return Ok(text(error(tool, ErrorKind::InvalidArgument, "no pid or name given", "pass pid or name of the remote process", Some(docs)))),
         };
-        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "remote-dump", a.confirm.as_deref()) {
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "remote-dump", a.confirm.as_deref(), &self.state.approvals) {
             Ok(d) => d,
             Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs)))); }
         };
@@ -4395,6 +4416,7 @@ impl ServerHandler for Heisenberg {
             Resource::new("heisenberg://captures", "Background capture jobs".to_string()),
             Resource::new("heisenberg://cases", "Exported case bundles".to_string()),
             Resource::new("heisenberg://sessions", "Open debug sessions".to_string()),
+            Resource::new("heisenberg://approvals", "Human-approval broker grants".to_string()),
             Resource::new("heisenberg://tools", "External tool inventory".to_string()),
         ];
         for (key, name, _, _) in docs::DOCS {
@@ -4457,9 +4479,10 @@ impl ServerHandler for Heisenberg {
                 serde_json::to_string_pretty(&json!({ "cases": cases })).ok()
             }
             "heisenberg://sessions" => {
-                // Persistent debug sessions (dump.command/ttd.replay) are not yet
-                // kept alive, so this is currently always empty.
                 serde_json::to_string_pretty(&json!({ "sessions": [] })).ok()
+            }
+            "heisenberg://approvals" => {
+                serde_json::to_string_pretty(&json!({ "approvals": self.state.approvals.list() })).ok()
             }
             other if other.starts_with("heisenberg://dumps/") => {
                 let id = &other["heisenberg://dumps/".len()..];

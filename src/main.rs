@@ -4,6 +4,7 @@
 //! Phase 1: the static single-binary server foundation — `env.check`, the policy
 //! safety spine, and the `heisenberg://` / `docs://` resources over stdio.
 
+mod approvals;
 mod audit;
 mod config;
 mod docs;
@@ -47,6 +48,22 @@ async fn main() -> Result<()> {
             let out = format!("{policy}.sig");
             std::fs::write(&out, sig)?;
             println!("wrote {out}");
+            return Ok(());
+        }
+        Some("approve") => {
+            // Out-of-band operator approval for a HumanApproval-gated tool on a
+            // Critical box: one-shot, valid 15 minutes.
+            let tool = args.get(2).ok_or_else(|| anyhow::anyhow!("usage: heisenberg approve <tool-name>"))?;
+            let store = store::Store::discover();
+            let appr = approvals::Approvals::load(store.approvals_path());
+            appr.grant(tool);
+            println!("granted a one-shot approval for '{tool}' (valid {} min)", approvals::APPROVAL_TTL_SECS / 60);
+            return Ok(());
+        }
+        Some("approvals") => {
+            let store = store::Store::discover();
+            let appr = approvals::Approvals::load(store.approvals_path());
+            println!("{}", serde_json::to_string_pretty(&appr.list()).unwrap_or_default());
             return Ok(());
         }
         _ => {}
