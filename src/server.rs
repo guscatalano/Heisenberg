@@ -631,6 +631,32 @@ fn comsvcs_path() -> std::path::PathBuf {
     std::path::PathBuf::from(sr).join("System32").join("comsvcs.dll")
 }
 
+/// Find the newest non-empty `.dmp` file in `dir` modified at or after `since`.
+/// ProcDump ignores the exact filename we request and writes its own
+/// (`<pid>_<timestamp>.dmp`), so after a capture we adopt whatever dump it wrote
+/// during this call rather than trusting the path we passed.
+fn newest_dump_since(dir: &std::path::Path, since: std::time::SystemTime) -> Option<std::path::PathBuf> {
+    let mut best: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()).map(|e| e.eq_ignore_ascii_case("dmp")) != Some(true) {
+            continue;
+        }
+        let meta = match entry.metadata() {
+            Ok(m) if m.len() > 0 => m,
+            _ => continue,
+        };
+        let mtime = match meta.modified() {
+            Ok(t) if t >= since => t,
+            _ => continue,
+        };
+        if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+            best = Some((mtime, path));
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
 /// Pull a handful of well-known fields out of cdb's `!analyze -v` text.
 fn parse_analysis(raw: &str) -> serde_json::Value {
     let grab = |key: &str| -> Option<String> {
@@ -1362,6 +1388,9 @@ impl Heisenberg {
             ("comsvcs", s, c)
         };
 
+        // Note when we launched so we can find the dump the backend actually
+        // wrote (ProcDump rewrites the filename we pass), tolerating small clock skew.
+        let started = std::time::SystemTime::now() - Duration::from_secs(5);
         let output = match tokio::time::timeout(Duration::from_secs(180), cmd.output()).await {
             Err(_) => {
                 self.state.audit.record(tool, "capture timed out", None, "timeout", None);
@@ -1386,9 +1415,16 @@ impl Heisenberg {
         };
 
         // The dump file on disk is the source of truth, not the exit code:
-        // ProcDump returns nonzero in cases where the dump was still written, and
-        // rundll32 (comsvcs) exit codes are meaningless. Treat a non-empty dump as
-        // success regardless of status; only error when no usable dump landed.
+        // ProcDump returns nonzero in cases where the dump was still written and
+        // rewrites the filename we pass (its own PID/timestamp convention), and
+        // rundll32 (comsvcs) exit codes are meaningless. Prefer the exact path we
+        // asked for; otherwise adopt the newest non-empty .dmp the backend wrote
+        // during this call. Only error when no usable dump landed.
+        let outpath = if outpath.is_file() {
+            outpath
+        } else {
+            newest_dump_since(&dir, started).unwrap_or(outpath)
+        };
         let bytes = std::fs::metadata(&outpath).map(|m| m.len()).unwrap_or(0);
         let produced = outpath.is_file() && bytes > 0;
         if !produced {
