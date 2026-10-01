@@ -37,6 +37,10 @@ impl Store {
         self.root.join("jobs.json")
     }
 
+    pub fn folders_path(&self) -> PathBuf {
+        self.root.join("folders.json")
+    }
+
     pub fn artifacts_dir(&self) -> PathBuf {
         self.root.join("artifacts")
     }

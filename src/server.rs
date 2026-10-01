@@ -3,6 +3,7 @@
 //! ledger, audit journal, gate *enforcement*, and a first reversible tool
 //! (`symbols.configure`) that exercises the whole path.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -84,6 +85,9 @@ pub struct AppState {
     pub dumps: Mutex<DumpRegistry>,
     pub jobs: Mutex<JobRegistry>,
     pub audit: Audit,
+    /// Operator-added tool search folders (persisted); shared with the locator.
+    pub extra_folders: Arc<Mutex<Vec<PathBuf>>>,
+    pub folders_path: PathBuf,
 }
 
 impl AppState {
@@ -93,15 +97,33 @@ impl AppState {
         let dumps = DumpRegistry::load(store.dumps_path());
         let jobs = JobRegistry::load(store.jobs_path());
         let audit = Audit::open(store.audit_path());
+        let folders_path = store.folders_path();
+        let folders: Vec<PathBuf> = std::fs::read(&folders_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+            .unwrap_or_default()
+            .into_iter()
+            .map(PathBuf::from)
+            .collect();
+        let extra_folders = Arc::new(Mutex::new(folders));
         AppState {
             policy,
-            locator: Locator::discover(),
+            locator: Locator::discover(extra_folders.clone()),
             ledger: Mutex::new(ledger),
             dumps: Mutex::new(dumps),
             jobs: Mutex::new(jobs),
             audit,
+            extra_folders,
+            folders_path,
             store,
         }
+    }
+}
+
+fn save_folders(path: &std::path::Path, folders: &[PathBuf]) {
+    let v: Vec<String> = folders.iter().map(|p| p.display().to_string()).collect();
+    if let Err(e) = std::fs::write(path, serde_json::to_vec_pretty(&v).unwrap_or_default()) {
+        tracing::warn!("folders save failed: {e}");
     }
 }
 
@@ -903,10 +925,74 @@ impl Heisenberg {
     async fn tools_list(&self) -> Result<CallToolResult, McpError> {
         let inv = self.state.locator.inventory();
         let found = inv.iter().filter(|t| t["found"] == json!(true)).count();
+        let extra: Vec<String> = self
+            .state
+            .extra_folders
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|p| p.display().to_string())
+            .collect();
         let v = Outcome::new("tools.list", format!("{}/{} known tools found", found, inv.len()))
-            .data(json!({ "tools": inv }))
+            .data(json!({ "tools": inv, "extraFolders": extra }))
             .to_value();
         Ok(text(v))
+    }
+
+    #[tool(
+        name = "tools.addFolder",
+        description = "Add a folder to Heisenberg's tool search path (searched first, persisted across restarts). Affects only tool discovery, not the machine."
+    )]
+    async fn tools_add_folder(
+        &self,
+        Parameters(a): Parameters<PathArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "tools.addFolder";
+        let (list, added) = {
+            let mut g = self.state.extra_folders.lock().unwrap();
+            let exists = g
+                .iter()
+                .any(|d| d.display().to_string().eq_ignore_ascii_case(&a.path));
+            if !exists {
+                g.push(PathBuf::from(&a.path));
+            }
+            (g.clone(), !exists)
+        };
+        save_folders(&self.state.folders_path, &list);
+        self.state.audit.record(tool, &format!("add folder {}", a.path), None, if added { "added" } else { "noop" }, None);
+        let display: Vec<String> = list.iter().map(|p| p.display().to_string()).collect();
+        let mut out = Outcome::new(tool, format!("{} search folder(s)", display.len()))
+            .data(json!({ "added": added, "folders": display }));
+        if !std::path::Path::new(&a.path).exists() {
+            out = out.warn("that folder doesn't exist yet; tools there will resolve once it does");
+        }
+        Ok(text(out.to_value()))
+    }
+
+    #[tool(
+        name = "tools.removeFolder",
+        description = "Remove a folder from Heisenberg's tool search path (persisted)."
+    )]
+    async fn tools_remove_folder(
+        &self,
+        Parameters(a): Parameters<PathArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "tools.removeFolder";
+        let (list, removed) = {
+            let mut g = self.state.extra_folders.lock().unwrap();
+            let before = g.len();
+            g.retain(|d| !d.display().to_string().eq_ignore_ascii_case(&a.path));
+            let removed = g.len() != before;
+            (g.clone(), removed)
+        };
+        save_folders(&self.state.folders_path, &list);
+        self.state.audit.record(tool, &format!("remove folder {}", a.path), None, if removed { "removed" } else { "noop" }, None);
+        let display: Vec<String> = list.iter().map(|p| p.display().to_string()).collect();
+        Ok(text(
+            Outcome::new(tool, format!("{} search folder(s)", display.len()))
+                .data(json!({ "removed": removed, "folders": display }))
+                .to_value(),
+        ))
     }
 
     #[tool(

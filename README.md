@@ -23,6 +23,7 @@ Tools today:
 | `tools.list` | Inventory the external tools Heisenberg drives — found (with path) vs missing — each with its doc link. |
 | `tools.install` | Install a known tool via direct download / winget / dotnet CLI (procdump, procmon, sysinternals, windbg, windows-sdk, dotnet-dump…); gated, uninstallable via `changes.revert`. |
 | `env.provision` | Provision the whole toolchain in one step via [Groundhog](https://github.com/guscatalano/Groundhog) if installed (default profile: windows-internals — Sysinternals, WinDbg, WPT, symbols, crash dumps). Falls back to `tools.install` when absent. |
+| `tools.addFolder` / `tools.removeFolder` | Add/remove a folder in the tool search path (searched first, persisted across restarts). |
 | `system.triage` | First-response gather on a broken box: systeminfo, services, tasklist, boot config, drivers, hypervisor, log locations. |
 | `inspect.processTree` / `inspect.network` / `inspect.verify` | Process tree (pid/ppid), active connections (netstat), and Authenticode signature checks. |
 | `dump.capture` | Capture a user-mode dump (full/mini) by pid or name. ProcDump if staged, else comsvcs. Disk pre-checked; full dumps marked high-sensitivity. |

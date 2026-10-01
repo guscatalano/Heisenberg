@@ -3,6 +3,7 @@
 //! debuggers and Sysinternals are not inside `heisenberg.exe`.
 
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 /// Known tools Heisenberg drives: (doc key, executable name).
 pub const KNOWN_TOOLS: &[(&str, &str)] = &[
@@ -76,16 +77,19 @@ pub fn install_method(key: &str) -> Option<InstallMethod> {
 
 pub struct Locator {
     dirs: Vec<PathBuf>,
+    /// Operator-added folders (via tools.addFolder), shared with AppState and
+    /// persisted; searched first.
+    extra: Arc<Mutex<Vec<PathBuf>>>,
 }
 
 impl Locator {
-    pub fn discover() -> Locator {
+    pub fn discover(extra: Arc<Mutex<Vec<PathBuf>>>) -> Locator {
         let mut dirs = Vec::new();
         if let Ok(d) = std::env::var("HEISENBERG_TOOLS") {
             dirs.extend(std::env::split_paths(&d));
         }
         dirs.extend(known_dirs());
-        Locator { dirs }
+        Locator { dirs, extra }
     }
 
     /// Find an executable by file name (e.g. "procdump.exe"): staged + known dirs
@@ -93,6 +97,14 @@ impl Locator {
     /// tool installed after startup — e.g. by env.provision — resolves without a
     /// restart).
     pub fn find(&self, exe: &str) -> Option<PathBuf> {
+        if let Ok(extra) = self.extra.lock() {
+            for d in extra.iter() {
+                let p = d.join(exe);
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
         for d in &self.dirs {
             let p = d.join(exe);
             if p.is_file() {
