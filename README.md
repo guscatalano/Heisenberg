@@ -32,6 +32,7 @@ Tools today:
 | `service.startupDebug` | Attach a debugger to an image at process start (IFEO Debugger) for startup crashes/hangs (reversible; needs elevation). |
 | `postmortem.aeDebug` | Set the AeDebug JIT debugger so any unhandled crash drops to a scripted dump (reversible; needs elevation). |
 | `dump.analyze` | Open a dump in cdb (`!analyze -v`, stacks, modules) and return parsed + raw. Needs the Debugging Tools for Windows. |
+| `dump.open` / `dump.command` / `dump.close` | Interactive cdb session on a dump: run arbitrary commands across calls, then close. |
 | `analyze.deadlock` / `analyze.highCpu` / `analyze.handles` / `analyze.async` / `analyze.verifierStop` / `analyze.foreignDump` | Targeted cdb analyses of a dump (lock contention, CPU by thread, handle leaks, .NET async, verifier stops, off-box dumps with matched symbols). |
 | `gflags.get` / `gflags.set` | Show / enable full page heap for an image via IFEO (reversible via the ledger; `dry_run` + confirm token; needs elevation). Disable by reverting the change. |
 | `appverifier.enable` | Enable Application Verifier for an image via IFEO (reversible; needs elevation). |

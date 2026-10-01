@@ -20,6 +20,7 @@ mod proc;
 mod regutil;
 mod server;
 mod session;
+mod sessions;
 mod signing;
 mod store;
 mod tools;

@@ -95,6 +95,8 @@ pub struct AppState {
     pub folders_path: PathBuf,
     /// Out-of-band human-approval broker.
     pub approvals: Approvals,
+    /// Live interactive cdb debug sessions (dump.open/command/close).
+    pub sessions: crate::sessions::DebugSessions,
 }
 
 impl AppState {
@@ -121,6 +123,7 @@ impl AppState {
             jobs: Mutex::new(jobs),
             audit,
             approvals: Approvals::load(store.approvals_path()),
+            sessions: crate::sessions::DebugSessions::new(),
             extra_folders,
             folders_path,
             store,
@@ -216,6 +219,29 @@ pub struct PromptTargetArgs {
 
 fn default_dur() -> u64 {
     10
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DumpOpenArgs {
+    /// Dump id (from dump.capture) or a file path to open interactively.
+    pub dump: String,
+    /// Symbol path (default: current _NT_SYMBOL_PATH, else the public server).
+    #[serde(default)]
+    pub sympath: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionCommandArgs {
+    /// Session id from dump.open.
+    pub session: String,
+    /// A cdb command to run in the session (e.g. "k", "!analyze -v", "lm").
+    pub command: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SessionIdArg {
+    /// Session id from dump.open.
+    pub session: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1381,6 +1407,17 @@ impl Heisenberg {
         }
 
         let bytes = std::fs::metadata(&outpath).map(|m| m.len()).unwrap_or(0);
+        // comsvcs MiniDump ACLs the dump to SYSTEM+Administrators only; grant the
+        // capturing user read so cdb (and dump.analyze) can open it without elevation.
+        if backend == "comsvcs" {
+            if let Ok(user) = std::env::var("USERNAME") {
+                let _ = tokio::time::timeout(
+                    Duration::from_secs(20),
+                    Command::new("icacls").arg(&outpath).arg("/grant").arg(format!("{user}:(R)")).output(),
+                )
+                .await;
+            }
+        }
         let rec = {
             let mut reg = self.state.dumps.lock().unwrap();
             reg.add(outpath.display().to_string(), pid, kind, backend, bytes)
@@ -4160,6 +4197,107 @@ impl Heisenberg {
         }
         Ok(text(out.to_value()))
     }
+
+    #[tool(
+        name = "dump.open",
+        description = "Open an interactive cdb session on a dump (id or path) and keep it alive for dump.command. Read-only (post-mortem). Needs cdb; returns a session id."
+    )]
+    async fn dump_open(
+        &self,
+        Parameters(a): Parameters<DumpOpenArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.open";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/";
+        let path = {
+            let reg = self.state.dumps.lock().unwrap();
+            let id = a.dump.trim_start_matches("heisenberg://dumps/");
+            reg.get(id).map(|r| r.path.clone()).unwrap_or_else(|| a.dump.clone())
+        };
+        if !std::path::Path::new(&path).is_file() {
+            return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no dump at {path}"), "pass a dump id or a valid path", Some(docs))));
+        }
+        if self.state.locator.find("cdb.exe").is_none() {
+            let mut v = error(tool, ErrorKind::ToolNotInstalled, "cdb.exe not found", "install the Debugging Tools for Windows (winget install Microsoft.WinDbg)", Some(docs));
+            v["error"]["wingetId"] = json!("Microsoft.WinDbg");
+            return Ok(text(v));
+        }
+        let sympath = a.sympath.clone().or_else(|| regutil::get_hkcu_env("_NT_SYMBOL_PATH")).unwrap_or_else(|| {
+            format!("srv*{}*https://msdl.microsoft.com/download/symbols", self.state.store.root.join("symbols").display())
+        });
+        let meta = self.state.sessions.open(path.clone(), sympath);
+        self.state.audit.record(tool, &format!("opened session {} on {path}", meta.id), None, "opened", Some(&meta.id));
+        Ok(text(
+            Outcome::new(tool, format!("opened cdb session {} on {path}", meta.id))
+                .data(json!({ "session": meta.id, "target": meta.target, "created": meta.created }))
+                .docs(docs)
+                .warn("run commands with dump.command {session, command}; close with dump.close when done")
+                .to_value(),
+        ))
+    }
+
+    /// Run one cdb command set against a dump (`-z ... -y ... -c "...; q"`).
+    async fn cdb_oneshot(&self, path: &str, sympath: &str, cmds: &str) -> Result<String, (ErrorKind, String)> {
+        let cdb = self
+            .state
+            .locator
+            .find("cdb.exe")
+            .ok_or((ErrorKind::ToolNotInstalled, "cdb.exe not found".to_string()))?;
+        let out = tokio::time::timeout(
+            Duration::from_secs(300),
+            Command::new(&cdb).arg("-z").arg(path).arg("-y").arg(sympath).arg("-c").arg(cmds).output(),
+        )
+        .await
+        .map_err(|_| (ErrorKind::Timeout, "cdb timed out after 300s".to_string()))?
+        .map_err(|e| (ErrorKind::Internal, format!("failed to launch cdb: {e}")))?;
+        Ok(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+
+    #[tool(
+        name = "dump.command",
+        description = "Run a cdb command in an open dump session (from dump.open) and return its output. Read-only (post-mortem) — each command re-execs cdb on the immutable dump."
+    )]
+    async fn dump_command(
+        &self,
+        Parameters(a): Parameters<SessionCommandArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.command";
+        let session = match self.state.sessions.get(&a.session) {
+            Some(s) => s,
+            None => {
+                return Ok(text(error(tool, ErrorKind::SessionNotFound, format!("no session {}", a.session), "open one with dump.open; list via heisenberg://sessions", None)))
+            }
+        };
+        let cmds = format!("{}; q", a.command);
+        match self.cdb_oneshot(&session.target, &session.sympath, &cmds).await {
+            Ok(raw) => {
+                self.state.audit.record(tool, &format!("ran '{}' in {}", a.command, a.session), None, "ran", Some(&a.session));
+                Ok(text(
+                    Outcome::new(tool, format!("ran '{}' in session {}", a.command, a.session))
+                        .data(json!({ "session": a.session, "command": a.command, "output": last_chars(&raw, 8000) }))
+                        .to_value(),
+                ))
+            }
+            Err((k, e)) => Ok(text(error(tool, k, e, "check cdb and the dump", None))),
+        }
+    }
+
+    #[tool(
+        name = "dump.close",
+        description = "Close an interactive cdb dump session opened with dump.open."
+    )]
+    async fn dump_close(
+        &self,
+        Parameters(a): Parameters<SessionIdArg>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.close";
+        let closed = self.state.sessions.close(&a.session);
+        self.state.audit.record(tool, &format!("close session {}", a.session), None, if closed { "closed" } else { "noop" }, Some(&a.session));
+        if closed {
+            Ok(text(Outcome::new(tool, format!("closed session {}", a.session)).data(json!({ "session": a.session })).to_value()))
+        } else {
+            Ok(text(error(tool, ErrorKind::SessionNotFound, format!("no session {}", a.session), "list via heisenberg://sessions", None)))
+        }
+    }
 }
 
 fn user_msg(text: String) -> Vec<PromptMessage> {
@@ -4479,7 +4617,7 @@ impl ServerHandler for Heisenberg {
                 serde_json::to_string_pretty(&json!({ "cases": cases })).ok()
             }
             "heisenberg://sessions" => {
-                serde_json::to_string_pretty(&json!({ "sessions": [] })).ok()
+                serde_json::to_string_pretty(&json!({ "sessions": self.state.sessions.list() })).ok()
             }
             "heisenberg://approvals" => {
                 serde_json::to_string_pretty(&json!({ "approvals": self.state.approvals.list() })).ok()
