@@ -149,3 +149,38 @@ pub fn net_guidance(host: &str, hostip: &str, port: u32, key: Option<&str>) -> V
         "caveats": caveats,
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{crash_dump_mode_name, crash_dump_mode_value};
+
+    #[test]
+    fn crash_dump_mode_value_accepts_aliases_case_insensitively() {
+        assert_eq!(crash_dump_mode_value("none"), Some(0));
+        assert_eq!(crash_dump_mode_value("OFF"), Some(0));
+        assert_eq!(crash_dump_mode_value("Complete"), Some(1));
+        assert_eq!(crash_dump_mode_value("full"), Some(1));
+        assert_eq!(crash_dump_mode_value("kernel"), Some(2));
+        assert_eq!(crash_dump_mode_value("minidump"), Some(3));
+        assert_eq!(crash_dump_mode_value("auto"), Some(7));
+        assert_eq!(crash_dump_mode_value("bogus"), None);
+    }
+
+    #[test]
+    fn crash_dump_mode_name_maps_known_values() {
+        assert_eq!(crash_dump_mode_name(0), "none");
+        assert_eq!(crash_dump_mode_name(1), "complete");
+        assert_eq!(crash_dump_mode_name(2), "kernel");
+        assert_eq!(crash_dump_mode_name(3), "small");
+        assert_eq!(crash_dump_mode_name(7), "automatic");
+        assert_eq!(crash_dump_mode_name(99), "unknown");
+    }
+
+    #[test]
+    fn crash_dump_canonical_values_round_trip_through_name() {
+        for v in [0u32, 1, 2, 3, 7] {
+            // name->value may normalize aliases, but the canonical name must map back.
+            assert_eq!(crash_dump_mode_value(crash_dump_mode_name(v)), Some(v));
+        }
+    }
+}

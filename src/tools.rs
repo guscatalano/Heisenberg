@@ -26,6 +26,7 @@ pub const KNOWN_TOOLS: &[(&str, &str)] = &[
 ];
 
 /// How a known tool is installed.
+#[derive(Debug)]
 pub enum InstallMethod {
     Winget(&'static str),
     DotnetTool(&'static str),
@@ -181,4 +182,45 @@ fn known_dirs() -> Vec<PathBuf> {
         v.push(PathBuf::from(&la).join(r"Microsoft\WindowsApps"));
     }
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{install_method, InstallMethod, KNOWN_TOOLS};
+
+    #[test]
+    fn sysinternals_tools_use_direct_zip() {
+        for key in ["procdump", "procmon", "autoruns", "psexec", "sysinternals"] {
+            match install_method(key) {
+                Some(InstallMethod::DirectZip { url, exe }) => {
+                    assert!(url.starts_with("https://download.sysinternals.com/"), "{key} url");
+                    assert!(exe.to_lowercase().ends_with(".exe"), "{key} exe");
+                }
+                other => panic!("{key} expected DirectZip, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn install_method_is_case_insensitive_and_known() {
+        assert!(matches!(install_method("ProcDump"), Some(InstallMethod::DirectZip { .. })));
+        assert!(matches!(install_method("windbg"), Some(InstallMethod::Winget(_))));
+        assert!(matches!(install_method("cdb"), Some(InstallMethod::Winget("Microsoft.WindowsSDK"))));
+        assert!(matches!(install_method("dotnet-trace"), Some(InstallMethod::DotnetTool(_))));
+        assert!(install_method("not-a-real-tool").is_none());
+    }
+
+    #[test]
+    fn known_tools_table_is_well_formed() {
+        // Every advertised tool has a non-empty key and an .exe name; the headline
+        // debugging tools must be present.
+        for (key, exe) in KNOWN_TOOLS {
+            assert!(!key.is_empty());
+            assert!(exe.to_lowercase().ends_with(".exe"), "{key} -> {exe}");
+        }
+        let keys: Vec<_> = KNOWN_TOOLS.iter().map(|(k, _)| *k).collect();
+        for want in ["procdump", "procmon", "windbg", "gflags"] {
+            assert!(keys.contains(&want), "KNOWN_TOOLS missing {want}");
+        }
+    }
 }

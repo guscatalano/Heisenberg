@@ -4700,3 +4700,77 @@ impl ServerHandler for Heisenberg {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{comsvcs_path, newest_dump_since};
+    use std::fs;
+    use std::time::{Duration, SystemTime};
+
+    fn tmpdir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "heisenberg_test_{tag}_{}",
+            SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn write_dump(dir: &std::path::Path, name: &str, len: usize, mtime: SystemTime) {
+        let p = dir.join(name);
+        fs::write(&p, vec![0u8; len]).unwrap();
+        fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
+    }
+
+    #[test]
+    fn comsvcs_path_points_at_system32_dll() {
+        let p = comsvcs_path();
+        assert_eq!(
+            p.file_name().and_then(|f| f.to_str()),
+            Some("comsvcs.dll")
+        );
+        assert!(p.to_string_lossy().to_lowercase().contains("system32"));
+    }
+
+    #[test]
+    fn newest_dump_none_for_missing_dir() {
+        let missing = std::env::temp_dir().join("heisenberg_test_definitely_absent_xyz");
+        assert!(newest_dump_since(&missing, SystemTime::UNIX_EPOCH).is_none());
+    }
+
+    #[test]
+    fn newest_dump_picks_most_recent_dmp() {
+        // Regression test for the dump.capture bug: ProcDump writes a file whose
+        // name differs from the one we requested, so we must adopt the newest .dmp
+        // the backend actually wrote during the call.
+        let dir = tmpdir("newest");
+        let base = SystemTime::now() - Duration::from_secs(60);
+        write_dump(&dir, "old_111.dmp", 1024, base);
+        write_dump(&dir, "new_222.dmp", 2048, base + Duration::from_secs(30));
+        let got = newest_dump_since(&dir, base - Duration::from_secs(10)).unwrap();
+        assert_eq!(got.file_name().and_then(|f| f.to_str()), Some("new_222.dmp"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn newest_dump_ignores_empty_and_non_dmp() {
+        let dir = tmpdir("filter");
+        let t = SystemTime::now() - Duration::from_secs(10);
+        write_dump(&dir, "good.dmp", 512, t);
+        write_dump(&dir, "empty.dmp", 0, t + Duration::from_secs(1)); // newer but zero-byte
+        fs::write(dir.join("notes.txt"), vec![0u8; 999]).unwrap(); // newer but not .dmp
+        let got = newest_dump_since(&dir, SystemTime::UNIX_EPOCH).unwrap();
+        assert_eq!(got.file_name().and_then(|f| f.to_str()), Some("good.dmp"));
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn newest_dump_respects_since_cutoff() {
+        let dir = tmpdir("cutoff");
+        let t = SystemTime::now() - Duration::from_secs(300);
+        write_dump(&dir, "stale.dmp", 512, t);
+        // Nothing written at/after a cutoff in the near future.
+        assert!(newest_dump_since(&dir, SystemTime::now() + Duration::from_secs(60)).is_none());
+        fs::remove_dir_all(&dir).ok();
+    }
+}
