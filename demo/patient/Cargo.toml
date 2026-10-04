@@ -1,0 +1,14 @@
+[package]
+name = "patient"
+version = "0.1.0"
+edition = "2021"
+description = "A deliberately-misbehaving Windows process for demoing Heisenberg."
+
+[[bin]]
+name = "patient"
+path = "src/main.rs"
+
+[profile.release]
+# Keep frames intact so the dump tells a clear story on screen.
+debug = true
+opt-level = 1
