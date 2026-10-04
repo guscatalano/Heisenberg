@@ -44,6 +44,8 @@ const FLG_HEAP_PAGE_ALLOCS: u32 = 0x0200_0000;
 const PAGE_HEAP_FULL: u32 = 0x3;
 
 const PROCMON_DOCS: &str = "https://learn.microsoft.com/sysinternals/downloads/procmon";
+const PKTMON_DOCS: &str =
+    "https://learn.microsoft.com/windows-server/networking/technologies/pktmon/pktmon";
 const GROUNDHOG_DOCS: &str = "https://github.com/guscatalano/Groundhog";
 
 const KERNEL_TOKEN: &str = "kernel-debug-setup";
@@ -403,6 +405,16 @@ pub struct ProcmonStartArgs {
     /// Optional process-name filter (not yet applied — recorded for now).
     #[serde(default)]
     pub process: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct NetCaptureArgs {
+    /// Only capture packets on this TCP/UDP port (both directions).
+    #[serde(default)]
+    pub port: Option<u16>,
+    /// Only capture packets to/from this IPv4/IPv6 address.
+    #[serde(default)]
+    pub address: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -1973,6 +1985,53 @@ impl Heisenberg {
         }
     }
 
+    /// Stop the pktmon capture session, clear its filters, and convert the `.etl`
+    /// to a `.pcapng` (Win10 2004+). Returns the `.pcapng` path when conversion
+    /// succeeds, otherwise `None` (the `.etl` remains the artifact).
+    async fn stop_pktmon(&self, etl: Option<&str>) -> Result<Option<String>, String> {
+        let out = tokio::time::timeout(
+            Duration::from_secs(60),
+            Command::new("pktmon").arg("stop").output(),
+        )
+        .await
+        .map_err(|_| "pktmon stop timed out".to_string())?
+        .map_err(|e| format!("failed to launch pktmon: {e}"))?;
+        if !out.status.success() {
+            let msg = String::from_utf8_lossy(&out.stderr);
+            let combined = if msg.trim().is_empty() {
+                String::from_utf8_lossy(&out.stdout).trim().to_string()
+            } else {
+                msg.trim().to_string()
+            };
+            return Err(format!("pktmon stop failed: {combined}"));
+        }
+        // Clear any filters we added so the next capture starts clean (best-effort).
+        let _ = Command::new("pktmon").args(["filter", "remove"]).output().await;
+
+        let etl = match etl {
+            Some(p) if std::path::Path::new(p).is_file() => p,
+            _ => return Ok(None),
+        };
+        let pcapng = std::path::Path::new(etl).with_extension("pcapng");
+        let conv = tokio::time::timeout(
+            Duration::from_secs(120),
+            Command::new("pktmon")
+                .arg("pcapng")
+                .arg(etl)
+                .arg("-o")
+                .arg(&pcapng)
+                .output(),
+        )
+        .await;
+        match conv {
+            Ok(Ok(o)) if o.status.success() && pcapng.is_file() => {
+                Ok(Some(pcapng.display().to_string()))
+            }
+            // Conversion unavailable (older Windows) or failed: keep the .etl.
+            _ => Ok(None),
+        }
+    }
+
     /// Stop a WPR ETW session and finalize its `.etl`.
     async fn stop_wpr(&self, etl: &str) -> Result<(), String> {
         let out = tokio::time::timeout(
@@ -2037,29 +2096,35 @@ impl Heisenberg {
             )));
         }
 
-        let stop_result: Result<(), String> = match job.kind.as_str() {
-            "procmon" => self.terminate_procmon().await,
-            "wpr" => match &job.backing_file {
+        // Ok(Some(path)) lets a backend hand back a converted artifact (e.g. pktmon
+        // turning its .etl into a .pcapng); Ok(None) means use the job's backing file.
+        let stop_result: Result<Option<String>, String> = match job.kind.as_str() {
+            "procmon" => self.terminate_procmon().await.map(|_| None),
+            "wpr" => (match &job.backing_file {
                 Some(p) => self.stop_wpr(p).await,
                 None => Err("wpr job has no backing file".to_string()),
-            },
-            "ttd" => self.stop_ttd().await,
+            })
+            .map(|_| None),
+            "ttd" => self.stop_ttd().await.map(|_| None),
             "procdump" | "dbgsrv" => {
                 // Best-effort: procdump may already have exited after its trigger
                 // fired; dbgsrv is a long-running server we terminate.
                 if let Some(pid) = job.tool_pid {
                     let _ = kill_pid(pid).await;
                 }
-                Ok(())
+                Ok(None)
             }
+            // pktmon is an ETW session, not a child process: `pktmon stop` ends it,
+            // then we convert the .etl to a .pcapng.
+            "pktmon" => self.stop_pktmon(job.backing_file.as_deref()).await,
             _ => {
                 if cancel {
                     match job.tool_pid {
-                        Some(pid) => kill_pid(pid).await,
-                        None => Ok(()),
+                        Some(pid) => kill_pid(pid).await.map(|_| None),
+                        None => Ok(None),
                     }
                 } else {
-                    Ok(())
+                    Ok(None)
                 }
             }
         };
@@ -2072,21 +2137,26 @@ impl Heisenberg {
         let verb = if cancel { "cancelled" } else { "stopped" };
 
         match stop_result {
-            Ok(()) => {
+            Ok(override_path) => {
                 let updated = self.state.jobs.lock().unwrap().set_state(id, final_state);
                 self.state.audit.record(tool, &format!("{verb} job {id}"), None, verb, Some(id));
                 let mut out = Outcome::new(tool, format!("{verb} job {id} ({})", job.kind))
                     .data(json!({ "job": updated }));
-                if let Some(bf) = &job.backing_file {
+                let art_path = override_path.or_else(|| job.backing_file.clone());
+                if let Some(bf) = &art_path {
                     if std::path::Path::new(bf).is_file() {
                         let bytes = std::fs::metadata(bf).map(|m| m.len()).unwrap_or(0);
+                        let is_pcap = job.kind == "pktmon";
                         out = out.artifact(Artifact {
-                            kind: "trace".to_string(),
+                            kind: if is_pcap { "pcap" } else { "trace" }.to_string(),
                             path: bf.clone(),
                             bytes,
                             resource: format!("heisenberg://captures/{id}"),
-                            sensitivity: Some("medium".to_string()),
+                            sensitivity: Some(if is_pcap { "high" } else { "medium" }.to_string()),
                         });
+                        if is_pcap {
+                            out = out.warn("packet capture may contain credentials, tokens, cookies or PII; treat as high-sensitivity and do not move it off-box unreviewed");
+                        }
                     }
                 }
                 Ok(text(out.to_value()))
@@ -2193,6 +2263,138 @@ impl Heisenberg {
         Parameters(a): Parameters<JobIdArgs>,
     ) -> Result<CallToolResult, McpError> {
         self.do_stop("procmon.stop", &a.id, false).await
+    }
+
+    #[tool(
+        name = "net.captureStart",
+        description = "Start a network packet capture in the background with pktmon (in-box on Windows 10 1809+/Server 2019+ — no install). Optional port/address filter. Read-only capture, but needs elevation. Stop with net.captureStop (converts to a Wireshark-readable .pcapng) or job.stop. Captures are HIGH-SENSITIVITY (may contain credentials/PII)."
+    )]
+    async fn net_capture_start(
+        &self,
+        Parameters(a): Parameters<NetCaptureArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "net.captureStart";
+        if !env_probe::is_elevated() {
+            return Ok(text(error(
+                tool,
+                ErrorKind::RequiresElevation,
+                "pktmon needs an elevated token to capture packets",
+                "re-run Heisenberg elevated, or via the elevated broker",
+                Some(PKTMON_DOCS),
+            )));
+        }
+        let pk = self
+            .state
+            .locator
+            .find("pktmon.exe")
+            .unwrap_or_else(|| std::path::PathBuf::from("pktmon.exe"));
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let etl = self.state.store.artifacts_dir().join(format!("netcap_{ts}.etl"));
+
+        // Apply optional filters before starting. pktmon filters are global, so
+        // clear any stale ones first; they're removed again on stop.
+        let mut filter_desc = String::new();
+        if a.port.is_some() || a.address.is_some() {
+            let _ = Command::new(&pk).args(["filter", "remove"]).output().await;
+            let mut fargs: Vec<String> = vec!["filter".into(), "add".into(), "heisenberg".into()];
+            if let Some(p) = a.port {
+                fargs.push("-p".into());
+                fargs.push(p.to_string());
+                filter_desc.push_str(&format!(" port={p}"));
+            }
+            if let Some(addr) = &a.address {
+                fargs.push("-i".into());
+                fargs.push(addr.clone());
+                filter_desc.push_str(&format!(" addr={addr}"));
+            }
+            if let Ok(o) = Command::new(&pk).args(&fargs).output().await {
+                if !o.status.success() {
+                    return Ok(text(error(
+                        tool,
+                        ErrorKind::InvalidArgument,
+                        format!("pktmon filter add failed: {}", String::from_utf8_lossy(&o.stderr).trim()),
+                        "check the port/address filter",
+                        Some(PKTMON_DOCS),
+                    )));
+                }
+            }
+        }
+
+        let cmd_str = format!(
+            "pktmon start --capture --pkt-size 0 --file-name \"{}\"",
+            etl.display()
+        );
+        let started = Command::new(&pk)
+            .args(["start", "--capture", "--pkt-size", "0", "--file-name"])
+            .arg(&etl)
+            .output()
+            .await;
+        match started {
+            Ok(o) if o.status.success() => {
+                let job = {
+                    let mut j = self.state.jobs.lock().unwrap();
+                    j.add(
+                        "pktmon",
+                        None,
+                        Some(etl.display().to_string()),
+                        &format!("pktmon capture -> {}", etl.display()),
+                    )
+                };
+                self.state.audit.record(tool, &format!("started pktmon job {}", job.id), None, "started", Some(&job.id));
+                let summary = if filter_desc.is_empty() {
+                    format!("started packet capture (job {}), all traffic", job.id)
+                } else {
+                    format!("started packet capture (job {}), filter:{filter_desc}", job.id)
+                };
+                let out = Outcome::new(tool, summary)
+                    .data(json!({
+                        "jobId": job.id,
+                        "backingFile": etl.display().to_string(),
+                        "filter": { "port": a.port, "address": a.address },
+                        "resource": format!("heisenberg://captures/{}", job.id)
+                    }))
+                    .command(cmd_str)
+                    .docs(PKTMON_DOCS)
+                    .warn("capture is running; stop it with net.captureStop (converts to .pcapng) or job.stop")
+                    .warn("packet captures are HIGH-SENSITIVITY (credentials/tokens/PII); do not move off-box unreviewed");
+                Ok(text(out.to_value()))
+            }
+            Ok(o) => {
+                let msg = String::from_utf8_lossy(&o.stdout);
+                let err = if msg.trim().is_empty() {
+                    String::from_utf8_lossy(&o.stderr).trim().to_string()
+                } else {
+                    msg.trim().to_string()
+                };
+                let mut v = error(
+                    tool,
+                    ErrorKind::Internal,
+                    format!("pktmon start failed: {err}"),
+                    "a capture may already be running (pktmon stop), or this build lacks pktmon (needs Windows 10 1809+)",
+                    Some(PKTMON_DOCS),
+                );
+                v["error"]["output"] = json!(err);
+                Ok(text(v))
+            }
+            Err(e) => Ok(text(error(
+                tool,
+                ErrorKind::ToolNotInstalled,
+                format!("failed to launch pktmon: {e}"),
+                "pktmon ships in-box on Windows 10 1809+/Server 2019+",
+                Some(PKTMON_DOCS),
+            ))),
+        }
+    }
+
+    #[tool(
+        name = "net.captureStop",
+        description = "Stop a running pktmon capture, convert it to a Wireshark-readable .pcapng, and return it as a high-sensitivity artifact."
+    )]
+    async fn net_capture_stop(
+        &self,
+        Parameters(a): Parameters<JobIdArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.do_stop("net.captureStop", &a.id, false).await
     }
 
     #[tool(

@@ -15,6 +15,7 @@ pub const KNOWN_TOOLS: &[(&str, &str)] = &[
     ("livekd", "livekd.exe"),
     ("ttd", "TTD.exe"),
     ("wpr", "wpr.exe"),
+    ("pktmon", "pktmon.exe"),
     ("dotnet-dump", "dotnet-dump.exe"),
     ("dotnet-gcdump", "dotnet-gcdump.exe"),
     ("dotnet-trace", "dotnet-trace.exe"),
