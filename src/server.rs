@@ -4,7 +4,7 @@
 //! (`symbols.configure`) that exercises the whole path.
 
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use rmcp::handler::server::router::prompt::PromptRouter;
@@ -104,6 +104,7 @@ pub struct AppState {
 impl AppState {
     pub fn new(policy: Policy) -> Self {
         let store = Store::discover();
+        init_call_log(&store.calls_path());
         let ledger = Ledger::load(store.ledger_path());
         let dumps = DumpRegistry::load(store.dumps_path());
         let jobs = JobRegistry::load(store.jobs_path());
@@ -720,7 +721,41 @@ fn parse_tier(s: &str) -> Option<EffectTier> {
     }
 }
 
+/// Append-only log of every tool-call *result* (one JSON object per line), so the
+/// results stream to a file you can tail live. Compact by design (summary, not the
+/// full `data` payload). Set up once at startup from the state root.
+static CALL_LOG: OnceLock<Mutex<std::fs::File>> = OnceLock::new();
+
+fn init_call_log(path: &std::path::Path) {
+    if let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = CALL_LOG.set(Mutex::new(f));
+    }
+}
+
+fn log_call(v: &serde_json::Value) {
+    let Some(cell) = CALL_LOG.get() else { return };
+    let artifacts: Vec<&serde_json::Value> = v
+        .get("artifacts")
+        .and_then(|a| a.as_array())
+        .map(|a| a.iter().filter_map(|x| x.get("path")).collect())
+        .unwrap_or_default();
+    let rec = json!({
+        "ts": crate::store::now_rfc3339(),
+        "tool": v.get("tool"),
+        "ok": v.get("ok"),
+        "summary": v.get("summary"),
+        "error": v.get("error").and_then(|e| e.get("kind")),
+        "command": v.get("command"),
+        "artifacts": artifacts,
+    });
+    if let Ok(mut f) = cell.lock() {
+        use std::io::Write;
+        let _ = writeln!(f, "{rec}");
+    }
+}
+
 fn text(v: serde_json::Value) -> CallToolResult {
+    log_call(&v);
     CallToolResult::success(vec![ContentBlock::text(
         serde_json::to_string_pretty(&v).unwrap_or_default(),
     )])
@@ -4806,6 +4841,7 @@ impl ServerHandler for Heisenberg {
             Resource::new("heisenberg://policy", "Effective safety policy".to_string()),
             Resource::new("heisenberg://changes", "Reversible-change ledger".to_string()),
             Resource::new("heisenberg://audit", "Audit journal (recent entries)".to_string()),
+            Resource::new("heisenberg://calls", "Tool-call result log (recent, JSONL)".to_string()),
             Resource::new("heisenberg://dumps", "Captured dumps".to_string()),
             Resource::new("heisenberg://captures", "Background capture jobs".to_string()),
             Resource::new("heisenberg://cases", "Exported case bundles".to_string()),
@@ -4848,6 +4884,12 @@ impl ServerHandler for Heisenberg {
             "heisenberg://changes" => serde_json::to_string_pretty(&self.changes_json()).ok(),
             "heisenberg://audit" => {
                 serde_json::to_string_pretty(&json!({ "entries": self.state.audit.tail(200) })).ok()
+            }
+            "heisenberg://calls" => {
+                let body = std::fs::read_to_string(self.state.store.calls_path()).unwrap_or_default();
+                let lines: Vec<&str> = body.lines().collect();
+                let start = lines.len().saturating_sub(200);
+                Some(lines[start..].join("\n"))
             }
             "heisenberg://dumps" => {
                 let reg = self.state.dumps.lock().unwrap();

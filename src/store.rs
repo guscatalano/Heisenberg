@@ -45,6 +45,11 @@ impl Store {
         self.root.join("approvals.json")
     }
 
+    /// Append-only JSONL log of tool-call results (one line per call).
+    pub fn calls_path(&self) -> PathBuf {
+        self.root.join("calls.jsonl")
+    }
+
     pub fn artifacts_dir(&self) -> PathBuf {
         self.root.join("artifacts")
     }

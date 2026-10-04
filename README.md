@@ -147,6 +147,18 @@ Gate matrix (box class × effect tier):
 | production   | allow     | confirm-token  | human-approval     |
 | critical     | allow     | human-approval | human-approval     |
 
+## Tool-call log
+
+Every tool-call *result* is appended (one compact JSON object per line) to
+`<state-root>\calls.jsonl` — `ts`, `tool`, `ok`, `summary`, `error`, `command`,
+and any `artifacts`. Tail it to watch results stream in live:
+
+```powershell
+Get-Content "$env:ProgramData\Heisenberg\calls.jsonl" -Wait
+```
+
+The recent tail is also exposed over MCP as the `heisenberg://calls` resource.
+
 ## Layout
 
 ```
