@@ -4833,6 +4833,12 @@ mod tests {
     #[tokio::test]
     async fn symbols_configure_refuses_on_critical_box() {
         use rmcp::handler::server::wrapper::Parameters;
+        // Isolate from the shared %ProgramData% store so a real out-of-band grant
+        // (or any machine state) can't make this pass or fail spuriously.
+        let home = std::env::temp_dir().join(format!("hb_srv_test_{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        std::env::set_var("HEISENBERG_HOME", &home);
+        std::fs::remove_file(home.join("approvals.json")).ok();
         let h = super::Heisenberg::new(crate::policy::Policy::default());
         let res = h
             .symbols_configure(Parameters(super::SymbolsConfigureArgs {

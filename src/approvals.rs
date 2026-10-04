@@ -49,9 +49,21 @@ impl Approvals {
         }
     }
 
+    /// Reload the on-disk store into `g`. Grants are written out-of-band by a
+    /// *separate* process (`heisenberg approve`), so the file — not this process's
+    /// in-memory copy — is the source of truth. Every grant/consume/list reads it
+    /// fresh, or the running server would never see an operator's approval.
+    fn refresh(&self, g: &mut Vec<Approval>) {
+        *g = std::fs::read(&self.path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default();
+    }
+
     /// Issue a one-shot grant for `tool` (operator action, via the CLI).
     pub fn grant(&self, tool: &str) {
         let mut g = self.items.lock().unwrap();
+        self.refresh(&mut g);
         g.push(Approval {
             tool: tool.to_string(),
             status: "granted".to_string(),
@@ -65,6 +77,7 @@ impl Approvals {
     pub fn consume(&self, tool: &str) -> bool {
         let now = chrono::Utc::now();
         let mut g = self.items.lock().unwrap();
+        self.refresh(&mut g);
         let idx = g.iter().position(|a| {
             a.tool == tool
                 && a.status == "granted"
@@ -84,7 +97,9 @@ impl Approvals {
     }
 
     pub fn list(&self) -> Vec<Approval> {
-        self.items.lock().unwrap().clone()
+        let mut g = self.items.lock().unwrap();
+        self.refresh(&mut g);
+        g.clone()
     }
 }
 
@@ -116,6 +131,25 @@ mod tests {
         a.grant("kernel.forceBugcheck");
         assert!(!a.consume("gflags.set"));
         assert!(a.consume("kernel.forceBugcheck"));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn out_of_band_grant_is_seen_by_a_running_server() {
+        // The broker's whole point: the server loads at startup, then an operator
+        // grants approval from a *separate* process (the CLI). The server must see
+        // it. Two Approvals instances on the same path model the two processes.
+        let p = tmp("oob");
+        let _ = std::fs::remove_file(&p);
+        let server = Approvals::load(p.clone()); // long-lived server, file empty
+        assert!(!server.consume("gflags.set"), "nothing granted yet");
+        let cli = Approvals::load(p.clone()); // `heisenberg approve`, separate process
+        cli.grant("gflags.set");
+        assert!(
+            server.consume("gflags.set"),
+            "the running server must see an out-of-band grant written after it started"
+        );
+        assert!(!server.consume("gflags.set"), "still one-shot across processes");
         let _ = std::fs::remove_file(&p);
     }
 }
