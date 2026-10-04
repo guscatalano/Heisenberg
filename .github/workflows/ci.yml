@@ -12,7 +12,7 @@ jobs:
   build-test:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust (stable + clippy)
         uses: dtolnay/rust-toolchain@stable
@@ -20,7 +20,7 @@ jobs:
           components: clippy
 
       - name: Cache cargo & target
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/registry
@@ -45,12 +45,12 @@ jobs:
     # Sanity-check the optimized static-CRT single binary builds too.
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - name: Build release
         run: cargo build --release
       - name: Upload heisenberg.exe
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: heisenberg-exe
           path: target/release/heisenberg.exe
