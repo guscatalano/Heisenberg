@@ -239,6 +239,32 @@ mod tests {
     }
 
     #[test]
+    fn full_matrix_matches_documented_table() {
+        use BoxClass::*;
+        use EffectTier::*;
+        use Gate::*;
+        // Every cell of the class x tier matrix, locked so the doc-comment table
+        // (and the safety contract it encodes) can't silently drift.
+        let cases = [
+            (Sandbox, ReadOnly, Allow),
+            (Sandbox, StateChanging, Allow),
+            (Sandbox, MachineDisrupting, Allow),
+            (Development, ReadOnly, Allow),
+            (Development, StateChanging, Allow),
+            (Development, MachineDisrupting, ConfirmToken),
+            (Production, ReadOnly, Allow),
+            (Production, StateChanging, ConfirmToken),
+            (Production, MachineDisrupting, HumanApproval),
+            (Critical, ReadOnly, Allow),
+            (Critical, StateChanging, HumanApproval),
+            (Critical, MachineDisrupting, HumanApproval),
+        ];
+        for (class, tier, gate) in cases {
+            assert_eq!(base_gate(class, tier), gate, "matrix cell {class:?} x {tier:?}");
+        }
+    }
+
+    #[test]
     fn critical_needs_a_human_for_any_mutation() {
         assert_eq!(base_gate(BoxClass::Critical, EffectTier::StateChanging), Gate::HumanApproval);
         assert_eq!(base_gate(BoxClass::Critical, EffectTier::MachineDisrupting), Gate::HumanApproval);

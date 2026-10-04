@@ -2987,14 +2987,17 @@ impl Heisenberg {
             Ok(Err(e)) => return Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch dotnet-dump: {e}"), "check the tool", Some(DOTNET_DOCS)))),
             Ok(Ok(o)) => o,
         };
-        if !output.status.success() || !out.is_file() {
+        // Trust the produced file over the exit code: a collector can write the
+        // dump and still exit nonzero (e.g. the target races to exit at the end).
+        let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        if !(out.is_file() && bytes > 0) {
             let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             let k = if combined.to_lowercase().contains("access") { ErrorKind::AccessDenied } else { ErrorKind::AnalysisFailed };
             let mut v = error(tool, k, format!("dotnet-dump failed for pid {pid}"), "ensure the target is a .NET process and you have access (elevation may be needed)", Some(DOTNET_DOCS));
             v["error"]["output"] = json!(combined.trim());
+            v["error"]["exitCode"] = json!(output.status.code());
             return Ok(text(v));
         }
-        let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         let rec = {
             let mut reg = self.state.dumps.lock().unwrap();
             reg.add(out.display().to_string(), pid, "full", "dotnet-dump", bytes)
@@ -3047,13 +3050,15 @@ impl Heisenberg {
             Ok(Err(e)) => return Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch dotnet-gcdump: {e}"), "check the tool", Some(DOTNET_DOCS)))),
             Ok(Ok(o)) => o,
         };
-        if !output.status.success() || !out.is_file() {
+        // Trust the produced file over the exit code.
+        let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+        if !(out.is_file() && bytes > 0) {
             let combined = format!("{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
             let mut v = error(tool, ErrorKind::AnalysisFailed, format!("dotnet-gcdump failed for pid {pid}"), "ensure the target is a .NET process", Some(DOTNET_DOCS));
             v["error"]["output"] = json!(combined.trim());
+            v["error"]["exitCode"] = json!(output.status.code());
             return Ok(text(v));
         }
-        let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
         self.state.audit.record(tool, &format!("gc heap snapshot of pid {pid}"), None, "captured", None);
         Ok(text(
             Outcome::new(tool, format!("collected GC heap snapshot of pid {pid} ({:.1} MB)", bytes as f64 / 1048576.0))
@@ -4125,13 +4130,15 @@ impl Heisenberg {
         let out = self.state.store.artifacts_dir().join(format!("trace_{pid}_{ts}.nettrace"));
         let cmd = format!("dotnet-trace collect -p {pid} --duration {dur} -o \"{}\"", out.display());
         let output = tokio::time::timeout(Duration::from_secs(secs + 90), Command::new(&dt).arg("collect").arg("-p").arg(pid.to_string()).arg("--duration").arg(&dur).arg("-o").arg(&out).output()).await;
+        let produced = out.is_file() && std::fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false);
         match output {
-            Ok(Ok(o)) if o.status.success() && out.is_file() => {
+            // Trust the produced .nettrace over the exit code.
+            Ok(Ok(_)) if produced => {
                 let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
                 self.state.audit.record(tool, &format!("traced pid {pid} for {secs}s"), None, "captured", None);
                 Ok(text(Outcome::new(tool, format!("collected a {secs}s .NET trace of pid {pid} ({:.1} MB)", bytes as f64 / 1048576.0)).data(json!({ "pid": pid, "durationSec": secs, "path": out.display().to_string(), "bytes": bytes })).artifact(Artifact { kind: "nettrace".to_string(), path: out.display().to_string(), bytes, resource: out.display().to_string(), sensitivity: Some("medium".to_string()) }).command(cmd).docs(DOTNET_DOCS).to_value()))
             }
-            Ok(Ok(o)) => Ok(text(error(tool, ErrorKind::AnalysisFailed, format!("dotnet-trace failed: {}", String::from_utf8_lossy(&o.stderr).trim()), "ensure the target is a .NET process", Some(DOTNET_DOCS)))),
+            Ok(Ok(o)) => { let mut v = error(tool, ErrorKind::AnalysisFailed, format!("dotnet-trace failed: {}", String::from_utf8_lossy(&o.stderr).trim()), "ensure the target is a .NET process", Some(DOTNET_DOCS)); v["error"]["exitCode"] = json!(o.status.code()); Ok(text(v)) }
             Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch dotnet-trace: {e}"), "check the tool", Some(DOTNET_DOCS)))),
             Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "dotnet-trace timed out", "retry with a shorter duration", Some(DOTNET_DOCS)))),
         }
@@ -4772,5 +4779,76 @@ mod tests {
         // Nothing written at/after a cutoff in the near future.
         assert!(newest_dump_since(&dir, SystemTime::now() + Duration::from_secs(60)).is_none());
         fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The safety invariant: every machine-mutating tool must be wired to
+    /// `gate::enforce`. We lock the exact set so that removing a gate (set
+    /// shrinks) or adding a mutating tool without classifying it (requires
+    /// updating this list) can't pass review silently. Derived by scanning the
+    /// tool sections of this file.
+    #[test]
+    fn mutating_tool_gate_set_is_locked() {
+        let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/server.rs")).unwrap();
+        let src = &src[..src.find("#[cfg(test)]").unwrap_or(src.len())];
+        let mut gated: Vec<String> = Vec::new();
+        for seg in src.split("#[tool(").skip(1) {
+            let name = seg.split("name = \"").nth(1).and_then(|s| s.split('"').next());
+            if let Some(name) = name {
+                if seg.contains("gate::enforce(") {
+                    gated.push(name.to_string());
+                }
+            }
+        }
+        gated.sort();
+        let mut expected = vec![
+            "appverifier.enable",
+            "boot.trace",
+            "dump.onCrashInstall",
+            "env.provision",
+            "gflags.set",
+            "kernel.netDebugSetup",
+            "kernel.serialDebugSetup",
+            "kernel.setCrashDump",
+            "leak.heapTrackStart",
+            "postmortem.aeDebug",
+            "remote.dumpCapture",
+            "service.startupDebug",
+            "session.launchInUser",
+            "symbols.configure",
+            "tools.install",
+        ];
+        expected.sort();
+        assert_eq!(
+            gated, expected,
+            "the set of gate::enforce-protected tools changed. If you added or \
+             removed a machine-mutating tool, confirm it calls gate::enforce and \
+             update this list; a shrink means a safety gate was dropped."
+        );
+    }
+
+    /// End-to-end proof the gate actually bites at runtime: on an unconfigured
+    /// (Critical) box, a state-changing tool must refuse before touching the
+    /// machine. `symbols.configure` gates without an elevation check, so this is
+    /// side-effect-free and runs anywhere.
+    #[tokio::test]
+    async fn symbols_configure_refuses_on_critical_box() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let h = super::Heisenberg::new(crate::policy::Policy::default());
+        let res = h
+            .symbols_configure(Parameters(super::SymbolsConfigureArgs {
+                path: "srv*C:\\symbols*https://msdl.microsoft.com/download/symbols".into(),
+                dry_run: false,
+                confirm: None,
+            }))
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res).unwrap();
+        let txt = v
+            .pointer("/content/0/text")
+            .and_then(|t| t.as_str())
+            .unwrap_or_else(|| panic!("unexpected tool result shape: {v}"));
+        let env: serde_json::Value = serde_json::from_str(txt).unwrap();
+        assert_eq!(env["ok"], serde_json::json!(false), "must refuse: {env}");
+        assert_eq!(env["error"]["kind"], serde_json::json!("RequiresApproval"));
     }
 }

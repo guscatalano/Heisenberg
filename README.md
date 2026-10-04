@@ -96,6 +96,25 @@ Or in a client config:
 
 The server speaks MCP over stdio; logs go to stderr (`RUST_LOG=debug` for detail).
 
+## Deploy to a broken box
+
+Heisenberg is a single static-CRT binary with no runtime dependencies, meant to
+be dropped onto an already-broken or air-gapped machine. After copying
+`heisenberg.exe` over, verify it offline before wiring it to a client:
+
+```powershell
+heisenberg version      # build identity
+heisenberg selfcheck    # policy in force, elevation, state root, and which
+                        # external tools (cdb/procdump/procmon/...) resolve here
+```
+
+`selfcheck` (alias `doctor`) starts no server and touches nothing — it just
+reports what the agent would see. A `[ ]` next to a tool means it isn't on this
+box; stage it with `tools.install` (needs network) or point `HEISENBERG_TOOLS`
+at a folder of staged tools. Then register the binary with your MCP client as
+below. If the box should be anything looser than `Critical`, drop a signed
+`policy.json` first (see **Safety policy**).
+
 ## Safety policy
 
 The box's **risk class** is set by an operator-deployed policy, never by the

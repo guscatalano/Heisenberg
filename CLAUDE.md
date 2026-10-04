@@ -56,9 +56,15 @@ Useful env vars for testing:
    - record the inverse in the ledger via `ledger.begin(..., RevertPlan::...)`
      **before** applying, then `mark(Applied|Failed)`,
    - support a `dry_run` that previews `commands` + the decision,
-   - `audit.record(...)` the outcome.
+   - `audit.record(...)` the outcome,
+   - be added to the `mutating_tool_gate_set_is_locked` test (server.rs) — it
+     locks the exact set of gated tools, so a new mutation won't compile-pass
+     review until it's classified there.
 5. Long-running captures register a `jobs` entry and stop via `do_stop` (add a
    `kind` arm); expose under `heisenberg://captures`.
+6. A tool that writes a file via an external backend must treat the **produced
+   file** as the source of truth, not the process exit code (ProcDump exits
+   nonzero on success and renames the output). See `dump.capture`.
 
 ## Invariants
 

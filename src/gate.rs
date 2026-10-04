@@ -149,4 +149,36 @@ mod tests {
         let r = enforce(&p, "symbols.configure", EffectTier::StateChanging, "set-symbol-path", Some("set-symbol-path"), &appr());
         assert!(matches!(r, Err(Blocked { kind: ErrorKind::RequiresApproval, .. })));
     }
+
+    #[test]
+    fn critical_mutation_proceeds_once_after_approval() {
+        // The out-of-band broker: a granted approval lets a Critical mutation
+        // through exactly once (one-shot), then the gate bites again.
+        let p = policy(BoxClass::Critical);
+        let a = appr();
+        a.grant("symbols.configure");
+        assert!(
+            enforce(&p, "symbols.configure", EffectTier::StateChanging, "set-symbol-path", None, &a).is_ok(),
+            "granted approval should let the first call through"
+        );
+        assert!(
+            matches!(
+                enforce(&p, "symbols.configure", EffectTier::StateChanging, "set-symbol-path", None, &a),
+                Err(Blocked { kind: ErrorKind::RequiresApproval, .. })
+            ),
+            "approval is one-shot; the second call must be blocked again"
+        );
+    }
+
+    #[test]
+    fn approval_is_not_transferable_between_tools() {
+        let p = policy(BoxClass::Critical);
+        let a = appr();
+        a.grant("gflags.set");
+        // An approval for one tool must not satisfy the gate for another.
+        assert!(matches!(
+            enforce(&p, "symbols.configure", EffectTier::StateChanging, "set-symbol-path", None, &a),
+            Err(Blocked { kind: ErrorKind::RequiresApproval, .. })
+        ));
+    }
 }

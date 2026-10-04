@@ -67,6 +67,44 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&appr.list()).unwrap_or_default());
             return Ok(());
         }
+        Some("version") | Some("--version") | Some("-V") => {
+            println!("heisenberg {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("selfcheck") | Some("doctor") => {
+            // Offline health check for a freshly-dropped binary: policy in force,
+            // elevation, state root, and which external tools resolve on this box.
+            let policy = config::load_policy();
+            println!("heisenberg {}", env!("CARGO_PKG_VERSION"));
+            println!("policy class : {:?} (effective)", policy.effective_class());
+            println!("policy source: {} [{:?}]", policy.source.origin, policy.source.trust);
+            println!("elevated     : {}", env_probe::is_elevated());
+            let store = store::Store::discover();
+            println!("state root   : {}", store.ledger_path().parent().map(|p| p.display().to_string()).unwrap_or_default());
+
+            let folders: Vec<std::path::PathBuf> = std::fs::read(store.folders_path())
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok())
+                .unwrap_or_default()
+                .into_iter()
+                .map(std::path::PathBuf::from)
+                .collect();
+            let extra = std::sync::Arc::new(std::sync::Mutex::new(folders));
+            let locator = tools::Locator::discover(extra);
+            println!("\ntools:");
+            let mut found = 0usize;
+            for (key, exe) in tools::KNOWN_TOOLS {
+                match locator.find(exe) {
+                    Some(p) => {
+                        found += 1;
+                        println!("  [x] {key:<14} {}", p.display());
+                    }
+                    None => println!("  [ ] {key:<14} (not found)"),
+                }
+            }
+            println!("\n{found}/{} known tools found", tools::KNOWN_TOOLS.len());
+            return Ok(());
+        }
         _ => {}
     }
 
