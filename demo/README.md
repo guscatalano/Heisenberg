@@ -73,6 +73,40 @@ writes a `demo_done.flag` when finished so a screen recorder knows when to stop.
   `demo/demo.gif` so the image at the top of this file renders.
 - `DEMO_PAUSE=1.4` gives a natural narrated pace; bump it up for a slower read.
 
+## Driving Heisenberg from another agent (Hermes)
+
+Heisenberg is a plain stdio MCP server, so any agent that speaks MCP can drive it
+— here it's [Hermes Agent](https://github.com/NousResearch/hermes-agent) running a
+local model (`qwen3.8-flash-next`), diagnosing the same hung process and hitting
+the same safety gate.
+
+![hermes](hermes-demo.gif)
+
+Hermes picked the tools itself (dump capture → `analyze.deadlock` → `gflags.set`
+→ `changes.revert`), named the deadlocked threads from the dump, and when
+`gflags.set` returned `RequiresApproval` on the Critical box it waited for an
+out-of-band `heisenberg approve gflags.set` before retrying — exactly the broker
+flow, now driven by a third-party agent.
+
+Register Heisenberg in the agent's MCP config (Hermes' `config.yaml` shown; the
+shape is the same for any client). The `env:` block points the locator at `cdb`
+and a symbol cache so analysis works:
+
+```yaml
+mcp_servers:
+  heisenberg:
+    command: "C:/path/to/heisenberg.exe"
+    env:
+      HEISENBERG_HOME: "C:/ProgramData/Heisenberg"
+      HEISENBERG_TOOLS: "C:/path/to/Debuggers/amd64"   # folder containing cdb.exe
+      _NT_SYMBOL_PATH: "srv*C:/symcache*https://msdl.microsoft.com/download/symbols"
+    timeout: 300
+```
+
+The agent then sees every Heisenberg tool as `mcp__heisenberg__<tool>`. The box's
+risk policy still applies: a Critical box returns `RequiresApproval` for mutations
+until a human runs `heisenberg approve <tool>` — the agent can't self-approve.
+
 ## Elevated variant
 
 Run the demo from an **elevated** terminal and the gated step becomes
