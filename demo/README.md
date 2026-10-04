@@ -9,7 +9,10 @@ It shows the three things that make Heisenberg more than a tool wrapper: real
 end-to-end debugging, the risk-tiered consent model, and a reversible,
 audited change ledger.
 
-![demo](demo.gif) <!-- record the run below and drop demo.gif here -->
+![demo](demo.gif)
+
+*Recorded on a disposable Groundhog-provisioned Windows 11 box (elevated), so the
+gated step is `gflags.set` (Full Page Heap via IFEO), blocked until approval.*
 
 ## What it does
 
@@ -46,6 +49,11 @@ $env:DEMO_EXE   = "C:\path\to\heisenberg.exe"
 
 Nothing touches the real machine: state goes to a throwaway `HEISENBERG_HOME`
 under `%TEMP%`, and the one change made (step 5) is reverted in step 6.
+
+`run_demo.ps1` is the same demo as a native PowerShell driver (no Python needed),
+used to record the GIF above on a VM: it maximizes the console, auto-detects cdb
+from the Store WinDbg package if the classic Debugging Tools aren't present, and
+writes a `demo_done.flag` when finished so a screen recorder knows when to stop.
 
 ## Prerequisites
 
