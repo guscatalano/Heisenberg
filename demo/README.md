@@ -1,5 +1,13 @@
 # Heisenberg demo
 
+**New here? Watch the explained walkthrough: [`tutorial.mp4`](tutorial.mp4)** — a
+slower, narrated version with "why/what" callouts for each step. It makes the
+analysis explicit: `analyze.deadlock` opens the dump in **cdb** (the command-line
+debugger from the Debugging Tools for Windows — the same engine as the WinDbg
+GUI) and runs `!locks; !cs -l; !syncblk; ~*kb`; the video shows the exact cdb
+command line and the real cdb output (the two critical sections and their owning
+threads) that reveal the AB-BA deadlock.
+
 A single-take, ~90-second story you can screen-record: **an AI agent diagnoses a
 hung Windows process from a memory dump, then proposes a machine change that the
 box's safety policy blocks until a human approves it out of band — and that is
