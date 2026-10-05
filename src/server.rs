@@ -732,6 +732,74 @@ fn init_call_log(path: &std::path::Path) {
     }
 }
 
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// Pull the first `module!function(+0xNN)` symbol token out of a line, e.g. a cdb
+/// stack frame. Returns None when the line has no such token.
+fn symbol_token(line: &str) -> Option<String> {
+    let bytes = line.as_bytes();
+    for (i, &c) in bytes.iter().enumerate() {
+        if c != b'!' || i == 0 {
+            continue;
+        }
+        let mut a = i;
+        while a > 0 && is_ident_byte(bytes[a - 1]) {
+            a -= 1;
+        }
+        let mut b = i + 1;
+        while b < bytes.len() && (is_ident_byte(bytes[b]) || bytes[b] == b':') {
+            b += 1;
+        }
+        if b < bytes.len() && bytes[b] == b'+' {
+            let mut c2 = b + 1;
+            while c2 < bytes.len() && (bytes[c2] == b'x' || bytes[c2].is_ascii_hexdigit()) {
+                c2 += 1;
+            }
+            b = c2;
+        }
+        if a < i && b > i + 1 {
+            return Some(line[a..b].to_string());
+        }
+    }
+    None
+}
+
+/// Extract a few human-readable evidence lines from a cdb analysis dump (`data.raw`)
+/// so the call log shows *what* an analyze.* / dump.analyze call found, not just that
+/// it ran: critical-section ownership lines and the distinct lock-wait frames.
+fn analysis_detail(raw: &str) -> Vec<String> {
+    const WAIT: [&str; 7] = [
+        "WaitForSingleObject", "NtWaitFor", "WaitOnAddress", "CriticalSection",
+        "RtlpWait", "RtlEnterCritical", "WaitForMultiple",
+    ];
+    let mut out: Vec<String> = Vec::new();
+    for line in raw.lines() {
+        let s = line.trim();
+        if s.is_empty() {
+            continue;
+        }
+        if s.contains("CritSec") || s.contains("Owning thread") || s.contains("OwningThread") {
+            let t: String = s.chars().take(88).collect();
+            if !out.contains(&t) {
+                out.push(t);
+            }
+        } else if let Some(tok) = symbol_token(s) {
+            if WAIT.iter().any(|w| tok.contains(w)) {
+                let e = format!("parked in {tok}");
+                if !out.contains(&e) {
+                    out.push(e);
+                }
+            }
+        }
+        if out.len() >= 6 {
+            break;
+        }
+    }
+    out
+}
+
 fn log_call(v: &serde_json::Value) {
     let Some(cell) = CALL_LOG.get() else { return };
     let artifacts: Vec<&serde_json::Value> = v
@@ -739,6 +807,13 @@ fn log_call(v: &serde_json::Value) {
         .and_then(|a| a.as_array())
         .map(|a| a.iter().filter_map(|x| x.get("path")).collect())
         .unwrap_or_default();
+    // For analysis results, surface a few evidence lines from the raw cdb output.
+    let detail = v
+        .get("data")
+        .and_then(|d| d.get("raw"))
+        .and_then(|r| r.as_str())
+        .map(analysis_detail)
+        .filter(|d| !d.is_empty());
     let rec = json!({
         "ts": crate::store::now_rfc3339(),
         "tool": v.get("tool"),
@@ -747,6 +822,7 @@ fn log_call(v: &serde_json::Value) {
         "error": v.get("error").and_then(|e| e.get("kind")),
         "command": v.get("command"),
         "artifacts": artifacts,
+        "detail": detail,
     });
     if let Ok(mut f) = cell.lock() {
         use std::io::Write;
@@ -4971,6 +5047,35 @@ mod tests {
         let p = dir.join(name);
         fs::write(&p, vec![0u8; len]).unwrap();
         fs::File::options().write(true).open(&p).unwrap().set_modified(mtime).unwrap();
+    }
+
+    #[test]
+    fn symbol_token_parses_a_frame() {
+        assert_eq!(
+            super::symbol_token("00 000`00 007f`aa ntdll!NtWaitForSingleObject+0x14").as_deref(),
+            Some("ntdll!NtWaitForSingleObject+0x14")
+        );
+        assert_eq!(
+            super::symbol_token("KERNELBASE!WaitForSingleObjectEx+0xaf").as_deref(),
+            Some("KERNELBASE!WaitForSingleObjectEx+0xaf")
+        );
+        assert!(super::symbol_token("no symbol here, just hex 00007ff").is_none());
+    }
+
+    #[test]
+    fn analysis_detail_surfaces_lock_waits() {
+        let raw = "\
+Microsoft (R) Windows Debugger\n\
+00 000`00 007f`aa ntdll!NtWaitForSingleObject+0x14\n\
+01 000`00 007f`bb ntdll!RtlpWaitOnCriticalSection+0x58f\n\
+    Owning thread is 0n1234\n\
+unrelated frame kernel32!DoStuff+0x1\n";
+        let det = super::analysis_detail(raw);
+        assert!(det.iter().any(|d| d.contains("NtWaitForSingleObject")), "{det:?}");
+        assert!(det.iter().any(|d| d.contains("RtlpWaitOnCriticalSection")), "{det:?}");
+        assert!(det.iter().any(|d| d.contains("Owning thread")), "{det:?}");
+        // non-wait frames are not surfaced
+        assert!(!det.iter().any(|d| d.contains("DoStuff")), "{det:?}");
     }
 
     #[test]

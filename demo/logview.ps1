@@ -32,6 +32,13 @@ Get-Content -Path $Path -Wait -Encoding utf8 | ForEach-Object {
     $sum = [string]$o.summary
     if ($sum.Length -gt 56) { $sum = $sum.Substring(0, 56) + '...' }
     Write-Host ("   " + $sum) -ForegroundColor Gray
+    foreach ($line in @($o.detail)) {
+        if ($line) {
+            $l = [string]$line
+            if ($l.Length -gt 54) { $l = $l.Substring(0, 54) + '...' }
+            Write-Host ("     - " + $l) -ForegroundColor DarkCyan
+        }
+    }
     foreach ($a in @($o.artifacts)) {
         if ($a) { Write-Host ("   -> " + (Split-Path $a -Leaf)) -ForegroundColor DarkYellow }
     }
