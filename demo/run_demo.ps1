@@ -13,9 +13,12 @@ $patientExe = Join-Path $here 'patient.exe'
 $pauseSec = if ($env:DEMO_PAUSE) { [double]$env:DEMO_PAUSE } else { 0.7 }
 
 # A throwaway state root + the Microsoft symbol server so cdb resolves ntdll.
-$home2 = Join-Path $env:TEMP ("hbdemo_" + [guid]::NewGuid().ToString('N').Substring(0,8))
+# Honour a preset HEISENBERG_HOME (so a side-by-side log viewer can tail the same
+# calls.jsonl); otherwise use a fresh temp root.
+$home2 = if ($env:HEISENBERG_HOME) { $env:HEISENBERG_HOME } else { Join-Path $env:TEMP ("hbdemo_" + [guid]::NewGuid().ToString('N').Substring(0,8)) }
 New-Item -ItemType Directory -Force $home2 | Out-Null
 $env:HEISENBERG_HOME = $home2
+Remove-Item (Join-Path $home2 'calls.jsonl') -EA SilentlyContinue  # fresh tool-call log for this run
 $env:RUST_LOG = 'error'
 # Stable symbol cache so a repeated run doesn't re-download ntdll symbols.
 $symCache = if ($env:DEMO_SYMCACHE) { $env:DEMO_SYMCACHE } else { Join-Path $env:TEMP 'hb_symcache' }
