@@ -109,16 +109,29 @@ so you watch the agent drive the tools *and* see each result land: the deadlock
 dump + analysis, then `gflags.set [RequiresApproval]` → operator approves →
 `[ok]` → `changes.revert`.
 
-**Explained walkthrough:
-[`hermes-explained.mp4`](hermes-explained.mp4)** — the same Hermes run with a
-caption bar that explains each step *as Hermes performs it* (the captions are
-timed from `calls.jsonl`, so the explanation and the tool result land together).
-It makes the analysis concrete: when `analyze.deadlock` runs, the caption shows
-that it opens the dump in **cdb** and what cdb printed — both worker threads
-parked in `RtlEnterCriticalSection` / `NtWaitForSingleObject`, each waiting on
-the lock the other holds (the AB-BA deadlock). Then `gflags.set` is **blocked**
-on the Critical box, a human approves it out of band, it applies, and
-`changes.revert` leaves the machine exactly as found.
+**Explained walkthrough — why Full Page Heap matters:
+[`hermes-explained.mp4`](hermes-explained.mp4)** — a second Hermes scenario with
+a caption bar that explains each step *as Hermes performs it* (captions are timed
+from `calls.jsonl`, so the explanation and the tool result land together). Here
+`patient.exe` crashes from a **heap buffer overflow**, and the video shows the
+classic reason to reach for page heap:
+
+1. Hermes arms crash capture (`dump.onCrashInstall`), then analyzes the first
+   dump (`dump.analyze`). `!analyze -v` reports **`STATUS_HEAP_CORRUPTION`
+   (c0000374)** detected deep inside ntdll's heap manager — the heap is smashed,
+   but the stack is far from the code that did it.
+2. To catch the culprit at the moment it happens, Hermes enables **Full Page
+   Heap** (`gflags.set`) — guard pages after every allocation turn the overflow
+   into an immediate fault.
+3. Analyzing the page-heap dump now shows an **`ACCESS_VIOLATION` (c0000005) right
+   in `patient`'s own code** (`patient+0x2d90`), with Application Verifier active
+   — the exact bad write, pinpointed.
+4. `changes.revert` rolls the page-heap change back from the ledger.
+
+This run is on a **Development** box (`HEISENBERG_POLICY` class `development`), so
+the state-changing `gflags.set` just applies and is recorded in the ledger — no
+approval gate, to keep the focus on the capture → harden → re-capture → analyze
+loop.
 
 Register Heisenberg in the agent's MCP config (Hermes' `config.yaml` shown; the
 shape is the same for any client). The `env:` block points the locator at `cdb`
@@ -153,4 +166,11 @@ The driver picks this automatically when it detects it's running as admin.
 ```powershell
 patient.exe            # deadlock (default): two threads, AB-BA critical sections
 patient.exe crash      # null-pointer dereference -> access violation
+patient.exe heapbug    # heap buffer overflow: vague ntdll heap-corruption crash
+                       #   without page heap, an access violation IN patient with it
 ```
+
+`heapbug` is what the page-heap walkthrough above uses: it overflows a 32-byte
+heap block so that, without page heap, freeing a neighbouring (header-clobbered)
+block trips a heap-corruption fast-fail deep in ntdll, while under Full Page Heap
+the first out-of-bounds store faults immediately in `patient`'s own code.
