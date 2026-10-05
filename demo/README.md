@@ -116,17 +116,21 @@ from `calls.jsonl`, so the explanation and the tool result land together). Here
 `patient.exe` crashes from a **heap buffer overflow**, and the video shows the
 classic reason to reach for page heap:
 
-1. Hermes arms crash capture (`dump.onCrashInstall`), then analyzes the first
-   dump (`dump.analyze`). `!analyze -v` reports **`STATUS_HEAP_CORRUPTION`
+1. Hermes arms crash capture (`dump.onCrashInstall`), reproduces the crash itself
+   (it runs `patient.exe` in the terminal; WER captures the dump), then analyzes
+   it (`dump.analyze`). `!analyze -v` reports **`STATUS_HEAP_CORRUPTION`
    (c0000374)** detected deep inside ntdll's heap manager — the heap is smashed,
    but the stack is far from the code that did it.
 2. To catch the culprit at the moment it happens, Hermes enables **Full Page
    Heap** (`gflags.set`) — guard pages after every allocation turn the overflow
    into an immediate fault.
-3. Analyzing the page-heap dump now shows an **`ACCESS_VIOLATION` (c0000005) right
-   in `patient`'s own code** (`patient+0x2d90`), with Application Verifier active
-   — the exact bad write, pinpointed.
+3. Hermes reproduces the crash **again** with page heap on and analyzes that
+   dump: now it's an **`ACCESS_VIOLATION` (c0000005) right in `patient`'s own
+   code** (`patient+0x2d90`), with Application Verifier active — the exact bad
+   write, pinpointed.
 4. `changes.revert` rolls the page-heap change back from the ledger.
+
+(Both dumps are collected live during the run, not pre-captured.)
 
 This run is on a **Development** box (`HEISENBERG_POLICY` class `development`), so
 the state-changing `gflags.set` just applies and is recorded in the ledger — no
@@ -170,7 +174,13 @@ patient.exe heapbug    # heap buffer overflow: vague ntdll heap-corruption crash
                        #   without page heap, an access violation IN patient with it
 ```
 
-`heapbug` is what the page-heap walkthrough above uses: it overflows a 32-byte
-heap block so that, without page heap, freeing a neighbouring (header-clobbered)
-block trips a heap-corruption fast-fail deep in ntdll, while under Full Page Heap
-the first out-of-bounds store faults immediately in `patient`'s own code.
+`heapbug` is what the page-heap walkthrough above uses. It overflows a 32-byte
+heap block by a few bytes and then frees it twice. The two bugs are arranged so
+each environment hits a *deterministic* fault: under Full Page Heap the first
+out-of-bounds store faults immediately in `patient`'s own code (a clean access
+violation at the overflow); with no page heap the small overflow is silent and
+execution reaches the double free, where the NT heap trips a heap-corruption
+fast-fail deep inside ntdll — a crash whose stack is the heap manager, not the
+code at fault. (A single overflow's "corruption discovered later" is
+layout-dependent and unreliable; the double free makes the no-page-heap crash
+reproducible.)
