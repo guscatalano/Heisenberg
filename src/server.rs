@@ -868,12 +868,73 @@ fn summarize_thread(frames: &[String], user_out: &mut Vec<String>, sys_out: &mut
     }
 }
 
+/// Short name for the NTSTATUS exception codes that matter in a crash triage.
+fn exception_name(code: &str) -> Option<&'static str> {
+    match code.to_ascii_lowercase().trim_start_matches("0x") {
+        "c0000005" => Some("Access violation"),
+        "c0000374" => Some("Heap corruption"),
+        "c0000409" => Some("Stack buffer overrun / fast-fail"),
+        "c00000fd" => Some("Stack overflow"),
+        "80000003" => Some("Breakpoint"),
+        "c0000417" => Some("Invalid CRT parameter"),
+        _ => None,
+    }
+}
+
+/// Pull the crash fingerprint out of a `!analyze -v` dump: the exception kind and
+/// the faulting frame, plus whether page heap / Application Verifier was active.
+/// Empty for a non-crash (e.g. deadlock) dump that has no exception record.
+fn crash_detail(raw: &str) -> Vec<String> {
+    let mut code: Option<String> = None;
+    let mut code_desc: Option<String> = None; // the "(…)" the debugger printed
+    let mut fault_sym: Option<String> = None;
+    let mut verifier = false;
+    for line in raw.lines() {
+        let s = line.trim();
+        if let Some(rest) = s.strip_prefix("ExceptionCode:") {
+            let v = rest.trim();
+            code = v.split_whitespace().next().map(|c| c.trim_start_matches("0x").to_string());
+            if let (Some(a), Some(b)) = (v.find('('), v.find(')')) {
+                if b > a + 1 {
+                    code_desc = Some(v[a + 1..b].to_string());
+                }
+            }
+        } else if let Some(rest) = s.strip_prefix("ExceptionAddress:") {
+            // ExceptionAddress: 00007ff6.. (patient+0x..)
+            if let (Some(a), Some(b)) = (rest.find('('), rest.find(')')) {
+                if b > a + 1 {
+                    fault_sym = Some(rest[a + 1..b].trim().to_string());
+                }
+            }
+        } else if s.starts_with("APPLICATION_VERIFIER_LOADED:") && s.ends_with('1') {
+            verifier = true;
+        }
+    }
+    let Some(code) = code else {
+        return Vec::new();
+    };
+    let name = exception_name(&code)
+        .map(|n| n.to_string())
+        .or(code_desc)
+        .unwrap_or_else(|| "exception".to_string());
+    let mut out = Vec::new();
+    out.push(match &fault_sym {
+        Some(sym) => format!("{name} ({code}) at {sym}"),
+        None => format!("{name} ({code})"),
+    });
+    if verifier {
+        out.push("Full Page Heap / Application Verifier active -> fault caught at the exact bad access".to_string());
+    }
+    out
+}
+
 /// Extract a few human-readable evidence lines from a cdb analysis dump (`data.raw`)
 /// so the call log shows *what* an analyze.* / dump.analyze call found, not just that
-/// it ran: per parked thread, the stuck application frame and the lock op it waits in
-/// (application threads first), then critical-section ownership lines from
-/// `!locks` / `!cs`.
+/// it ran: for a crash, the exception and faulting frame; for a deadlock, per parked
+/// thread the stuck application frame and the lock op it waits in (application threads
+/// first), then critical-section ownership lines from `!locks` / `!cs`.
 fn analysis_detail(raw: &str) -> Vec<String> {
+    let crash = crash_detail(raw);
     let mut user_out: Vec<String> = Vec::new();
     let mut sys_out: Vec<String> = Vec::new();
     let mut locks: Vec<String> = Vec::new();
@@ -910,7 +971,8 @@ fn analysis_detail(raw: &str) -> Vec<String> {
     if in_thread {
         summarize_thread(&frames, &mut user_out, &mut sys_out);
     }
-    let mut out = user_out;
+    let mut out = crash; // crash fingerprint leads when present
+    out.extend(user_out);
     out.extend(sys_out);
     out.truncate(6);
     for l in locks {
@@ -5252,6 +5314,35 @@ RetAddr               : Args to Child                 : Call Site\n\
         let first_lock = det.iter().position(|d| d.contains("CritSec") || d.contains("OwningThread"));
         let last_user = det.iter().rposition(|d| d.starts_with("patient+"));
         assert!(matches!((first_lock, last_user), (Some(fl), Some(lu)) if lu < fl), "{det:?}");
+    }
+
+    #[test]
+    fn analysis_detail_surfaces_crash_fingerprint() {
+        // a page-heap-caught access violation (round 2 of the heap demo): the
+        // exception + faulting frame + verifier note lead the detail.
+        let av = "\
+APPLICATION_VERIFIER_LOADED: 1\n\
+ExceptionAddress: 00007ff630af2d90 (patient+0x0000000000002d90)\n\
+ExceptionCode: c0000005 (Access violation)\n\
+   .  0  Id: 11.22 Suspend: 0 Teb: 0 Unfrozen\n\
+00 00`00 00`00 patient+0x2d90\n";
+        let det = super::analysis_detail(av);
+        assert_eq!(det.first().map(String::as_str), Some("Access violation (c0000005) at patient+0x0000000000002d90"), "{det:?}");
+        assert!(det.iter().any(|d| d.contains("Page Heap") || d.contains("Application Verifier")), "{det:?}");
+
+        // heap corruption with no page heap (round 1): vague, in ntdll.
+        let hc = "\
+ExceptionAddress: 00007fffd6e72165 (ntdll!RtlpMuiRegCreateRegistryInfo+0x1b5)\n\
+ExceptionCode: c0000374\n";
+        let det2 = super::analysis_detail(hc);
+        assert_eq!(det2.first().map(String::as_str), Some("Heap corruption (c0000374) at ntdll!RtlpMuiRegCreateRegistryInfo+0x1b5"), "{det2:?}");
+
+        // a deadlock dump (no exception record) is unaffected -> no crash line.
+        let dl = "\
+   0  Id: 1.2 Suspend: 0 Teb: 0\n\
+00 00`00 00`00 ntdll!NtWaitForSingleObject+0x14\n\
+01 00`00 00`00 patient+0x1b53 ntdll!RtlEnterCriticalSection+0xf2\n";
+        assert!(!super::analysis_detail(dl).iter().any(|d| d.contains("c0000")), "deadlock dump must not report an exception");
     }
 
     #[test]

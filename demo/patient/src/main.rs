@@ -7,6 +7,19 @@
 //!             ntdll!RtlpWaitOnCriticalSection — exactly what analyze.deadlock
 //!             looks for.
 //!   crash     dereference a null pointer -> access violation (for the crash arc).
+//!   heapbug [delay_ms]
+//!             overflow a 32-byte heap buffer by writing well past its end. The
+//!             contrast is the whole point of the page-heap demo:
+//!               * WITHOUT page heap: the overflow lands in adjacent committed
+//!                 heap, silently smashing neighbouring block headers; nothing
+//!                 faults until the block is freed, where the heap manager trips
+//!                 a STATUS_HEAP_CORRUPTION fast-fail deep in ntdll -- a crash
+//!                 whose stack is far from the actual bug.
+//!               * WITH Full Page Heap: a no-access guard page sits immediately
+//!                 after the allocation, so the very first out-of-bounds store
+//!                 faults on the spot, in patient's own code -- the dump points
+//!                 straight at the overflow. `delay_ms` (default 6000) leaves
+//!                 time to arm a crash trigger before the fault.
 //!
 //! Zero dependencies: links the two CRITICAL_SECTION calls from kernel32 directly.
 
@@ -52,6 +65,36 @@ fn main() {
             // Deliberate access violation.
             let p: *mut u32 = std::ptr::null_mut();
             unsafe { p.write_volatile(0xdead) };
+        }
+        "heapbug" => {
+            use std::alloc::{alloc, dealloc, Layout};
+            let delay_ms: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(6000);
+            println!("patient pid {pid}: heap buffer overflow in {delay_ms}ms...");
+            thread::sleep(Duration::from_millis(delay_ms));
+            // Two 32-byte blocks on the process heap (Rust's System allocator ->
+            // HeapAlloc, which Full Page Heap guards). Fresh same-size allocations
+            // land next to each other, so overflowing `a` clobbers `b`'s header.
+            let layout = Layout::from_size_align(32, 16).unwrap();
+            unsafe {
+                let a = alloc(layout);
+                let b = alloc(layout);
+                assert!(!a.is_null() && !b.is_null());
+                // Write 512 bytes into the 32-byte buffer `a`. write_volatile keeps
+                // the compiler from eliding the out-of-bounds stores.
+                //  - Full Page Heap: the store just past offset ~32 hits a's guard
+                //    page and faults HERE, in patient's own code (an access violation).
+                //  - No page heap: these stores land in committed heap and smash b's
+                //    block header without faulting...
+                for i in 0..512usize {
+                    std::ptr::write_volatile(a.add(i), 0x41u8);
+                }
+                // ...and the damage only surfaces now: freeing b validates its
+                // (clobbered) header and trips a deterministic heap-corruption
+                // fast-fail deep inside ntdll -- far from the real bug.
+                dealloc(b, layout);
+                dealloc(a, layout);
+            }
+            println!("patient pid {pid}: (never reached)");
         }
         _ => {
             let lock_a = Lock::new();
