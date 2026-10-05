@@ -820,7 +820,7 @@ fn log_call(v: &serde_json::Value) {
         "ok": v.get("ok"),
         "summary": v.get("summary"),
         "error": v.get("error").and_then(|e| e.get("kind")),
-        "command": v.get("command"),
+        "command": v.get("commands").and_then(|c| c.as_array()).and_then(|a| a.first()),
         "artifacts": artifacts,
         "detail": detail,
     });
