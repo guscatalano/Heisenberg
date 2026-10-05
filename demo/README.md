@@ -94,6 +94,13 @@ Hermes picked the tools itself (dump capture → `analyze.deadlock` → `gflags.
 out-of-band `heisenberg approve gflags.set` before retrying — exactly the broker
 flow, now driven by a third-party agent.
 
+**Video with the live tool-call log:
+[`hermes-live.mp4`](hermes-live.mp4)** — the Hermes TUI on the left (its own
+reasoning and tool calls) and Heisenberg's `calls.jsonl` tailing on the right,
+so you watch the agent drive the tools *and* see each result land: the deadlock
+dump + analysis, then `gflags.set [RequiresApproval]` → operator approves →
+`[ok]` → `changes.revert`.
+
 Register Heisenberg in the agent's MCP config (Hermes' `config.yaml` shown; the
 shape is the same for any client). The `env:` block points the locator at `cdb`
 and a symbol cache so analysis works:
