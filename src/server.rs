@@ -796,15 +796,12 @@ fn is_system_module(tok: &str) -> bool {
     SYS.iter().any(|s| m == *s)
 }
 
-/// If `line` begins a cdb `~*kb` stack frame, its hex frame index (`00`, `01`, …).
-/// Frame `00` marks the top of a new thread's stack.
-fn stack_frame_index(line: &str) -> Option<u32> {
-    let first = line.split_whitespace().next()?;
-    if (1..=2).contains(&first.len()) && first.bytes().all(|b| b.is_ascii_hexdigit()) {
-        u32::from_str_radix(first, 16).ok()
-    } else {
-        None
-    }
+/// A cdb `~*kb` thread header, e.g. `.  0  Id: 1688.2bcc Suspend: 0 Teb: ... "main"`.
+/// It marks the start of a new thread's stack, independent of the frame format
+/// (cdb prints either indexed `00 <sp> <ret> sym` frames or `<ret> : args : sym`
+/// frames, but always one of these headers before each thread).
+fn is_thread_header(line: &str) -> bool {
+    line.contains("Id:") && line.contains("Suspend:")
 }
 
 /// A cdb stack-frame reference: a resolved `module!symbol+0x..` token, or an
@@ -838,14 +835,15 @@ fn frame_ref(line: &str) -> Option<String> {
 
 /// Collapse one thread's frames (top first) into a single evidence line pointing
 /// at the application frame that is stuck and the lock op it is blocked in, e.g.
-/// `patient+0x1740  ->  ntdll!RtlEnterCriticalSection+0xf2`. Only parked threads
-/// (ones actually in a wait) produce a line; falls back to the top wait frame
-/// when the whole stack is system code.
-fn summarize_thread(frames: &[String], out: &mut Vec<String>) {
+/// `patient+0x1740  ->  ntdll!RtlEnterCriticalSection+0xf2`. Threads with an
+/// application frame go to `user_out` (the signal); threads that are entirely
+/// system code (thread-pool waiters, etc.) fall back to `parked in <top wait>`
+/// in `sys_out`. Only parked threads (ones actually in a wait) produce a line.
+fn summarize_thread(frames: &[String], user_out: &mut Vec<String>, sys_out: &mut Vec<String>) {
     if !frames.iter().any(|f| is_wait_frame(f)) {
         return;
     }
-    let line = match frames.iter().position(|f| !is_system_module(f)) {
+    match frames.iter().position(|f| !is_system_module(f)) {
         Some(u) => {
             // the wait frame closest above the application frame names the op
             let op = frames[..u]
@@ -853,29 +851,45 @@ fn summarize_thread(frames: &[String], out: &mut Vec<String>) {
                 .rev()
                 .find(|f| is_wait_frame(f))
                 .or_else(|| frames.iter().find(|f| is_wait_frame(f)));
-            match op {
+            let line = match op {
                 Some(op) => format!("{}  ->  {op}", frames[u]),
                 None => format!("stuck in {}", frames[u]),
+            };
+            if !user_out.contains(&line) {
+                user_out.push(line);
             }
         }
-        None => format!("parked in {}", frames.iter().find(|f| is_wait_frame(f)).unwrap()),
-    };
-    if !out.contains(&line) {
-        out.push(line);
+        None => {
+            let line = format!("parked in {}", frames.iter().find(|f| is_wait_frame(f)).unwrap());
+            if !sys_out.contains(&line) {
+                sys_out.push(line);
+            }
+        }
     }
 }
 
 /// Extract a few human-readable evidence lines from a cdb analysis dump (`data.raw`)
 /// so the call log shows *what* an analyze.* / dump.analyze call found, not just that
-/// it ran: per parked thread, the stuck application frame and the lock op it waits in,
-/// then critical-section ownership lines from `!locks` / `!cs`.
+/// it ran: per parked thread, the stuck application frame and the lock op it waits in
+/// (application threads first), then critical-section ownership lines from
+/// `!locks` / `!cs`.
 fn analysis_detail(raw: &str) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
+    let mut user_out: Vec<String> = Vec::new();
+    let mut sys_out: Vec<String> = Vec::new();
     let mut locks: Vec<String> = Vec::new();
     let mut frames: Vec<String> = Vec::new();
+    let mut in_thread = false;
     for line in raw.lines() {
         let s = line.trim();
         if s.is_empty() {
+            continue;
+        }
+        if is_thread_header(s) {
+            if in_thread {
+                summarize_thread(&frames, &mut user_out, &mut sys_out);
+            }
+            frames.clear();
+            in_thread = true;
             continue;
         }
         if s.contains("CritSec") || s.contains("Owning thread") || s.contains("OwningThread") {
@@ -885,15 +899,19 @@ fn analysis_detail(raw: &str) -> Vec<String> {
             }
             continue;
         }
-        if let (Some(idx), Some(tok)) = (stack_frame_index(s), frame_ref(s)) {
-            if idx == 0 && !frames.is_empty() {
-                summarize_thread(&frames, &mut out);
-                frames.clear();
+        // within a thread, the frame's symbol is the token on the line (cdb prints
+        // it last in both the indexed and the RetAddr/Call-Site stack formats)
+        if in_thread {
+            if let Some(tok) = frame_ref(s) {
+                frames.push(tok);
             }
-            frames.push(tok);
         }
     }
-    summarize_thread(&frames, &mut out);
+    if in_thread {
+        summarize_thread(&frames, &mut user_out, &mut sys_out);
+    }
+    let mut out = user_out;
+    out.extend(sys_out);
     out.truncate(6);
     for l in locks {
         if out.len() >= 8 {
@@ -5198,10 +5216,42 @@ Microsoft (R) Windows Debugger\n\
     #[test]
     fn analysis_detail_falls_back_when_stack_is_all_system() {
         let raw = "\
+   0  Id: 1abc.2001 Suspend: 0 Teb: 00000000`0 Unfrozen\n\
 00 000`00 007f`aa ntdll!NtWaitForSingleObject+0x14\n\
 01 000`00 007f`bb KERNELBASE!WaitForSingleObjectEx+0xaf\n";
         let det = super::analysis_detail(raw);
         assert!(det.iter().any(|d| d.starts_with("parked in") && d.contains("NtWaitForSingleObject")), "{det:?}");
+    }
+
+    #[test]
+    fn analysis_detail_reads_retaddr_callsite_format() {
+        // cdb's other ~*kb layout: no leading frame index, the Call Site symbol is
+        // the LAST token, threads delimited by a `. N Id: ... Suspend: ... Teb:` header.
+        // patient has no private symbols, so its frames show as `patient+0x..`.
+        let raw = "\
+Loading Dump File\n\
+.  0  Id: 1688.2bcc Suspend: 0 Teb: 00000004`ad7d2000 Unfrozen \"main\"\n\
+RetAddr               : Args to Child                 : Call Site\n\
+00007fff`a7d4c11f     : 0000004a`ad59f840 00007ff6 : ntdll!NtWaitForSingleObject+0x14\n\
+00007ff6`bd3e64b1     : 00000000`00200000 00007ff6 : KERNELBASE!WaitForSingleObjectEx+0xaf\n\
+00007ff6`bd3e3748     : 00000000`00000006 0000004a : patient+0x64b1\n\
+.  3  Id: 1688.1aa4 Suspend: 0 Teb: 00000004`ad7d8000 Unfrozen \"worker\"\n\
+RetAddr               : Args to Child                 : Call Site\n\
+00007fff`a7d1aaaa     : 0000020a`efe1d1d0 00000000 : ntdll!NtWaitForAlertByThreadId+0x14\n\
+00007fff`a7d2bbbb     : 00000000`00000000 00000000 : ntdll!RtlpWaitOnAddressWithTimeout+0x7f\n\
+00007fff`a7d3cccc     : 0000020a`efe1d1d0 00000000 : ntdll!RtlEnterCriticalSection+0x14a\n\
+00007ff6`bd3e9999     : 0000020a`efe1d1d0 00000000 : patient+0x7320\n\
+    CritSec +efe1d1d0 at 0000020aefe1d1d0\n\
+    OwningThread 2858\n";
+        let det = super::analysis_detail(raw);
+        // the worker thread points at its patient frame and the critical-section op
+        assert!(det.iter().any(|d| d.contains("patient+0x7320") && d.contains("RtlEnterCriticalSection")), "{det:?}");
+        // the main thread points at its patient frame and the WaitForSingleObject op
+        assert!(det.iter().any(|d| d.contains("patient+0x64b1") && d.contains("WaitForSingleObject")), "{det:?}");
+        // application-frame lines come before the lock-ownership lines
+        let first_lock = det.iter().position(|d| d.contains("CritSec") || d.contains("OwningThread"));
+        let last_user = det.iter().rposition(|d| d.starts_with("patient+"));
+        assert!(matches!((first_lock, last_user), (Some(fl), Some(lu)) if lu < fl), "{det:?}");
     }
 
     #[test]
