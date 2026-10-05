@@ -14,6 +14,12 @@ audited change ledger.
 *Recorded on a disposable Groundhog-provisioned Windows 11 box (elevated), so the
 gated step is `gflags.set` (Full Page Heap via IFEO), blocked until approval.*
 
+**Higher-quality video with a live log viewer:
+[`demo-live.mp4`](demo-live.mp4)** — the same run with a second pane tailing
+Heisenberg's `calls.jsonl` (`logview.ps1`), so you watch each tool-call result
+(`env.check`, `dump.capture`, `analyze.deadlock`, `gflags.set [RequiresApproval]`
+→ `[ok]`, `changes.revert`) stream in live beside the narration.
+
 ## What it does
 
 `run_demo.py` is a narrated driver. Every `agent ▸` line is a real Heisenberg
