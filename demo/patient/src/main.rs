@@ -71,28 +71,27 @@ fn main() {
             let delay_ms: u64 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(6000);
             println!("patient pid {pid}: heap buffer overflow in {delay_ms}ms...");
             thread::sleep(Duration::from_millis(delay_ms));
-            // Two 32-byte blocks on the process heap (Rust's System allocator ->
-            // HeapAlloc, which Full Page Heap guards). Fresh same-size allocations
-            // land next to each other, so overflowing `a` clobbers `b`'s header.
+            // A 32-byte heap block (Rust's System allocator -> HeapAlloc, which Full
+            // Page Heap guards). The two bugs are arranged so each environment hits a
+            // *deterministic* fault that tells the demo's story:
+            //   * Full Page Heap: a guard page sits right after the block, so the
+            //     first out-of-bounds store below faults IMMEDIATELY, in patient's
+            //     own code (a clean access violation at the overflow).
+            //   * No page heap: the small overflow lands in committed heap and does
+            //     NOT fault, so execution reaches the double free, where the NT heap
+            //     deterministically trips a STATUS_HEAP_CORRUPTION fast-fail deep
+            //     inside ntdll -- a crash whose stack is the heap manager, not the
+            //     code at fault.
             let layout = Layout::from_size_align(32, 16).unwrap();
             unsafe {
-                let a = alloc(layout);
-                let b = alloc(layout);
-                assert!(!a.is_null() && !b.is_null());
-                // Write 512 bytes into the 32-byte buffer `a`. write_volatile keeps
-                // the compiler from eliding the out-of-bounds stores.
-                //  - Full Page Heap: the store just past offset ~32 hits a's guard
-                //    page and faults HERE, in patient's own code (an access violation).
-                //  - No page heap: these stores land in committed heap and smash b's
-                //    block header without faulting...
-                for i in 0..512usize {
-                    std::ptr::write_volatile(a.add(i), 0x41u8);
+                let p = alloc(layout);
+                assert!(!p.is_null());
+                // overflow by 64 bytes; write_volatile keeps the stores from being elided
+                for i in 0..64usize {
+                    std::ptr::write_volatile(p.add(i), 0x41u8); // PAGE HEAP faults here
                 }
-                // ...and the damage only surfaces now: freeing b validates its
-                // (clobbered) header and trips a deterministic heap-corruption
-                // fast-fail deep inside ntdll -- far from the real bug.
-                dealloc(b, layout);
-                dealloc(a, layout);
+                dealloc(p, layout);
+                dealloc(p, layout); // NO page heap trips STATUS_HEAP_CORRUPTION here
             }
             println!("patient pid {pid}: (never reached)");
         }
