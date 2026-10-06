@@ -172,6 +172,8 @@ patient.exe            # deadlock (default): two threads, AB-BA critical section
 patient.exe crash      # null-pointer dereference -> access violation
 patient.exe heapbug    # heap buffer overflow: vague ntdll heap-corruption crash
                        #   without page heap, an access violation IN patient with it
+patient.exe deadheap   # hangs (AB-BA deadlock) AND overflows its heap, then parks
+                       #   live-capturable while hung; page heap faults at the overflow
 ```
 
 `heapbug` is what the page-heap walkthrough above uses. It overflows a 32-byte
@@ -184,3 +186,24 @@ fast-fail deep inside ntdll — a crash whose stack is the heap manager, not the
 code at fault. (A single overflow's "corruption discovered later" is
 layout-dependent and unreliable; the double free makes the no-page-heap crash
 reproducible.)
+
+`deadheap` is what the **autonomous live-capture** run uses: the two workers
+deadlock AB-BA so the process *hangs and stays alive*, then the main thread
+overflows a 32-byte block and parks. With no page heap the overflow is silent, so
+the process just hangs — a live dump (captured straight off the running pid) shows
+the deadlock cleanly, but the heap damage has no visible culprit. With Full Page
+Heap on, the overflow faults immediately in `patient`'s own code, so a relaunch
+under page heap pins the bug to the exact instruction.
+
+## Autonomous live-capture run
+
+**[`hermes-autonomous.mp4`](hermes-autonomous.mp4)** — Hermes is given *no* dump
+and *no* tool steps: just "patient.exe is running and hung — capture the live
+process and pinpoint the bug." On its own it finds the hung pid
+(`inspect.processTree`), captures it live (`dump.capture` — nothing is handed to
+it), analyses the **AB-BA deadlock**, then realises the heap is corrupted and it
+needs to catch the bad write: it enables **Full Page Heap** (`gflags.set`), arms a
+crash dump (`dump.onCrashInstall`), relaunches `patient.exe deadheap`, and
+re-analyses the resulting crash — an **access violation in `patient`'s own code**,
+the overflow pinpointed — then reverts both changes from the ledger. The caption
+bar explains each step, timed from `calls.jsonl`; it plays at natural (1x) speed.

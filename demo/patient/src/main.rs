@@ -20,6 +20,18 @@
 //!                 faults on the spot, in patient's own code -- the dump points
 //!                 straight at the overflow. `delay_ms` (default 6000) leaves
 //!                 time to arm a crash trigger before the fault.
+//!   deadheap  the "live capture, then harden" demo: two worker threads deadlock
+//!             AB-BA (so the process HANGS and is alive to be captured), and the
+//!             main thread then overflows a 32-byte heap buffer and parks.
+//!               * WITHOUT page heap: the overflow is silent, so the process just
+//!                 hangs -- a live dump shows the AB-BA deadlock cleanly, but the
+//!                 heap damage has no visible culprit (the store already ran).
+//!               * WITH Full Page Heap: the overflow faults IMMEDIATELY at the
+//!                 out-of-bounds store, in patient's own code (a clean access
+//!                 violation at the overflow) -- so after enabling page heap and
+//!                 relaunching, the dump points straight at the faulty code. The
+//!                 overflow runs only after the workers have deadlocked, so with
+//!                 no page heap the process reliably reaches the hang.
 //!
 //! Zero dependencies: links the two CRITICAL_SECTION calls from kernel32 directly.
 
@@ -94,6 +106,52 @@ fn main() {
                 dealloc(p, layout); // NO page heap trips STATUS_HEAP_CORRUPTION here
             }
             println!("patient pid {pid}: (never reached)");
+        }
+        "deadheap" => {
+            use std::alloc::{alloc, Layout};
+            let lock_a = Lock::new();
+            let lock_b = Lock::new();
+            println!("patient pid {pid}: deadheap -- two worker threads, locks A and B");
+
+            // Worker 1: holds A, then wants B.
+            thread::Builder::new()
+                .name("worker-holds-A-wants-B".into())
+                .spawn(move || {
+                    lock_a.enter();
+                    thread::sleep(Duration::from_millis(400));
+                    lock_b.enter(); // blocks forever: worker 2 holds B
+                })
+                .unwrap();
+            // Worker 2: holds B, then wants A.
+            thread::Builder::new()
+                .name("worker-holds-B-wants-A".into())
+                .spawn(move || {
+                    lock_b.enter();
+                    thread::sleep(Duration::from_millis(400));
+                    lock_a.enter(); // blocks forever: worker 1 holds A
+                })
+                .unwrap();
+
+            // Let the two workers reach the AB-BA deadlock before we touch the heap,
+            // so with no page heap the overflow is silent and the process reliably
+            // hangs (alive, capturable). With Full Page Heap the store below faults
+            // immediately in patient's own code.
+            thread::sleep(Duration::from_millis(900));
+            println!("patient pid {pid}: DEADLOCKED (AB-BA); overflowing heap buffer...");
+            let layout = Layout::from_size_align(32, 16).unwrap();
+            unsafe {
+                let p = alloc(layout);
+                assert!(!p.is_null());
+                for i in 0..64usize {
+                    std::ptr::write_volatile(p.add(i), 0x41u8); // PAGE HEAP faults here
+                }
+                // No free: with no page heap the damage is silent, so the process
+                // stays hung (below) instead of crashing. Deliberately leaked.
+            }
+            println!("patient pid {pid}: heap overflowed; hanging. Capture me.");
+            loop {
+                thread::sleep(Duration::from_secs(3600));
+            }
         }
         _ => {
             let lock_a = Lock::new();
