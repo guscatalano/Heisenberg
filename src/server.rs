@@ -194,6 +194,22 @@ pub struct DumpCaptureArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DumpDiagnoseArgs {
+    /// Target process id (preferred — unambiguous). Captured automatically.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Target process name, e.g. "patient.exe". Captured automatically; rejected if it matches many.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Diagnose an existing dump instead of capturing one (id from dump.capture, or a file path).
+    #[serde(default)]
+    pub dump: Option<String>,
+    /// When capturing, take a full dump (default) vs a minidump.
+    #[serde(default = "default_true")]
+    pub full: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DumpAnalyzeArgs {
     /// A dump id from dump.capture (or heisenberg://dumps/<id>), or a file path.
     pub dump: String,
@@ -984,6 +1000,115 @@ fn analysis_detail(raw: &str) -> Vec<String> {
     out
 }
 
+/// A captured dump: the on-disk path, registry id, size, backend and any
+/// warnings. Produced by `capture_pid`, consumed by dump.capture and dump.diagnose.
+struct Captured {
+    path: String,
+    dump_id: String,
+    bytes: u64,
+    kind: &'static str,
+    backend: &'static str,
+    cmd_str: String,
+    sensitivity: String,
+    warnings: Vec<String>,
+}
+
+/// A one-shot diagnosis of a hung/broken process: the primary condition, a plain
+/// verdict, the supporting evidence lines, and (when known) a suggested fix.
+struct Diagnosis {
+    condition: &'static str,
+    summary: String,
+    evidence: Vec<String>,
+    fix: Option<String>,
+}
+
+/// Count distinct threads blocked *entering* a critical section — the signature of
+/// a lock-ordering deadlock. Walks the `~*kb` stacks (one `Id:/Suspend:` header per
+/// thread) and counts a thread once if any of its frames is a critical-section wait.
+fn count_cs_waiters(raw: &str) -> usize {
+    const CS_WAIT: [&str; 3] = [
+        "RtlpWaitOnCriticalSection",
+        "RtlEnterCriticalSection",
+        "RtlpEnterCriticalSectionContended",
+    ];
+    let mut count = 0usize;
+    let mut in_thread = false;
+    let mut hit = false;
+    for line in raw.lines() {
+        let s = line.trim();
+        if is_thread_header(s) {
+            if in_thread && hit {
+                count += 1;
+            }
+            in_thread = true;
+            hit = false;
+            continue;
+        }
+        if in_thread && CS_WAIT.iter().any(|w| s.contains(w)) {
+            hit = true;
+        }
+    }
+    if in_thread && hit {
+        count += 1;
+    }
+    count
+}
+
+/// Classify a combined cdb analysis (`!analyze -v; !locks; !cs -l; !syncblk; ~*kb; ...`)
+/// into one primary condition. A real exception wins (a crash); otherwise two or
+/// more threads blocked acquiring a critical section is a lock deadlock; otherwise
+/// the process is parked/waiting with no cycle.
+///
+/// A dump taken of a *live* (hung) process carries a synthetic `80000003`
+/// breakpoint from the capture itself — that is not a crash, so it is ignored.
+fn classify_diagnosis(raw: &str) -> Diagnosis {
+    let crash = crash_detail(raw);
+    let real_crash = crash
+        .first()
+        .map(|h| !h.contains("(80000003)"))
+        .unwrap_or(false);
+    let mut evidence = analysis_detail(raw);
+    if !real_crash {
+        // drop the synthetic breakpoint line a live capture leaves in !analyze
+        evidence.retain(|l| !l.contains("(80000003)"));
+    }
+    if real_crash {
+        let head = crash[0].clone();
+        let fix = if head.contains("Heap corruption") {
+            Some("The heap is already corrupt here, so the stack is the allocator, not the code at fault. Enable Full Page Heap (gflags.set) and reproduce so the bad write faults at the exact instruction.".to_string())
+        } else if head.contains("Access violation") {
+            Some("Inspect the faulting instruction and its operands; trace the bad pointer back to where it was set.".to_string())
+        } else if head.contains("Stack overflow") {
+            Some("Look for unbounded recursion or a very large stack allocation on the faulting thread.".to_string())
+        } else {
+            None
+        };
+        return Diagnosis {
+            condition: "crash",
+            summary: format!("Crash - {head}"),
+            evidence,
+            fix,
+        };
+    }
+    let waiters = count_cs_waiters(raw);
+    if waiters >= 2 {
+        return Diagnosis {
+            condition: "deadlock",
+            summary: format!(
+                "Deadlock - {waiters} threads are blocked acquiring locks (each holds a lock another needs: a classic AB-BA lock-order inversion)."
+            ),
+            evidence,
+            fix: Some("Acquire the locks in one global order on every path (or take them together with std::scoped_lock / std::lock); that makes the AB-BA cycle impossible.".to_string()),
+        };
+    }
+    Diagnosis {
+        condition: "waiting",
+        summary: "Waiting - threads are parked in waits, but no lock cycle or crash was found. The process is likely blocked on I/O, an event, or external input rather than deadlocked.".to_string(),
+        evidence,
+        fix: None,
+    }
+}
+
 fn log_call(v: &serde_json::Value) {
     let Some(cell) = CALL_LOG.get() else { return };
     let artifacts: Vec<&serde_json::Value> = v
@@ -1613,28 +1738,26 @@ impl Heisenberg {
         }
     }
 
-    #[tool(
-        name = "dump.capture",
-        description = "Capture a user-mode process dump (full by default, or mini) by pid or name. Auto-selects ProcDump if staged, else comsvcs MiniDump. Read-only; disk pre-checked. Full dumps are marked high-sensitivity."
-    )]
-    async fn dump_capture(
+    /// Resolve a pid/name to a pid, mapping proc errors into the tool envelope.
+    /// Shared by dump.capture and dump.diagnose.
+    fn resolve_pid(
         &self,
-        Parameters(a): Parameters<DumpCaptureArgs>,
-    ) -> Result<CallToolResult, McpError> {
-        let tool = "dump.capture";
-        let docs = "https://learn.microsoft.com/sysinternals/downloads/procdump";
-
-        let pid = match proc::resolve(a.pid, a.name.as_deref()) {
-            Ok(p) => p,
+        tool: &str,
+        pid: Option<u32>,
+        name: Option<&str>,
+        docs: &str,
+    ) -> Result<u32, CallToolResult> {
+        match proc::resolve(pid, name) {
+            Ok(p) => Ok(p),
             Err(proc::TargetError::NotFound(m)) => {
                 self.state.audit.record(tool, &format!("target not found: {m}"), None, "error", None);
-                return Ok(text(error(
+                Err(text(error(
                     tool,
                     ErrorKind::TargetNotFound,
                     format!("no process matched {m}"),
                     "pass a valid pid or an exact process name",
                     Some(docs),
-                )));
+                )))
             }
             Err(proc::TargetError::Ambiguous { name, pids }) => {
                 self.state.audit.record(tool, &format!("ambiguous target {name}"), None, "error", None);
@@ -1646,21 +1769,33 @@ impl Heisenberg {
                     Some(docs),
                 );
                 v["error"]["candidates"] = json!(pids);
-                return Ok(text(v));
+                Err(text(v))
             }
-        };
+        }
+    }
 
+    /// Capture a dump of `pid` (full/mini) to the artifacts dir, register it, and
+    /// return the result. Shared by dump.capture and dump.diagnose. Errors come
+    /// back as a ready-to-return tool envelope. The dump file on disk is the
+    /// source of truth, not the backend exit code.
+    async fn capture_pid(
+        &self,
+        tool: &str,
+        pid: u32,
+        full: bool,
+        docs: &str,
+    ) -> Result<Captured, CallToolResult> {
         // Disk pre-check: estimate from the target's working set.
         let dir = self.state.store.artifacts_dir();
         let est = proc::working_set(pid).unwrap_or(64 * 1024 * 1024);
-        let need = if a.full {
+        let need = if full {
             est + est / 2 + 16 * 1024 * 1024
         } else {
             32 * 1024 * 1024
         };
         if let Some(free) = proc::free_bytes(&dir) {
             if free < need {
-                return Ok(text(error(
+                return Err(text(error(
                     tool,
                     ErrorKind::InsufficientDiskSpace,
                     format!("need ~{} MB, only {} MB free", need / 1048576, free / 1048576),
@@ -1670,20 +1805,20 @@ impl Heisenberg {
             }
         }
 
-        let kind = if a.full { "full" } else { "mini" };
+        let kind = if full { "full" } else { "mini" };
         let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
         let outpath = dir.join(format!("pid{pid}_{ts}.dmp"));
 
         let mut warnings: Vec<String> = Vec::new();
         let (backend, cmd_str, mut cmd) = if let Some(pd) = self.state.locator.find("procdump.exe") {
-            let mode = if a.full { "-ma" } else { "-mp" };
+            let mode = if full { "-ma" } else { "-mp" };
             let s = format!("{} -accepteula {} {} \"{}\"", pd.display(), mode, pid, outpath.display());
             let mut c = Command::new(&pd);
             c.args(["-accepteula", mode]).arg(pid.to_string()).arg(&outpath);
             ("procdump", s, c)
         } else {
             let comsvcs = comsvcs_path();
-            if !a.full {
+            if !full {
                 warnings.push("comsvcs MiniDump writes a full dump; 'mini' was upgraded to full".to_string());
             }
             let s = format!("rundll32.exe {},MiniDump {} \"{}\" full", comsvcs.display(), pid, outpath.display());
@@ -1701,7 +1836,7 @@ impl Heisenberg {
         let output = match tokio::time::timeout(Duration::from_secs(180), cmd.output()).await {
             Err(_) => {
                 self.state.audit.record(tool, "capture timed out", None, "timeout", None);
-                return Ok(text(error(
+                return Err(text(error(
                     tool,
                     ErrorKind::Timeout,
                     "dump capture timed out after 180s",
@@ -1710,7 +1845,7 @@ impl Heisenberg {
                 )));
             }
             Ok(Err(e)) => {
-                return Ok(text(error(
+                return Err(text(error(
                     tool,
                     ErrorKind::Internal,
                     format!("failed to launch {backend}: {e}"),
@@ -1721,12 +1856,8 @@ impl Heisenberg {
             Ok(Ok(o)) => o,
         };
 
-        // The dump file on disk is the source of truth, not the exit code:
-        // ProcDump returns nonzero in cases where the dump was still written and
-        // rewrites the filename we pass (its own PID/timestamp convention), and
-        // rundll32 (comsvcs) exit codes are meaningless. Prefer the exact path we
-        // asked for; otherwise adopt the newest non-empty .dmp the backend wrote
-        // during this call. Only error when no usable dump landed.
+        // Prefer the exact path we asked for; otherwise adopt the newest non-empty
+        // .dmp the backend wrote during this call. Only error when none landed.
         let outpath = if outpath.is_file() {
             outpath
         } else {
@@ -1753,7 +1884,7 @@ impl Heisenberg {
             let mut v = error(tool, kinderr, format!("{backend} failed to capture pid {pid}"), remedy, Some(docs));
             v["error"]["output"] = json!(combined.trim());
             v["error"]["exitCode"] = json!(output.status.code());
-            return Ok(text(v));
+            return Err(text(v));
         }
         if !output.status.success() {
             warnings.push(format!(
@@ -1783,34 +1914,67 @@ impl Heisenberg {
             "captured",
             Some(&rec.id),
         );
+        Ok(Captured {
+            path: outpath.display().to_string(),
+            dump_id: rec.id,
+            bytes,
+            kind,
+            backend,
+            cmd_str,
+            sensitivity: rec.sensitivity,
+            warnings,
+        })
+    }
+
+    #[tool(
+        name = "dump.capture",
+        description = "Capture a user-mode process dump (full by default, or mini) by pid or name. Auto-selects ProcDump if staged, else comsvcs MiniDump. Read-only; disk pre-checked. Full dumps are marked high-sensitivity."
+    )]
+    async fn dump_capture(
+        &self,
+        Parameters(a): Parameters<DumpCaptureArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.capture";
+        let docs = "https://learn.microsoft.com/sysinternals/downloads/procdump";
+
+        let pid = match self.resolve_pid(tool, a.pid, a.name.as_deref(), docs) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
+        let cap = match self.capture_pid(tool, pid, a.full, docs).await {
+            Ok(c) => c,
+            Err(e) => return Ok(e),
+        };
 
         let mut out = Outcome::new(
             tool,
             format!(
-                "captured {kind} dump of pid {pid} via {backend} ({:.1} MB)",
-                bytes as f64 / 1048576.0
+                "captured {} dump of pid {pid} via {} ({:.1} MB)",
+                cap.kind,
+                cap.backend,
+                cap.bytes as f64 / 1048576.0
             ),
         )
         .data(json!({
-            "pid": pid, "kind": kind, "backend": backend,
-            "bytes": bytes, "path": outpath.display().to_string(), "dumpId": rec.id
+            "pid": pid, "kind": cap.kind, "backend": cap.backend,
+            "bytes": cap.bytes, "path": cap.path, "dumpId": cap.dump_id
         }))
         .artifact(Artifact {
             kind: "dump".to_string(),
-            path: outpath.display().to_string(),
-            bytes,
-            resource: format!("heisenberg://dumps/{}", rec.id),
-            sensitivity: Some(rec.sensitivity.clone()),
+            path: cap.path.clone(),
+            bytes: cap.bytes,
+            resource: format!("heisenberg://dumps/{}", cap.dump_id),
+            sensitivity: Some(cap.sensitivity.clone()),
         })
-        .command(cmd_str)
+        .command(cap.cmd_str.clone())
         .docs(docs);
-        if rec.sensitivity == "high" {
+        if cap.sensitivity == "high" {
             out = out.warn(
                 "full dump may contain passwords/keys/PII; treat as high-sensitivity and do not transfer off-box unreviewed",
             );
         }
-        for w in warnings {
-            out = out.warn(w);
+        for w in &cap.warnings {
+            out = out.warn(w.clone());
         }
         Ok(text(out.to_value()))
     }
@@ -1910,6 +2074,80 @@ impl Heisenberg {
             out = out.warn("some symbols could not be loaded; stacks may be incomplete");
         }
         self.state.audit.record(tool, &format!("analyzed {path}"), None, "analyzed", None);
+        Ok(text(out.to_value()))
+    }
+
+    #[tool(
+        name = "dump.diagnose",
+        description = "One-shot triage of a hung or broken process (or an existing dump): captures by pid/name if needed, then classifies the primary condition - crash, deadlock, or waiting - and returns a plain verdict with evidence and a suggested fix. Run this first on a 'not responding' or crashing process. Read-only; needs cdb."
+    )]
+    async fn dump_diagnose(
+        &self,
+        Parameters(a): Parameters<DumpDiagnoseArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.diagnose";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/";
+
+        // Resolve a dump to analyze: a given dump ref, or capture one from pid/name.
+        let (dump_ref, captured) = if let Some(d) = a.dump.clone() {
+            (d, None)
+        } else if a.pid.is_some() || a.name.is_some() {
+            let cap_docs = "https://learn.microsoft.com/sysinternals/downloads/procdump";
+            let pid = match self.resolve_pid(tool, a.pid, a.name.as_deref(), cap_docs) {
+                Ok(p) => p,
+                Err(e) => return Ok(e),
+            };
+            match self.capture_pid(tool, pid, a.full, cap_docs).await {
+                Ok(c) => (c.path.clone(), Some(c)),
+                Err(e) => return Ok(e),
+            }
+        } else {
+            return Ok(text(error(
+                tool,
+                ErrorKind::InvalidArgument,
+                "no target to diagnose",
+                "pass a pid, a name, or a dump id/path",
+                Some(docs),
+            )));
+        };
+
+        let cmds = "!analyze -v; !locks; !cs -l; !syncblk; ~*kb; lm t; q";
+        let (path, raw, cmd_str) = match self.run_cdb_on(tool, &dump_ref, cmds).await {
+            Ok(t) => t,
+            Err(e) => return Ok(e),
+        };
+
+        let dx = classify_diagnosis(&raw);
+        let sym_missing = raw.contains("symbols could not be loaded")
+            || raw.contains("Symbol file could not be found");
+        let mut data = json!({
+            "condition": dx.condition,
+            "verdict": dx.summary,
+            "evidence": dx.evidence,
+            "suggestedFix": dx.fix,
+            "path": path,
+            "raw": last_chars(&raw, 8000),
+        });
+        if let Some(c) = &captured {
+            data["dumpId"] = json!(c.dump_id);
+            data["capturedBytes"] = json!(c.bytes);
+        }
+        let mut out = Outcome::new(tool, dx.summary.clone())
+            .data(data)
+            .command(cmd_str)
+            .docs(docs);
+        if sym_missing {
+            out = out.warn("some symbols could not be loaded; stacks may be incomplete");
+        }
+        if let Some(c) = &captured {
+            if c.sensitivity == "high" {
+                out = out.warn("captured a full dump (high-sensitivity: may contain secrets/PII); do not transfer off-box unreviewed");
+            }
+            for w in &c.warnings {
+                out = out.warn(w.clone());
+            }
+        }
+        self.state.audit.record(tool, &dx.summary, None, dx.condition, None);
         Ok(text(out.to_value()))
     }
 
@@ -5273,6 +5511,63 @@ Microsoft (R) Windows Debugger\n\
         assert_eq!(det.iter().filter(|d| d.starts_with("patient+")).count(), 2, "{det:?}");
         // lock ownership from !locks / !cs is still surfaced
         assert!(det.iter().any(|d| d.contains("OwningThread")), "{det:?}");
+    }
+
+    #[test]
+    fn classify_diagnosis_calls_a_lock_cycle_a_deadlock() {
+        // two worker threads parked entering a critical section, plus the synthetic
+        // 80000003 breakpoint a live capture leaves behind -> deadlock, not a crash.
+        let raw = "\
+ExceptionCode: 80000003 (Break instruction exception)\n\
+   0  Id: 1abc.2001 Suspend: 0\n\
+00 00`0 ntdll!RtlpWaitOnCriticalSection+0x58f\n\
+01 00`0 ntdll!RtlEnterCriticalSection+0xf2\n\
+02 00`0 patient+0x1740\n\
+   1  Id: 1abc.2002 Suspend: 0\n\
+00 00`0 ntdll!RtlpWaitOnCriticalSection+0x58f\n\
+01 00`0 ntdll!RtlEnterCriticalSection+0xf2\n\
+02 00`0 patient+0x1795\n";
+        let dx = super::classify_diagnosis(raw);
+        assert_eq!(dx.condition, "deadlock", "{}", dx.summary);
+        assert!(dx.fix.is_some());
+        // the synthetic capture breakpoint is not surfaced as a crash
+        assert!(!dx.evidence.iter().any(|e| e.contains("80000003")), "{:?}", dx.evidence);
+    }
+
+    #[test]
+    fn classify_diagnosis_calls_an_access_violation_a_crash() {
+        let raw = "\
+ExceptionCode: c0000005 (Access violation)\n\
+ExceptionAddress: 00007ff6`e0f72d90 (patient+0x4224)\n\
+   0  Id: 1abc.2001 Suspend: 0\n\
+00 00`0 patient+0x4224\n";
+        let dx = super::classify_diagnosis(raw);
+        assert_eq!(dx.condition, "crash", "{}", dx.summary);
+        assert!(dx.summary.contains("Access violation"), "{}", dx.summary);
+    }
+
+    #[test]
+    fn classify_diagnosis_calls_a_lone_waiter_waiting() {
+        // one thread parked in a plain wait (no critical-section acquisition, no
+        // exception) is not a deadlock.
+        let raw = "\
+   0  Id: 1abc.2001 Suspend: 0\n\
+00 00`0 ntdll!NtWaitForSingleObject+0x14\n\
+01 00`0 KERNELBASE!WaitForSingleObjectEx+0xaf\n\
+02 00`0 patient+0x64b1\n";
+        let dx = super::classify_diagnosis(raw);
+        assert_eq!(dx.condition, "waiting", "{}", dx.summary);
+        assert!(dx.fix.is_none());
+    }
+
+    #[test]
+    fn count_cs_waiters_counts_threads_not_frames() {
+        // one thread with two critical-section frames counts once, not twice.
+        let raw = "\
+   0  Id: 1abc.2001 Suspend: 0\n\
+00 00`0 ntdll!RtlpWaitOnCriticalSection+0x58f\n\
+01 00`0 ntdll!RtlEnterCriticalSection+0xf2\n";
+        assert_eq!(super::count_cs_waiters(raw), 1);
     }
 
     #[test]
