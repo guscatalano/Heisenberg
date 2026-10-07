@@ -210,6 +210,27 @@ pub struct DumpDiagnoseArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DumpDisassembleArgs {
+    /// Dump id (from dump.capture / dump.diagnose) or a file path.
+    pub dump: String,
+    /// Where to disassemble: a symbol or address, e.g. "patient+0x4224" or "0x7ff6abcd1234".
+    pub around: String,
+    /// Number of instructions (default 24, max 256).
+    #[serde(default)]
+    pub count: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InspectProcessArgs {
+    /// Target process id (preferred).
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Target process name, e.g. "patient.exe".
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DumpAnalyzeArgs {
     /// A dump id from dump.capture (or heisenberg://dumps/<id>), or a file path.
     pub dump: String,
@@ -1738,6 +1759,33 @@ impl Heisenberg {
         }
     }
 
+    /// Resolve the cdb symbol path. Order: an explicit override, then the process
+    /// environment `_NT_SYMBOL_PATH`, then the user-registry value, then a public-
+    /// server default backed by a local cache under the state root. The default's
+    /// cache dir is created and normalized to native separators, because symsrv
+    /// rejects a cache path with forward/mixed slashes ("not a valid store").
+    fn symbol_path(&self, override_path: Option<&str>) -> String {
+        if let Some(p) = override_path {
+            if !p.trim().is_empty() {
+                return p.to_string();
+            }
+        }
+        if let Ok(p) = std::env::var("_NT_SYMBOL_PATH") {
+            if !p.trim().is_empty() {
+                return p;
+            }
+        }
+        if let Some(p) = regutil::get_hkcu_env("_NT_SYMBOL_PATH") {
+            if !p.trim().is_empty() {
+                return p;
+            }
+        }
+        let cache = self.state.store.root.join("symbols");
+        let _ = std::fs::create_dir_all(&cache);
+        let cache = cache.display().to_string().replace('/', "\\");
+        format!("srv*{cache}*https://msdl.microsoft.com/download/symbols")
+    }
+
     /// Resolve a pid/name to a pid, mapping proc errors into the tool envelope.
     /// Shared by dump.capture and dump.diagnose.
     fn resolve_pid(
@@ -2020,12 +2068,7 @@ impl Heisenberg {
             }
         };
 
-        let sympath = regutil::get_hkcu_env("_NT_SYMBOL_PATH").unwrap_or_else(|| {
-            format!(
-                "srv*{}*https://msdl.microsoft.com/download/symbols",
-                self.state.store.root.join("symbols").display()
-            )
-        });
+        let sympath = self.symbol_path(None);
         let cmds = a
             .commands
             .clone()
@@ -2151,6 +2194,28 @@ impl Heisenberg {
         Ok(text(out.to_value()))
     }
 
+    #[tool(
+        name = "dump.disassemble",
+        description = "Disassemble around a symbol or address in a dump (cdb `u`) - e.g. the faulting instruction a crash points at, or a function prologue. Read-only; needs cdb."
+    )]
+    async fn dump_disassemble(
+        &self,
+        Parameters(a): Parameters<DumpDisassembleArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        if a.around.contains(';') {
+            return Ok(text(error(
+                "dump.disassemble",
+                ErrorKind::InvalidArgument,
+                "';' is not allowed in 'around'",
+                "pass a single symbol or address, e.g. patient+0x4224",
+                None,
+            )));
+        }
+        let n = a.count.unwrap_or(24).clamp(1, 256);
+        let cmds = format!("u {} L{:x}; q", a.around.trim(), n);
+        self.simple_analyze("dump.disassemble", &a.dump, None, &cmds).await
+    }
+
     /// Resolve a dump ref (id or path), locate cdb, run a command set, return raw.
     async fn run_cdb_on(
         &self,
@@ -2175,9 +2240,7 @@ impl Heisenberg {
                 return Err(text(v));
             }
         };
-        let sympath = regutil::get_hkcu_env("_NT_SYMBOL_PATH").unwrap_or_else(|| {
-            format!("srv*{}*https://msdl.microsoft.com/download/symbols", self.state.store.root.join("symbols").display())
-        });
+        let sympath = self.symbol_path(None);
         let cmd_str = format!("{} -z \"{}\" -y \"{}\" -c \"{}\"", cdb.display(), path, sympath, cmds);
         let output = match tokio::time::timeout(
             Duration::from_secs(300),
@@ -4158,6 +4221,50 @@ impl Heisenberg {
     }
 
     #[tool(
+        name = "inspect.process",
+        description = "Show one process's identity - image path, command line, parent pid, start time and working-set size - by pid or name, so an agent doesn't have to shell out to wmic/CIM. Read-only. Useful to locate a binary/PDB or confirm how a process was launched."
+    )]
+    async fn inspect_process(
+        &self,
+        Parameters(a): Parameters<InspectProcessArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "inspect.process";
+        let docs = "https://learn.microsoft.com/windows/win32/cimwin32prov/win32-process";
+        let pid = match self.resolve_pid(tool, a.pid, a.name.as_deref(), docs) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
+        let script = format!(
+            "$p=Get-CimInstance Win32_Process -Filter 'ProcessId={pid}' -EA SilentlyContinue; if($p){{ ($p | Select-Object ProcessId,Name,ParentProcessId,CommandLine,ExecutablePath,@{{n='CreationDate';e={{if($_.CreationDate){{$_.CreationDate.ToString('o')}}}}}},WorkingSetSize | ConvertTo-Json -Compress) }} else {{ 'NONE' }}"
+        );
+        let out = match tokio::time::timeout(
+            Duration::from_secs(20),
+            Command::new("powershell")
+                .args(["-NoProfile", "-NonInteractive", "-Command", &script])
+                .output(),
+        )
+        .await
+        {
+            Err(_) => return Ok(text(error(tool, ErrorKind::Timeout, "process query timed out after 20s", "retry", Some(docs)))),
+            Ok(Err(e)) => return Ok(text(error(tool, ErrorKind::Internal, format!("failed to query process: {e}"), "check powershell is on PATH", Some(docs)))),
+            Ok(Ok(o)) => String::from_utf8_lossy(&o.stdout).trim().to_string(),
+        };
+        if out.is_empty() || out == "NONE" {
+            return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("process {pid} not found or inaccessible"), "pass a valid pid/name; run elevated for a protected process", Some(docs))));
+        }
+        let info: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|_| json!({ "raw": last_chars(&out, 2000) }));
+        let exe = info.get("ExecutablePath").and_then(|v| v.as_str()).unwrap_or("?");
+        self.state.audit.record(tool, &format!("inspected pid {pid}"), None, "inspected", None);
+        Ok(text(
+            Outcome::new(tool, format!("pid {pid}: {exe}"))
+                .data(json!({ "pid": pid, "info": info }))
+                .docs(docs)
+                .to_value(),
+        ))
+    }
+
+    #[tool(
         name = "inspect.processTree",
         description = "Enumerate running processes as a tree (pid, ppid, name) from a Toolhelp snapshot. Read-only."
     )]
@@ -5010,9 +5117,7 @@ impl Heisenberg {
             v["error"]["wingetId"] = json!("Microsoft.WinDbg");
             return Ok(text(v));
         }
-        let sympath = a.sympath.clone().or_else(|| regutil::get_hkcu_env("_NT_SYMBOL_PATH")).unwrap_or_else(|| {
-            format!("srv*{}*https://msdl.microsoft.com/download/symbols", self.state.store.root.join("symbols").display())
-        });
+        let sympath = self.symbol_path(a.sympath.as_deref());
         let meta = self.state.sessions.open(path.clone(), sympath);
         self.state.audit.record(tool, &format!("opened session {} on {path}", meta.id), None, "opened", Some(&meta.id));
         Ok(text(
@@ -5025,25 +5130,45 @@ impl Heisenberg {
     }
 
     /// Run one cdb command set against a dump (`-z ... -y ... -c "...; q"`).
-    async fn cdb_oneshot(&self, path: &str, sympath: &str, cmds: &str) -> Result<String, (ErrorKind, String)> {
+    async fn cdb_oneshot(
+        &self,
+        path: &str,
+        sympath: &str,
+        cmds: &str,
+        timeout_secs: u64,
+    ) -> Result<String, (ErrorKind, String)> {
         let cdb = self
             .state
             .locator
             .find("cdb.exe")
             .ok_or((ErrorKind::ToolNotInstalled, "cdb.exe not found".to_string()))?;
         let out = tokio::time::timeout(
-            Duration::from_secs(300),
+            Duration::from_secs(timeout_secs),
             Command::new(&cdb).arg("-z").arg(path).arg("-y").arg(sympath).arg("-c").arg(cmds).output(),
         )
         .await
-        .map_err(|_| (ErrorKind::Timeout, "cdb timed out after 300s".to_string()))?
+        .map_err(|_| (ErrorKind::Timeout, format!("cdb command timed out after {timeout_secs}s")))?
         .map_err(|e| (ErrorKind::Internal, format!("failed to launch cdb: {e}")))?;
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
 
+    /// cdb execution-control verbs (go / step / trace / watch). They only make sense
+    /// on a LIVE target; on an immutable post-mortem dump they do nothing useful and
+    /// can hang the one-shot waiting for the target to run, so dump.command refuses
+    /// them — a guard so a small agent can't wedge a session.
+    fn is_execution_command(cmd: &str) -> bool {
+        const DENY: [&str; 15] = [
+            "g", "gu", "gc", "gh", "gn", "p", "pa", "pc", "pt", "t", "ta", "tc", "tt", "wt", "pct",
+        ];
+        cmd.split(';').any(|c| {
+            let w = c.split_whitespace().next().unwrap_or("");
+            DENY.iter().any(|d| w.eq_ignore_ascii_case(d))
+        })
+    }
+
     #[tool(
         name = "dump.command",
-        description = "Run a cdb command in an open dump session (from dump.open) and return its output. Read-only (post-mortem) — each command re-execs cdb on the immutable dump."
+        description = "Run a read-only cdb command in an open dump session (from dump.open) and return its output - e.g. ~*k, !locks, lm, u, dt. Execution-control commands (g/p/t/wt/...) are refused since a dump can't run. Post-mortem; each command re-execs cdb on the immutable dump (90s cap). For a one-shot verdict prefer dump.diagnose."
     )]
     async fn dump_command(
         &self,
@@ -5056,8 +5181,17 @@ impl Heisenberg {
                 return Ok(text(error(tool, ErrorKind::SessionNotFound, format!("no session {}", a.session), "open one with dump.open; list via heisenberg://sessions", None)))
             }
         };
+        if Self::is_execution_command(&a.command) {
+            return Ok(text(error(
+                tool,
+                ErrorKind::InvalidArgument,
+                format!("'{}' is an execution-control command; a dump is immutable, so there is nothing to run", a.command.trim()),
+                "inspect the dump read-only instead: ~*k (stacks), !locks / !cs (locks), lm (modules), u / dt (disassembly / structures) - or dump.diagnose for a one-shot verdict",
+                None,
+            )));
+        }
         let cmds = format!("{}; q", a.command);
-        match self.cdb_oneshot(&session.target, &session.sympath, &cmds).await {
+        match self.cdb_oneshot(&session.target, &session.sympath, &cmds, 90).await {
             Ok(raw) => {
                 self.state.audit.record(tool, &format!("ran '{}' in {}", a.command, a.session), None, "ran", Some(&a.session));
                 Ok(text(
@@ -5558,6 +5692,18 @@ ExceptionAddress: 00007ff6`e0f72d90 (patient+0x4224)\n\
         let dx = super::classify_diagnosis(raw);
         assert_eq!(dx.condition, "waiting", "{}", dx.summary);
         assert!(dx.fix.is_none());
+    }
+
+    #[test]
+    fn execution_commands_are_refused_on_a_dump() {
+        // go/step/trace/watch make no sense on an immutable dump and can hang.
+        for c in ["g", "p", "t", "wt", "gu", "~0s; g", "pa 5"] {
+            assert!(super::Heisenberg::is_execution_command(c), "should deny: {c}");
+        }
+        // read-only inspection is allowed.
+        for c in ["~*k", "!locks", "lm t", "u patient+0x4224 L20", "dt ntdll!_PEB"] {
+            assert!(!super::Heisenberg::is_execution_command(c), "should allow: {c}");
+        }
     }
 
     #[test]
