@@ -5,14 +5,12 @@ debugging easy for an agent — capture dumps, configure gflags, run Procmon, op
 dumps, drive TTD, launch from session 0 into a user session — wrapping only free,
 Microsoft-published tools and citing public docs.
 
-Full design plan: <https://claude.ai/code/artifact/00a8d7df-6da0-4f1b-a9f9-2cb877dbffc2>
-
 ## Status
 
 **Phases 1–3 — implemented.** The static single-binary `rmcp` server, the
 `env.check` probe, the box-class safety spine with *enforcement*, the reversible
 change ledger + audit journal, and the first capture-then-inspect loop. Later
-phases (gflags, procmon, kernel, TTD, logs, session-0) are planned; see the doc.
+phases (gflags, procmon, kernel, TTD, logs, session-0) are planned.
 
 Tools today:
 

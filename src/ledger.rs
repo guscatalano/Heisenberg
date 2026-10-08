@@ -31,6 +31,32 @@ pub enum RevertPlan {
         dwords: Vec<(String, Option<u32>)>,
         created_key: bool,
     },
+    /// Restore the two registry locations a silent-process-exit dump touches: the
+    /// IFEO GlobalFlag for the image and the `SilentProcessExit\<image>` dump
+    /// settings — undoes a `dump.onExit` change in one revert.
+    SilentProcessExit {
+        image: String,
+        prior_global_flag: Option<u32>,
+        prior_page_heap: Option<u32>,
+        created_ifeo_key: bool,
+        se_subkey: String,
+        se_strings: Vec<(String, Option<String>)>,
+        se_dwords: Vec<(String, Option<u32>)>,
+        created_se_key: bool,
+    },
+    /// Re-write the original bytes into a live process's memory (undoes memory.patch).
+    /// Best-effort: the process may have exited by revert time.
+    MemoryPatch {
+        pid: u32,
+        address: u64,
+        original: Vec<u8>,
+    },
+    /// Re-write the original bytes into a file at an offset (undoes binary.patch).
+    FilePatch {
+        path: String,
+        offset: u64,
+        original: Vec<u8>,
+    },
     /// Run a command to undo the change (e.g. `bcdedit /debug off`).
     Command {
         program: String,
@@ -69,6 +95,30 @@ impl RevertPlan {
             } => {
                 regutil::hklm_restore(subkey, strings, dwords, *created_key)?;
                 Ok(())
+            }
+            RevertPlan::SilentProcessExit {
+                image,
+                prior_global_flag,
+                prior_page_heap,
+                created_ifeo_key,
+                se_subkey,
+                se_strings,
+                se_dwords,
+                created_se_key,
+            } => {
+                regutil::ifeo_restore(image, *prior_global_flag, *prior_page_heap, *created_ifeo_key)?;
+                regutil::hklm_restore(se_subkey, se_strings, se_dwords, *created_se_key)?;
+                Ok(())
+            }
+            RevertPlan::MemoryPatch { pid, address, original } => {
+                crate::patch::write_process_memory(*pid, *address, original)
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!("re-write original bytes to pid {pid}: {e}"))
+            }
+            RevertPlan::FilePatch { path, offset, original } => {
+                crate::patch::patch_file(std::path::Path::new(path), *offset, original)
+                    .map(|_| ())
+                    .map_err(|e| anyhow::anyhow!("restore original bytes in {path}: {e}"))
             }
             RevertPlan::Command {
                 program,

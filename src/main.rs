@@ -15,6 +15,7 @@ mod gate;
 mod jobs;
 mod kernel;
 mod ledger;
+mod patch;
 mod policy;
 mod proc;
 mod regutil;

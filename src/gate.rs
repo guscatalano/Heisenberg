@@ -96,6 +96,7 @@ mod tests {
         Policy {
             class,
             overrides: BTreeMap::new(),
+            allow_third_party_tools: true,
             source: PolicySource {
                 origin: "test".into(),
                 trust: Trust::Signed,

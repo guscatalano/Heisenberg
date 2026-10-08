@@ -1,8 +1,8 @@
 # Heisenberg — contributor & agent guide
 
 Windows-only MCP server that makes native debugging easy for an agent, wrapping
-only free Microsoft-published tools and citing public docs. Rust + `rmcp` over
-stdio. Full design plan: <https://claude.ai/code/artifact/00a8d7df-6da0-4f1b-a9f9-2cb877dbffc2>
+free debugging tools (Microsoft-published by default, plus opt-in third-party
+helpers like cv2pdb) and citing public docs. Rust + `rmcp` over stdio.
 
 ## Build / test / lint
 
@@ -68,7 +68,11 @@ Useful env vars for testing:
 
 ## Invariants
 
-- Public Microsoft tools only; every tool carries a `docsUrl`.
+- Every wrapped tool carries a `docsUrl` and a vendor (`microsoft` | `third-party`,
+  see `tools::vendor`). Microsoft tooling is always allowed; third-party tools
+  (e.g. cv2pdb, groundhog) are allowed by default but can be locked out by a box
+  whose policy sets `allow_third_party_tools: false` (enforced via
+  `require_tool_allowed`).
 - The agent can never change the box class through the protocol.
 - Every machine mutation is reversible via the ledger, or clearly marked Manual.
 - Full dumps/traces are tagged sensitive; warn before anything leaves the box.

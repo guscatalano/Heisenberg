@@ -64,6 +64,12 @@ pub const DOCS: &[(&str, &str, &str, &str)] = &[
         "https://learn.microsoft.com/windows-hardware/drivers/debugger/microsoft-public-symbols",
         "_NT_SYMBOL_PATH pointing at msdl for public symbols.",
     ),
+    (
+        "cv2pdb",
+        "cv2pdb (third-party)",
+        "https://github.com/rainers/cv2pdb",
+        "Converts a binary's DWARF debug info into a cdb-readable PDB (mingw/g++, Rust-GNU).",
+    ),
 ];
 
 /// Look up one tool's doc entry by key.

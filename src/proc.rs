@@ -83,6 +83,48 @@ pub fn list_processes() -> Vec<(u32, String)> {
     out
 }
 
+/// The load base address of a module (e.g. "patient.exe") in a running process,
+/// so a module-relative RVA can be turned into a live virtual address. ASLR means
+/// this differs from a dump's base and between launches.
+#[cfg(windows)]
+pub fn module_base(pid: u32, module: &str) -> Option<u64> {
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Module32FirstW, Module32NextW, MODULEENTRY32W,
+        TH32CS_SNAPMODULE, TH32CS_SNAPMODULE32,
+    };
+    let want = module.to_ascii_lowercase();
+    let want = want.trim_end_matches(".exe");
+    unsafe {
+        let snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE | TH32CS_SNAPMODULE32, pid).ok()?;
+        let mut me = MODULEENTRY32W {
+            dwSize: std::mem::size_of::<MODULEENTRY32W>() as u32,
+            ..Default::default()
+        };
+        let mut found = None;
+        if Module32FirstW(snap, &mut me).is_ok() {
+            loop {
+                let len = me.szModule.iter().position(|&c| c == 0).unwrap_or(me.szModule.len());
+                let name = String::from_utf16_lossy(&me.szModule[..len]).to_ascii_lowercase();
+                if name.trim_end_matches(".exe") == want {
+                    found = Some(me.modBaseAddr as u64);
+                    break;
+                }
+                if Module32NextW(snap, &mut me).is_err() {
+                    break;
+                }
+            }
+        }
+        let _ = CloseHandle(snap);
+        found
+    }
+}
+
+#[cfg(not(windows))]
+pub fn module_base(_pid: u32, _module: &str) -> Option<u64> {
+    None
+}
+
 /// Like `list_processes` but also returns each process's parent pid.
 #[cfg(windows)]
 pub fn list_processes_ext() -> Vec<(u32, u32, String)> {

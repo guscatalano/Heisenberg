@@ -134,15 +134,39 @@ impl Default for PolicySource {
 
 /// A per-tool gate override. Loosening overrides only take effect under a trusted
 /// policy; on an untrusted one they are dropped and the base gate applies.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Policy {
     #[serde(default)]
     pub class: BoxClass,
     /// tool name → forced gate.
     #[serde(default)]
     pub overrides: BTreeMap<String, Gate>,
+    /// Whether non-Microsoft (third-party) external tools may be located, installed
+    /// and used. Defaults to `true`; a locked-down box sets it `false` to restrict
+    /// Heisenberg to Microsoft-published tooling only. Independent of the gate
+    /// matrix — this is a provenance allow-list, not an effect tier.
+    #[serde(default = "default_true")]
+    pub allow_third_party_tools: bool,
     #[serde(default, skip_deserializing)]
     pub source: PolicySource,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for Policy {
+    /// An unconfigured box fails safe to `Critical` for the gate matrix, but
+    /// still allows third-party tools by default — provenance is a separate,
+    /// opt-in restriction, and read-only helpers like cv2pdb can't hurt the box.
+    fn default() -> Self {
+        Policy {
+            class: BoxClass::default(),
+            overrides: BTreeMap::new(),
+            allow_third_party_tools: true,
+            source: PolicySource::default(),
+        }
+    }
 }
 
 /// The result of asking the policy about one action.
@@ -213,6 +237,7 @@ mod tests {
         Policy {
             class,
             overrides: BTreeMap::new(),
+            allow_third_party_tools: true,
             source: PolicySource {
                 origin: "test".into(),
                 trust: Trust::Signed,
@@ -291,6 +316,7 @@ mod tests {
         let p = Policy {
             class: BoxClass::Sandbox,
             overrides: BTreeMap::new(),
+            allow_third_party_tools: true,
             source: PolicySource {
                 origin: "unsigned file".into(),
                 trust: Trust::Unverified,
@@ -321,6 +347,7 @@ mod tests {
         let p = Policy {
             class: BoxClass::Sandbox,
             overrides,
+            allow_third_party_tools: true,
             source: PolicySource {
                 origin: "unsigned".into(),
                 trust: Trust::Unverified,
@@ -341,6 +368,7 @@ mod tests {
         let p = Policy {
             class: BoxClass::Production,
             overrides,
+            allow_third_party_tools: true,
             source: PolicySource {
                 origin: "unsigned".into(),
                 trust: Trust::Unverified,

@@ -24,7 +24,30 @@ pub const KNOWN_TOOLS: &[(&str, &str)] = &[
     ("psexec", "PsExec.exe"),
     ("poolmon", "poolmon.exe"),
     ("groundhog", "groundhog-agent.exe"),
+    ("cv2pdb", "cv2pdb.exe"),
 ];
+
+/// Who publishes a tool. Governs the policy's third-party allow-list, not the
+/// effect-tier gate matrix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Vendor {
+    Microsoft,
+    ThirdParty,
+}
+
+/// Classify a known tool by publisher. Sysinternals, the Debugging Tools for
+/// Windows / Windows SDK / WPT, and the .NET diagnostic tools are Microsoft;
+/// `groundhog` and `cv2pdb` are third-party. An unrecognised key fails safe to
+/// `ThirdParty`, so it needs the third-party allowance before it can be used.
+pub fn vendor(key: &str) -> Vendor {
+    match key.to_ascii_lowercase().as_str() {
+        "procdump" | "procmon" | "autoruns" | "psexec" | "sysinternals" | "sysinternals-suite"
+        | "livekd" | "windbg" | "ttd" | "windows-sdk" | "sdk" | "cdb" | "gflags" | "umdh"
+        | "symchk" | "symbols" | "wpr" | "wpt" | "pktmon" | "poolmon" | "dotnet-dump"
+        | "dotnet-gcdump" | "dotnet-trace" => Vendor::Microsoft,
+        _ => Vendor::ThirdParty,
+    }
+}
 
 /// How a known tool is installed.
 #[derive(Debug)]
@@ -73,6 +96,12 @@ pub fn install_method(key: &str) -> Option<InstallMethod> {
         "dotnet-dump" => InstallMethod::DotnetTool("dotnet-dump"),
         "dotnet-gcdump" => InstallMethod::DotnetTool("dotnet-gcdump"),
         "dotnet-trace" => InstallMethod::DotnetTool("dotnet-trace"),
+        // Third-party: cv2pdb converts a binary's DWARF debug info into a PDB that
+        // cdb can read (mingw/g++, Rust-GNU, …). From its official GitHub release.
+        "cv2pdb" => InstallMethod::DirectZip {
+            url: "https://github.com/rainers/cv2pdb/releases/download/v0.52/cv2pdb-0.52.zip",
+            exe: "cv2pdb.exe",
+        },
         _ => return None,
     })
 }
@@ -137,11 +166,16 @@ impl Locator {
             .map(|(key, exe)| {
                 let found = self.find(exe);
                 let docs = crate::docs::lookup(key).map(|(_, _, url, _)| *url);
+                let vendor = match vendor(key) {
+                    Vendor::Microsoft => "microsoft",
+                    Vendor::ThirdParty => "third-party",
+                };
                 serde_json::json!({
                     "key": key,
                     "exe": exe,
                     "path": found.as_ref().map(|p| p.display().to_string()),
                     "found": found.is_some(),
+                    "vendor": vendor,
                     "docsUrl": docs,
                 })
             })
@@ -187,7 +221,31 @@ fn known_dirs() -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{install_method, InstallMethod, KNOWN_TOOLS};
+    use super::{install_method, vendor, InstallMethod, Vendor, KNOWN_TOOLS};
+
+    #[test]
+    fn vendor_classifies_microsoft_and_third_party() {
+        for ms in ["procdump", "ProcMon", "windbg", "cdb", "gflags", "dotnet-trace", "poolmon"] {
+            assert_eq!(vendor(ms), Vendor::Microsoft, "{ms}");
+        }
+        for tp in ["cv2pdb", "CV2PDB", "groundhog"] {
+            assert_eq!(vendor(tp), Vendor::ThirdParty, "{tp}");
+        }
+        // An unrecognised tool fails safe to third-party (needs the allowance).
+        assert_eq!(vendor("some-random-tool"), Vendor::ThirdParty);
+    }
+
+    #[test]
+    fn cv2pdb_is_a_third_party_direct_zip() {
+        match install_method("cv2pdb") {
+            Some(InstallMethod::DirectZip { url, exe }) => {
+                assert!(url.contains("github.com/rainers/cv2pdb"), "{url}");
+                assert!(exe.eq_ignore_ascii_case("cv2pdb.exe"));
+            }
+            other => panic!("cv2pdb expected DirectZip, got {other:?}"),
+        }
+        assert_eq!(vendor("cv2pdb"), Vendor::ThirdParty);
+    }
 
     #[test]
     fn sysinternals_tools_use_direct_zip() {

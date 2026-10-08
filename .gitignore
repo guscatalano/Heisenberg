@@ -9,3 +9,5 @@ Cargo.lock.orig
 *.etl
 *.run
 *.evtx
+# Raw screen captures (demo sources) — only the rendered mp4s are committed.
+*.avi

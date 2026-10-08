@@ -75,6 +75,20 @@ const WER_LOCALDUMPS: &str = r"SOFTWARE\Microsoft\Windows\Windows Error Reportin
 const POSTMORTEM_DOCS: &str =
     "https://learn.microsoft.com/windows/win32/wer/collecting-user-mode-dumps";
 
+const MEM_PATCH_TOKEN: &str = "patch-process-memory";
+const BIN_PATCH_TOKEN: &str = "patch-binary-file";
+const PATCH_DOCS: &str =
+    "https://learn.microsoft.com/windows/win32/api/memoryapi/nf-memoryapi-writeprocessmemory";
+
+const SILENT_EXIT_TOKEN: &str = "set-silent-process-exit";
+const SILENT_PROCESS_EXIT: &str =
+    r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\SilentProcessExit";
+const SILENT_EXIT_DOCS: &str =
+    "https://learn.microsoft.com/windows-hardware/drivers/debugger/registry-entries-for-silent-process-exit";
+/// FLG_MONITOR_SILENT_PROCESS_EXIT in the IFEO GlobalFlag — turns on silent
+/// process-exit monitoring for an image so its exit (even a clean one) is dumped.
+const FLG_MONITOR_SILENT_PROCESS_EXIT: u32 = 0x200;
+
 const APPVERIF_TOKEN: &str = "enable-appverifier";
 const APPVERIF_DOCS: &str =
     "https://learn.microsoft.com/windows-hardware/drivers/devtest/application-verifier";
@@ -168,6 +182,20 @@ pub struct SymbolsConfigureArgs {
     /// Confirm token naming the effect ("set-symbol-path") when the box requires one.
     #[serde(default)]
     pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SymbolsFromDwarfArgs {
+    /// Path to the binary (.exe/.dll) whose DWARF debug info to convert to a PDB,
+    /// e.g. a mingw/g++ or Rust-GNU build.
+    pub binary: String,
+    /// Optional explicit output .pdb path (default: next to the binary).
+    #[serde(default)]
+    pub out_pdb: Option<String>,
+    /// Rewrite the binary in place so dumps of it resolve its own frames (default
+    /// false: write a symbolized copy "<name>_sym.exe" and leave the original as-is).
+    #[serde(default)]
+    pub in_place: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -584,6 +612,57 @@ pub struct OnCrashInstallArgs {
     /// Folder for the dumps (default "%LOCALAPPDATA%\\CrashDumps").
     #[serde(default)]
     pub dump_folder: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct OnExitArgs {
+    /// Image name whose exit (including a clean/silent exit) should be dumped,
+    /// e.g. "myapp.exe".
+    pub image: String,
+    /// Full dump (default) vs mini.
+    #[serde(default = "default_true")]
+    pub full: bool,
+    /// Folder for the dumps (default "%LOCALAPPDATA%\\CrashDumps").
+    #[serde(default)]
+    pub dump_folder: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryPatchArgs {
+    /// Target process pid.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// ...or exact process name.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Where to write: "<module>+0x<rva>" (e.g. "patient.exe+0x13a0"; the rva is
+    /// resolved against the LIVE module base) or a raw virtual address "0x7ff6...".
+    pub address: String,
+    /// New bytes as hex, e.g. "90 90 90" or "4889c8".
+    pub bytes: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BinaryPatchArgs {
+    /// Path to the PE file (.exe/.dll) to patch on disk.
+    pub file: String,
+    /// Where to write: a module-relative RVA ("0x13a0" or "patient.exe+0x13a0",
+    /// mapped to a file offset via the section table) or a raw file offset "@0x7a0".
+    pub address: String,
+    /// New bytes as hex, e.g. "90 90 90".
+    pub bytes: String,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
@@ -1082,6 +1161,26 @@ fn count_cs_waiters(raw: &str) -> usize {
 ///
 /// A dump taken of a *live* (hung) process carries a synthetic `80000003`
 /// breakpoint from the capture itself — that is not a crash, so it is ignored.
+/// Space-separated lowercase hex of a byte slice, for patch previews.
+fn hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+/// Parse "0x13a0" / "13A0" as hex.
+fn parse_hex_u64(s: &str) -> Option<u64> {
+    let s = s.trim().trim_start_matches("0x").trim_start_matches("0X").replace('`', "");
+    u64::from_str_radix(&s, 16).ok()
+}
+
+/// Split "module+0x<rva>" into (Some(module), rva); "0x<va>" into (None, va).
+fn split_module_addr(s: &str) -> Option<(Option<String>, u64)> {
+    let s = s.trim();
+    match s.split_once('+') {
+        Some((m, r)) => Some((Some(m.trim().to_string()), parse_hex_u64(r)?)),
+        None => Some((None, parse_hex_u64(s)?)),
+    }
+}
+
 fn classify_diagnosis(raw: &str) -> Diagnosis {
     let crash = crash_detail(raw);
     let real_crash = crash
@@ -1109,6 +1208,22 @@ fn classify_diagnosis(raw: &str) -> Diagnosis {
             summary: format!("Crash - {head}"),
             evidence,
             fix,
+        };
+    }
+    // A silent-process-exit dump (dump.onExit) captures the process as it
+    // terminates normally — the monitor reports it from RtlReportSilentProcessExit,
+    // off the CRT's exit path. Reaching exit means the program ran to completion,
+    // so it did not hang or deadlock. This is how you confirm a former deadlock is
+    // fixed: before, it hangs (no exit dump ever fires); after, it exits cleanly.
+    if raw.contains("RtlReportSilentProcessExit")
+        || raw.contains("RtlExitUserProcess")
+        || raw.contains("_crtExitProcess")
+    {
+        return Diagnosis {
+            condition: "exiting",
+            summary: "Exiting - captured while the process was terminating normally; its threads ran to completion with no deadlock or crash (a silent process-exit dump means it reached exit instead of hanging).".to_string(),
+            evidence,
+            fix: None,
         };
     }
     let waiters = count_cs_waiters(raw);
@@ -1236,6 +1351,7 @@ impl Heisenberg {
             "effectiveClass": class,
             "source": policy.source,
             "overrides": policy.overrides,
+            "allowThirdPartyTools": policy.allow_third_party_tools,
             "gateMatrix": gate_matrix(),
         });
         Outcome::new(
@@ -1434,6 +1550,267 @@ impl Heisenberg {
     }
 
     #[tool(
+        name = "symbols.fromDwarf",
+        description = "Generate a cdb-readable PDB from a binary's DWARF debug info using cv2pdb, so a mingw/g++ or Rust-GNU build resolves its own frames (binary!func) in dumps. Read-only to the machine (writes a PDB + a symbolized copy, or rewrites the binary with in_place). cv2pdb is a THIRD-PARTY tool: blocked when the box policy restricts tooling to Microsoft-published only."
+    )]
+    async fn symbols_from_dwarf(
+        &self,
+        Parameters(a): Parameters<SymbolsFromDwarfArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "symbols.fromDwarf";
+        let docs = crate::docs::lookup("cv2pdb")
+            .map(|(_, _, u, _)| *u)
+            .unwrap_or("https://github.com/rainers/cv2pdb");
+        if let Err(e) = self.require_tool_allowed(tool, "cv2pdb", docs) {
+            return Ok(e);
+        }
+        let binary = std::path::PathBuf::from(&a.binary);
+        if !binary.is_file() {
+            return Ok(text(error(
+                tool,
+                ErrorKind::TargetNotFound,
+                format!("binary not found: {}", a.binary),
+                "pass a path to an .exe/.dll on disk",
+                Some(docs),
+            )));
+        }
+        let cv2pdb = match self.state.locator.find("cv2pdb.exe") {
+            Some(p) => p,
+            None => {
+                let mut v = error(
+                    tool,
+                    ErrorKind::ToolNotInstalled,
+                    "cv2pdb.exe not found".to_string(),
+                    "install it with tools.install cv2pdb (third-party, from its GitHub release)",
+                    Some(docs),
+                );
+                v["error"]["installKey"] = json!("cv2pdb");
+                return Ok(text(v));
+            }
+        };
+        let out_pdb = a
+            .out_pdb
+            .clone()
+            .unwrap_or_else(|| binary.with_extension("pdb").display().to_string());
+        let mut cmd = Command::new(&cv2pdb);
+        let (cmd_str, produced_image) = if a.in_place {
+            // cv2pdb <exe>: rewrites the image's debug directory and writes <stem>.pdb
+            // beside it, so future dumps of this binary resolve its frames.
+            cmd.arg(&binary);
+            (format!("{} \"{}\"", cv2pdb.display(), binary.display()), binary.display().to_string())
+        } else {
+            let stem = binary.file_stem().and_then(|s| s.to_str()).unwrap_or("out");
+            let ext = binary.extension().and_then(|s| s.to_str()).unwrap_or("exe");
+            let out_exe = binary.with_file_name(format!("{stem}_sym.{ext}"));
+            cmd.arg(&binary).arg(&out_exe).arg(&out_pdb);
+            (
+                format!("{} \"{}\" \"{}\" \"{}\"", cv2pdb.display(), binary.display(), out_exe.display(), out_pdb),
+                out_exe.display().to_string(),
+            )
+        };
+        let output = match tokio::time::timeout(Duration::from_secs(120), cmd.output()).await {
+            Err(_) => {
+                return Ok(text(error(tool, ErrorKind::Timeout, "cv2pdb timed out after 120s".to_string(), "retry, or run cv2pdb manually", Some(docs))))
+            }
+            Ok(Err(e)) => {
+                return Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch cv2pdb: {e}"), "check the cv2pdb path", Some(docs))))
+            }
+            Ok(Ok(o)) => o,
+        };
+        if !std::path::Path::new(&out_pdb).is_file() {
+            let combined = format!(
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut v = error(
+                tool,
+                ErrorKind::AnalysisFailed,
+                "cv2pdb did not produce a PDB".to_string(),
+                "the binary may have no DWARF debug info (build with -g); see the output",
+                Some(docs),
+            );
+            v["error"]["output"] = json!(combined.trim());
+            return Ok(text(v));
+        }
+        let bytes = std::fs::metadata(&out_pdb).map(|m| m.len()).unwrap_or(0);
+        self.state.audit.record(tool, &format!("generated PDB for {}", a.binary), None, "ok", None);
+        Ok(text(
+            Outcome::new(
+                tool,
+                format!(
+                    "generated {out_pdb} ({:.0} KB) from {}'s DWARF; dumps of {produced_image} now resolve its own frames",
+                    bytes as f64 / 1024.0,
+                    a.binary
+                ),
+            )
+            .data(json!({ "binary": a.binary, "pdb": out_pdb, "symbolizedImage": produced_image, "inPlace": a.in_place, "bytes": bytes }))
+            .command(cmd_str)
+            .docs(docs)
+            .warn("cv2pdb is third-party; without in_place the original binary is untouched (capture/analyze the _sym copy to pick up symbols)")
+            .to_value(),
+        ))
+    }
+
+    #[tool(
+        name = "memory.patch",
+        description = "Write bytes into a LIVE process's memory (WriteProcessMemory) - e.g. to patch code in place. Address is \"<module>+0x<rva>\" (resolved against the live module base, so it tracks ASLR) or a raw VA. State-changing, reversible via the ledger (restores the original bytes if the process is still alive); needs elevation. dry_run + confirm."
+    )]
+    async fn memory_patch(
+        &self,
+        Parameters(a): Parameters<MemoryPatchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "memory.patch";
+        let docs = PATCH_DOCS;
+        let bytes = match crate::patch::parse_hex_bytes(&a.bytes) {
+            Ok(b) => b,
+            Err(e) => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad bytes: {e}"), "pass hex like \"90 90 90\"", Some(docs)))),
+        };
+        let pid = match self.resolve_pid(tool, a.pid, a.name.as_deref(), docs) {
+            Ok(p) => p,
+            Err(e) => return Ok(e),
+        };
+        let (module, val) = match split_module_addr(&a.address) {
+            Some(x) => x,
+            None => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad address '{}'", a.address), "use \"module+0xrva\" or a raw \"0xVA\"", Some(docs)))),
+        };
+        let address = match &module {
+            Some(m) => match proc::module_base(pid, m) {
+                Some(base) => base + val,
+                None => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("module '{m}' not loaded in pid {pid}"), "check the module name", Some(docs)))),
+            },
+            None => val,
+        };
+        let cmd = format!("WriteProcessMemory(pid {pid}, 0x{address:x}, {} bytes)", bytes.len());
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            let cur = crate::patch::read_process_memory(pid, address, bytes.len()).ok();
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would write {} bytes to pid {pid} at 0x{address:x}", bytes.len()))
+                    .data(json!({ "pid": pid, "address": format!("0x{address:x}"), "newBytes": hex(&bytes), "currentBytes": cur.map(|c| hex(&c)), "gate": decision }))
+                    .command(cmd).docs(docs).warn("dry-run: no change made").to_value(),
+            ));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "writing another process's memory needs an elevated token (SeDebugPrivilege)".to_string(), "re-run Heisenberg elevated", Some(docs))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, MEM_PATCH_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs))));
+            }
+        };
+        let orig = match crate::patch::read_process_memory(pid, address, bytes.len()) {
+            Ok(o) if o.len() == bytes.len() => o,
+            _ => return Ok(text(error(tool, ErrorKind::AccessDenied, "could not read the target bytes".to_string(), "check the address is valid and mapped", Some(docs)))),
+        };
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(tool, &format!("patched pid {pid} at 0x{address:x} ({} bytes)", bytes.len()),
+                RevertPlan::MemoryPatch { pid, address, original: orig.clone() })
+        };
+        match crate::patch::write_process_memory(pid, address, &bytes) {
+            Ok(_) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(tool, &format!("patched pid {pid} at 0x{address:x}"), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                Ok(text(
+                    Outcome::new(tool, format!("wrote {} bytes to pid {pid} at 0x{address:x}; change {id}", bytes.len()))
+                        .data(json!({ "pid": pid, "address": format!("0x{address:x}"), "bytes": hex(&bytes), "originalBytes": hex(&orig), "changeId": id }))
+                        .command(cmd).docs(docs)
+                        .warn("live code patched; changes.revert writes the original bytes back if the process is still alive")
+                        .to_value(),
+                ))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                Ok(text(error(tool, ErrorKind::Internal, format!("WriteProcessMemory failed: {e}"), "check rights and the address", Some(docs))))
+            }
+        }
+    }
+
+    #[tool(
+        name = "binary.patch",
+        description = "Patch bytes into a PE file on disk (e.g. a .exe you have no source for), so a fresh run uses the patched code. Address is a module-relative RVA (\"0x13a0\" or \"patient.exe+0x13a0\", mapped to a file offset via the section table) or a raw file offset \"@0x7a0\". State-changing, reversible via the ledger. dry_run + confirm."
+    )]
+    async fn binary_patch(
+        &self,
+        Parameters(a): Parameters<BinaryPatchArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "binary.patch";
+        let docs = PATCH_DOCS;
+        let bytes = match crate::patch::parse_hex_bytes(&a.bytes) {
+            Ok(b) => b,
+            Err(e) => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad bytes: {e}"), "pass hex like \"90 90 90\"", Some(docs)))),
+        };
+        let path = std::path::PathBuf::from(&a.file);
+        if !path.is_file() {
+            return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("file not found: {}", a.file), "pass a path to a PE file", Some(docs))));
+        }
+        let pe = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => return Ok(text(error(tool, ErrorKind::Internal, format!("read failed: {e}"), "check the path", Some(docs)))),
+        };
+        let addr_s = a.address.trim();
+        let file_offset = if let Some(raw) = addr_s.strip_prefix('@') {
+            match parse_hex_u64(raw) { Some(v) => v, None => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad @offset '{}'", a.address), "use @0xFILEOFFSET", Some(docs)))) }
+        } else {
+            let (_m, rva) = match split_module_addr(addr_s) {
+                Some(x) => x,
+                None => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad address '{}'", a.address), "use an RVA like 0x13a0, or @0xfileoffset", Some(docs)))),
+            };
+            match crate::patch::rva_to_file_offset(&pe, rva) {
+                Some(o) => o,
+                None => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("RVA 0x{rva:x} is not in any PE section"), "pass a code RVA, or @0xfileoffset", Some(docs)))),
+            }
+        };
+        let end = file_offset as usize + bytes.len();
+        if end > pe.len() {
+            return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("patch runs past end of file (offset 0x{file_offset:x} + {} bytes)", bytes.len()), "check the offset", Some(docs))));
+        }
+        let cur = hex(&pe[file_offset as usize..end]);
+        let cmd = format!("patch {} at file+0x{file_offset:x} ({} bytes)", a.file, bytes.len());
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would write {} bytes to {} at file+0x{file_offset:x}", bytes.len(), a.file))
+                    .data(json!({ "file": a.file, "fileOffset": format!("0x{file_offset:x}"), "newBytes": hex(&bytes), "currentBytes": cur, "gate": decision }))
+                    .command(cmd).docs(docs).warn("dry-run: no change made").to_value(),
+            ));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, BIN_PATCH_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs))));
+            }
+        };
+        let original = pe[file_offset as usize..end].to_vec();
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(tool, &format!("patched {} at file+0x{file_offset:x}", a.file),
+                RevertPlan::FilePatch { path: a.file.clone(), offset: file_offset, original: original.clone() })
+        };
+        match crate::patch::patch_file(&path, file_offset, &bytes) {
+            Ok(orig) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(tool, &format!("patched {} at file+0x{file_offset:x}", a.file), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                Ok(text(
+                    Outcome::new(tool, format!("patched {} at file+0x{file_offset:x} ({} bytes); change {id}", a.file, bytes.len()))
+                        .data(json!({ "file": a.file, "fileOffset": format!("0x{file_offset:x}"), "bytes": hex(&bytes), "originalBytes": hex(&orig), "changeId": id }))
+                        .command(cmd).docs(docs).warn("revert with changes.revert to restore the original bytes").to_value(),
+                ))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                Ok(text(error(tool, ErrorKind::Internal, format!("patch failed: {e}"), "check file permissions and that it isn't running", Some(docs))))
+            }
+        }
+    }
+
+    #[tool(
         name = "changes.list",
         description = "List the reversible-change ledger: every state mutation this server made, its status, and how to undo it. Read-only."
     )]
@@ -1580,11 +1957,17 @@ impl Heisenberg {
                     tool,
                     ErrorKind::InvalidArgument,
                     format!("don't know how to install '{}'", a.tool),
-                    "known: procdump, procmon, autoruns, psexec, sysinternals, windbg, windows-sdk, dotnet-dump, dotnet-gcdump, dotnet-trace",
+                    "known: procdump, procmon, autoruns, psexec, sysinternals, windbg, windows-sdk, dotnet-dump, dotnet-gcdump, dotnet-trace, cv2pdb",
                     Some(docs),
                 )))
             }
         };
+        // Provenance allow-list: refuse installing a third-party tool when the box
+        // policy restricts tooling to Microsoft-published only.
+        let tool_docs = crate::docs::lookup(&a.tool).map(|(_, _, u, _)| *u).unwrap_or(docs);
+        if let Err(e) = self.require_tool_allowed(tool, &a.tool, tool_docs) {
+            return Ok(e);
+        }
         let (program, args_vec, revert, label): (&str, Vec<String>, RevertPlan, String) = match &method {
             crate::tools::InstallMethod::Winget(id) => (
                 "winget",
@@ -1784,6 +2167,28 @@ impl Heisenberg {
         let _ = std::fs::create_dir_all(&cache);
         let cache = cache.display().to_string().replace('/', "\\");
         format!("srv*{cache}*https://msdl.microsoft.com/download/symbols")
+    }
+
+    /// Enforce the box policy's tool-provenance allow-list: a third-party
+    /// (non-Microsoft) external tool is refused when the policy restricts tooling
+    /// to Microsoft-published only. Microsoft tools are always allowed. This is a
+    /// provenance check, separate from the effect-tier gate matrix.
+    fn require_tool_allowed(&self, tool: &str, key: &str, docs: &str) -> Result<(), CallToolResult> {
+        if crate::tools::vendor(key) == crate::tools::Vendor::ThirdParty
+            && !self.state.policy.allow_third_party_tools
+        {
+            self.state
+                .audit
+                .record(tool, &format!("third-party tool '{key}' blocked by policy"), None, "blocked", None);
+            return Err(text(error(
+                tool,
+                ErrorKind::PolicyDenied,
+                format!("'{key}' is a third-party (non-Microsoft) tool and this box's policy restricts tooling to Microsoft-published tools"),
+                "set allow_third_party_tools: true in the box policy to permit third-party tools",
+                Some(docs),
+            )));
+        }
+        Ok(())
     }
 
     /// Resolve a pid/name to a pid, mapping proc errors into the tool envelope.
@@ -4460,6 +4865,107 @@ impl Heisenberg {
     }
 
     #[tool(
+        name = "dump.onExit",
+        description = "Capture a dump when an image exits -- including a clean/silent exit -- via Windows Silent Process Exit monitoring (IFEO GlobalFlag 0x200 + SilentProcessExit\\<image>). Use it to confirm a process now runs to completion instead of hanging. State-changing, reversible via the ledger; needs elevation. dry_run + confirm."
+    )]
+    async fn dump_on_exit(
+        &self,
+        Parameters(a): Parameters<OnExitArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.onExit";
+        let image = a.image.trim().to_string();
+        if image.is_empty() || !image.to_ascii_lowercase().ends_with(".exe") {
+            return Ok(text(error(
+                tool,
+                ErrorKind::InvalidArgument,
+                "image must be an .exe name".to_string(),
+                "pass an image like \"patient.exe\"",
+                Some(SILENT_EXIT_DOCS),
+            )));
+        }
+        let se_sub = format!("{SILENT_PROCESS_EXIT}\\{image}");
+        let dumptype = if a.full { 2u32 } else { 1u32 };
+        let folder = a.dump_folder.clone().unwrap_or_else(|| r"%LOCALAPPDATA%\CrashDumps".to_string());
+        let (prior_gf, prior_ph, ifeo_exists) = regutil::ifeo_read(&image);
+        let se_exists = regutil::hklm_key_exists(&se_sub);
+        let prior_mode = regutil::hklm_read_dword(&se_sub, "ReportingMode");
+        let prior_folder = regutil::hklm_read_sz(&se_sub, "LocalDumpFolder");
+        let prior_dtype = regutil::hklm_read_dword(&se_sub, "DumpType");
+        let new_gf = prior_gf.unwrap_or(0) | FLG_MONITOR_SILENT_PROCESS_EXIT;
+        let cmd = format!(
+            "reg add \"HKLM\\...\\Image File Execution Options\\{image}\" /v GlobalFlag /t REG_DWORD /d 0x{new_gf:x} /f  (+ SilentProcessExit\\{image}: ReportingMode=2, LocalDumpFolder, DumpType={dumptype})"
+        );
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would dump {image} on exit ({}) to {folder}", if a.full { "full" } else { "mini" }))
+                    .data(json!({ "image": image, "dumpType": dumptype, "dumpFolder": folder, "globalFlag": new_gf, "prior": { "GlobalFlag": prior_gf, "ReportingMode": prior_mode, "LocalDumpFolder": prior_folder, "DumpType": prior_dtype }, "gate": decision }))
+                    .command(cmd)
+                    .docs(SILENT_EXIT_DOCS)
+                    .warn("dry-run: no change made")
+                    .to_value(),
+            ));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "silent-exit monitoring writes HKLM; needs an elevated token".to_string(), "re-run Heisenberg elevated", Some(SILENT_EXIT_DOCS))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, SILENT_EXIT_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(SILENT_EXIT_DOCS))));
+            }
+        };
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(
+                tool,
+                &format!("silent-process-exit dump for {image}"),
+                RevertPlan::SilentProcessExit {
+                    image: image.clone(),
+                    prior_global_flag: prior_gf,
+                    prior_page_heap: prior_ph,
+                    created_ifeo_key: !ifeo_exists,
+                    se_subkey: se_sub.clone(),
+                    se_strings: vec![("LocalDumpFolder".to_string(), prior_folder)],
+                    se_dwords: vec![("ReportingMode".to_string(), prior_mode), ("DumpType".to_string(), prior_dtype)],
+                    created_se_key: !se_exists,
+                },
+            )
+        };
+        // IFEO GlobalFlag turns monitoring on; SilentProcessExit\<image> configures the local dump.
+        let r = regutil::ifeo_write(&image, new_gf, prior_ph.unwrap_or(0))
+            .map(|_| ())
+            .and_then(|_| regutil::hklm_set_dword(&se_sub, "ReportingMode", 2).map(|_| ()))
+            .and_then(|_| regutil::hklm_set_sz(&se_sub, "LocalDumpFolder", &folder).map(|_| ()))
+            .and_then(|_| regutil::hklm_set_dword(&se_sub, "DumpType", dumptype).map(|_| ()));
+        match r {
+            Ok(_) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(tool, &format!("silent-exit dump armed for {image}"), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                Ok(text(
+                    Outcome::new(tool, format!("{image} will dump to {folder} when it exits; change {id}"))
+                        .data(json!({ "image": image, "dumpType": dumptype, "dumpFolder": folder, "globalFlag": new_gf, "changeId": id }))
+                        .command(cmd)
+                        .docs(SILENT_EXIT_DOCS)
+                        .warn("revert with changes.revert when done; dumps may contain secrets (high-sensitivity)")
+                        .to_value(),
+                ))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                let (k, remedy) = if e.kind() == std::io::ErrorKind::PermissionDenied {
+                    (ErrorKind::RequiresElevation, "re-run elevated")
+                } else {
+                    (ErrorKind::Internal, "check HKLM permissions for IFEO / SilentProcessExit")
+                };
+                Ok(text(error(tool, k, format!("failed to arm silent-exit dump: {e}"), remedy, Some(SILENT_EXIT_DOCS))))
+            }
+        }
+    }
+
+    #[tool(
         name = "dump.onTrigger",
         description = "Arm ProcDump to dump a process in the background when a trigger fires (unhandled/firstchance exception, CPU threshold, or hang); returns a jobId. Read-only capture; needs ProcDump staged. Stop with job.stop/job.cancel."
     )]
@@ -5695,6 +6201,24 @@ ExceptionAddress: 00007ff6`e0f72d90 (patient+0x4224)\n\
     }
 
     #[test]
+    fn classify_diagnosis_calls_a_silent_exit_dump_exiting() {
+        // A dump.onExit (silent process exit) dump is captured off the CRT exit
+        // path via RtlReportSilentProcessExit -- the process reached exit, so it
+        // ran to completion and is neither deadlocked nor crashed.
+        let raw = "\
+ExceptionCode: 80000003 (Break instruction exception)\n\
+FAULTING_THREAD:  c98\n\
+   0  Id: 1fe0.0c98 Suspend: 0\n\
+00 00`0 ntdll!NtWaitForSingleObject+0x14\n\
+01 00`0 ntdll!RtlReportSilentProcessExit+0x1bf\n\
+02 00`0 msvcrt!_crtExitProcess+0x6d\n";
+        let dx = super::classify_diagnosis(raw);
+        assert_eq!(dx.condition, "exiting", "{}", dx.summary);
+        assert!(dx.fix.is_none());
+        assert!(!dx.evidence.iter().any(|e| e.contains("80000003")), "{:?}", dx.evidence);
+    }
+
+    #[test]
     fn execution_commands_are_refused_on_a_dump() {
         // go/step/trace/watch make no sense on an immutable dump and can hang.
         for c in ["g", "p", "t", "wt", "gu", "~0s; g", "pa 5"] {
@@ -5873,10 +6397,13 @@ ExceptionCode: c0000374\n";
         gated.sort();
         let mut expected = vec![
             "appverifier.enable",
+            "binary.patch",
             "boot.trace",
             "dump.onCrashInstall",
+            "dump.onExit",
             "env.provision",
             "gflags.set",
+            "memory.patch",
             "kernel.netDebugSetup",
             "kernel.serialDebugSetup",
             "kernel.setCrashDump",
@@ -5927,5 +6454,33 @@ ExceptionCode: c0000374\n";
         let env: serde_json::Value = serde_json::from_str(txt).unwrap();
         assert_eq!(env["ok"], serde_json::json!(false), "must refuse: {env}");
         assert_eq!(env["error"]["kind"], serde_json::json!("RequiresApproval"));
+    }
+
+    /// The tool-provenance allow-list bites: with third-party tools disallowed,
+    /// `symbols.fromDwarf` (which uses cv2pdb) is refused up front with PolicyDenied,
+    /// before it ever looks for the tool or the binary.
+    #[tokio::test]
+    async fn symbols_from_dwarf_refused_when_third_party_disallowed() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let home = std::env::temp_dir().join(format!("hb_tp_test_{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        std::env::set_var("HEISENBERG_HOME", &home);
+        let mut policy = crate::policy::Policy::default();
+        policy.class = crate::policy::BoxClass::Development;
+        policy.allow_third_party_tools = false;
+        let h = super::Heisenberg::new(policy);
+        let res = h
+            .symbols_from_dwarf(Parameters(super::SymbolsFromDwarfArgs {
+                binary: "C:\\does\\not\\matter.exe".into(),
+                out_pdb: None,
+                in_place: false,
+            }))
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res).unwrap();
+        let txt = v.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap();
+        let env: serde_json::Value = serde_json::from_str(txt).unwrap();
+        assert_eq!(env["ok"], serde_json::json!(false), "must refuse: {env}");
+        assert_eq!(env["error"]["kind"], serde_json::json!("PolicyDenied"), "{env}");
     }
 }
