@@ -33,6 +33,10 @@ impl Store {
         self.root.join("dumps.json")
     }
 
+    pub fn repros_path(&self) -> PathBuf {
+        self.root.join("repros.json")
+    }
+
     pub fn jobs_path(&self) -> PathBuf {
         self.root.join("jobs.json")
     }

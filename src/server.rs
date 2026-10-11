@@ -104,6 +104,7 @@ pub struct AppState {
     pub locator: Locator,
     pub ledger: Mutex<Ledger>,
     pub dumps: Mutex<DumpRegistry>,
+    pub repros: Mutex<crate::repro::ReproStore>,
     pub jobs: Mutex<JobRegistry>,
     pub audit: Audit,
     /// Operator-added tool search folders (persisted); shared with the locator.
@@ -121,6 +122,7 @@ impl AppState {
         init_call_log(&store.calls_path());
         let ledger = Ledger::load(store.ledger_path());
         let dumps = DumpRegistry::load(store.dumps_path());
+        let repros = crate::repro::ReproStore::load(store.repros_path());
         let jobs = JobRegistry::load(store.jobs_path());
         let audit = Audit::open(store.audit_path());
         let folders_path = store.folders_path();
@@ -137,6 +139,7 @@ impl AppState {
             locator: Locator::discover(extra_folders.clone()),
             ledger: Mutex::new(ledger),
             dumps: Mutex::new(dumps),
+            repros: Mutex::new(repros),
             jobs: Mutex::new(jobs),
             audit,
             approvals: Approvals::load(store.approvals_path()),
@@ -1449,6 +1452,75 @@ pub struct KernelVerifierArgs {
     #[serde(default)]
     pub confirm: Option<String>,
 }
+
+/// Args for `repro.record`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReproRecordArgs {
+    /// Existing recipe id to UPDATE (merge). Omit to create a new recipe.
+    #[serde(default)]
+    pub id: Option<String>,
+    /// Short title, e.g. "notepad hangs on print".
+    #[serde(default)]
+    pub title: Option<String>,
+    /// crash | hang | high-cpu | leak | deadlock | other.
+    #[serde(default)]
+    pub symptom: Option<String>,
+    /// The target image (stable key for replay), e.g. "myapp.exe".
+    #[serde(default)]
+    pub image: Option<String>,
+    /// The original pid (informational).
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// Re-appliable arming conditions you just set up (the tool + its forward args).
+    #[serde(default)]
+    pub arming: Vec<crate::repro::ArmingStep>,
+    /// Manual trigger steps Heisenberg can't observe, e.g. ["open a 2GB file", "File > Print"].
+    #[serde(default)]
+    pub manual_steps: Vec<String>,
+    /// The dump.onTrigger condition, if any: unhandled | firstchance | cpu | hang.
+    #[serde(default)]
+    pub trigger: Option<String>,
+    /// Dump ids this reproduction produced (append on update).
+    #[serde(default)]
+    pub dump_ids: Vec<String>,
+    /// Capture/job ids this reproduction produced (append on update).
+    #[serde(default)]
+    pub job_ids: Vec<String>,
+    /// Ledger change ids that constitute these conditions (traceability).
+    #[serde(default)]
+    pub change_ids: Vec<String>,
+    /// Free-text note / observed symptom detail (append on update).
+    #[serde(default)]
+    pub notes: Option<String>,
+}
+
+/// Args for `repro.replay`.
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReproReplayArgs {
+    /// Recipe id (from repro.record or heisenberg://repros).
+    pub id: String,
+    /// "emit" (default, read-only: return the runnable recipe) or "apply" (re-arm the
+    /// conditions on this box via the underlying tools, each through its own gate).
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// apply mode: preview the arming commands + gate decision without applying.
+    #[serde(default)]
+    pub dry_run: bool,
+    /// apply mode: confirm token ("replay-repro") when the box requires one.
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+const REPRO_DOCS: &str = "https://learn.microsoft.com/windows-hardware/drivers/debugger/";
+const REPRO_REPLAY_TOKEN: &str = "replay-repro";
+/// The arming tools `repro.replay apply` can re-invoke (each re-passes its own gate).
+const REPLAYABLE_ARMING: [&str; 5] = [
+    "gflags.set",
+    "appverifier.enable",
+    "dump.onCrashInstall",
+    "dump.onTrigger",
+    "symbols.configure",
+];
 
 /// PowerShell for perf.counters: sample a process N times, incl. GDI/USER object counts.
 const PERF_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
@@ -5255,6 +5327,239 @@ impl Heisenberg {
     }
 
     #[tool(
+        name = "repro.record",
+        description = "Record (or update) a repro recipe: the re-appliable arming conditions (gflags.set / appverifier.enable / dump.onCrashInstall / dump.onTrigger / symbols.configure), the manual trigger steps Heisenberg can't observe, and the evidence it produced. Pass id to merge into an existing recipe (append dumps/jobs/notes) - e.g. attach the dump after you reproduce. Read-only to the machine; writes only Heisenberg state. Replay with repro.replay; appears in collect.package + report.generate + heisenberg://repros."
+    )]
+    async fn repro_record(
+        &self,
+        Parameters(a): Parameters<ReproRecordArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "repro.record";
+        let mut store = self.state.repros.lock().unwrap();
+
+        // Flag arming steps whose tool can't actually be re-applied, so the recipe is honest.
+        let non_replayable: Vec<String> = a
+            .arming
+            .iter()
+            .filter(|s| !REPLAYABLE_ARMING.contains(&s.tool.as_str()))
+            .map(|s| s.tool.clone())
+            .collect();
+
+        let stored = if let Some(id) = a.id.as_deref() {
+            // Merge into an existing recipe.
+            let mut r = match store.get(id) {
+                Some(r) => r.clone(),
+                None => {
+                    return Ok(text(error(
+                        tool,
+                        ErrorKind::TargetNotFound,
+                        format!("no repro recipe with id {id}"),
+                        "omit id to create a new recipe, or list heisenberg://repros",
+                        Some(REPRO_DOCS),
+                    )));
+                }
+            };
+            if let Some(v) = a.title { r.title = v; }
+            if let Some(v) = a.symptom { r.symptom = v; }
+            if a.image.is_some() { r.image = a.image; }
+            if a.pid.is_some() { r.pid = a.pid; }
+            if !a.arming.is_empty() { r.arming = a.arming; }
+            if !a.manual_steps.is_empty() { r.manual_steps = a.manual_steps; }
+            if a.trigger.is_some() { r.trigger = a.trigger; }
+            r.outcome.dump_ids.extend(a.dump_ids);
+            r.outcome.job_ids.extend(a.job_ids);
+            r.source_change_ids.extend(a.change_ids);
+            if let Some(n) = a.notes {
+                r.outcome.notes = Some(match r.outcome.notes.take() {
+                    Some(prev) if !prev.is_empty() => format!("{prev}\n{n}"),
+                    _ => n,
+                });
+            }
+            store.replace(r).expect("recipe existed above")
+        } else {
+            // Create a new recipe.
+            let recipe = crate::repro::ReproRecipe {
+                id: String::new(),
+                created: String::new(),
+                title: a.title.unwrap_or_else(|| "untitled repro".to_string()),
+                symptom: a.symptom.unwrap_or_else(|| "other".to_string()),
+                image: a.image,
+                pid: a.pid,
+                arming: a.arming,
+                manual_steps: a.manual_steps,
+                trigger: a.trigger,
+                outcome: crate::repro::ReproOutcome {
+                    symptom: None,
+                    dump_ids: a.dump_ids,
+                    job_ids: a.job_ids,
+                    notes: a.notes,
+                },
+                source_change_ids: a.change_ids,
+            };
+            store.add(recipe)
+        };
+
+        self.state.audit.record(tool, &format!("recorded repro recipe {}", stored.id), None, "recorded", None);
+        let mut out = Outcome::new(tool, format!("repro recipe {} ({})", stored.id, stored.symptom))
+            .data(json!({ "recipe": stored, "resource": format!("heisenberg://repros/{}", stored.id) }))
+            .docs(REPRO_DOCS);
+        if !non_replayable.is_empty() {
+            out = out.warn(format!(
+                "arming step(s) {non_replayable:?} are not auto-re-appliable; repro.replay will emit them as manual steps"
+            ));
+        }
+        Ok(text(out.to_value()))
+    }
+
+    #[tool(
+        name = "repro.replay",
+        description = "Replay a repro recipe. mode=\"emit\" (default, read-only) returns the ordered runnable recipe (arming commands, then manual steps, then trigger, plus evidence refs). mode=\"apply\" re-establishes the arming conditions on THIS box by re-invoking each underlying tool - each re-passes its OWN gate and records its own reversible ledger entry (one changes.revert undoes them). apply supports dry_run (preview + gate decision) and a confirm token on Production/Critical."
+    )]
+    async fn repro_replay(
+        &self,
+        Parameters(a): Parameters<ReproReplayArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "repro.replay";
+        let recipe = {
+            let store = self.state.repros.lock().unwrap();
+            match store.get(&a.id) {
+                Some(r) => r.clone(),
+                None => {
+                    return Ok(text(error(
+                        tool,
+                        ErrorKind::TargetNotFound,
+                        format!("no repro recipe with id {}", a.id),
+                        "list heisenberg://repros or record one with repro.record",
+                        Some(REPRO_DOCS),
+                    )));
+                }
+            }
+        };
+
+        // Build the ordered, human-runnable steps (used by emit and by apply's preview).
+        let arming_steps: Vec<serde_json::Value> = recipe
+            .arming
+            .iter()
+            .map(|s| {
+                let replayable = REPLAYABLE_ARMING.contains(&s.tool.as_str());
+                json!({ "tool": s.tool, "args": s.args, "command": s.command, "autoReplayable": replayable })
+            })
+            .collect();
+
+        let mode = a.mode.as_deref().unwrap_or("emit");
+        if mode == "emit" {
+            self.state.audit.record(tool, &format!("emitted repro recipe {}", recipe.id), None, "emitted", None);
+            return Ok(text(
+                Outcome::new(tool, format!("runnable recipe for {} ({})", recipe.id, recipe.symptom))
+                    .data(json!({
+                        "id": recipe.id,
+                        "symptom": recipe.symptom,
+                        "target": { "image": recipe.image, "pid": recipe.pid },
+                        "arming": arming_steps,
+                        "manualSteps": recipe.manual_steps,
+                        "trigger": recipe.trigger,
+                        "evidence": { "dumpIds": recipe.outcome.dump_ids, "jobIds": recipe.outcome.job_ids },
+                    }))
+                    .docs(REPRO_DOCS)
+                    .warn("emit is read-only: it describes how to reproduce; nothing was applied. Use mode=\"apply\" to re-arm.")
+                    .to_value(),
+            ));
+        }
+        if mode != "apply" {
+            return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("unknown mode '{mode}'"), "use mode=\"emit\" or mode=\"apply\"", Some(REPRO_DOCS))));
+        }
+
+        // apply mode: this is the gated mutation.
+        let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+        if a.dry_run {
+            self.state.audit.record(tool, "dry-run", Some(&format!("{:?}", decision.gate)), "dry-run", None);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would re-arm {} (gate: {:?})", recipe.id, decision.gate))
+                    .data(json!({ "id": recipe.id, "arming": arming_steps, "manualSteps": recipe.manual_steps, "trigger": recipe.trigger, "gate": decision }))
+                    .docs(REPRO_DOCS)
+                    .warn("dry-run: no change made. Each arming step will be applied through its own gate + ledger when you confirm.")
+                    .to_value(),
+            ));
+        }
+
+        let decision = match gate::enforce(
+            &self.state.policy,
+            tool,
+            EffectTier::StateChanging,
+            REPRO_REPLAY_TOKEN,
+            a.confirm.as_deref(),
+            &self.state.approvals,
+        ) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(REPRO_DOCS))));
+            }
+        };
+
+        // Re-invoke each arming tool. Each re-passes its OWN gate (so a sub-step that
+        // needs its own confirm/approval on this box is surfaced, never bypassed) and
+        // records its own reversible ledger entry.
+        let mut results: Vec<serde_json::Value> = Vec::new();
+        let mut applied = 0usize;
+        for step in &recipe.arming {
+            if !REPLAYABLE_ARMING.contains(&step.tool.as_str()) {
+                results.push(json!({ "tool": step.tool, "status": "skipped", "reason": "not auto-re-appliable; perform manually" }));
+                continue;
+            }
+            let sub = self.dispatch_arming(&step.tool, step.args.clone()).await;
+            match sub {
+                Ok(v) => {
+                    let ok = v.get("error").is_none();
+                    if ok { applied += 1; }
+                    results.push(json!({ "tool": step.tool, "status": if ok { "applied" } else { "error" }, "result": v }));
+                }
+                Err(e) => results.push(json!({ "tool": step.tool, "status": "error", "reason": e })),
+            }
+        }
+
+        self.state.audit.record(tool, &format!("replayed repro recipe {} ({applied} armed)", recipe.id), Some(&format!("{:?}", decision.gate)), "applied", None);
+        Ok(text(
+            Outcome::new(tool, format!("re-armed {} - {applied}/{} step(s) applied", recipe.id, recipe.arming.len()))
+                .data(json!({
+                    "id": recipe.id,
+                    "armingResults": results,
+                    "manualSteps": recipe.manual_steps,
+                    "trigger": recipe.trigger,
+                }))
+                .docs(REPRO_DOCS)
+                .warn("conditions re-armed; now perform the manual steps to reproduce. Undo all arming via changes.revert (each step recorded its own ledger entry).")
+                .to_value(),
+        ))
+    }
+
+    /// Re-invoke one arming tool by name with stored args, returning its result
+    /// envelope as JSON. Each underlying tool runs its OWN gate + ledger, so the
+    /// safety spine is never bypassed here. Not a `#[tool]` - an internal dispatcher.
+    async fn dispatch_arming(&self, tool: &str, args: serde_json::Value) -> Result<serde_json::Value, String> {
+        macro_rules! parse {
+            () => {
+                serde_json::from_value(args).map_err(|e| format!("bad args for {tool}: {e}"))?
+            };
+        }
+        let res = match tool {
+            "gflags.set" => self.gflags_set(Parameters(parse!())).await,
+            "appverifier.enable" => self.appverifier_enable(Parameters(parse!())).await,
+            "dump.onCrashInstall" => self.dump_on_crash_install(Parameters(parse!())).await,
+            "dump.onTrigger" => self.dump_on_trigger(Parameters(parse!())).await,
+            "symbols.configure" => self.symbols_configure(Parameters(parse!())).await,
+            other => return Err(format!("tool {other} is not re-appliable")),
+        };
+        let ctr = res.map_err(|e| e.to_string())?;
+        // text() packs the envelope as a single JSON text block; read it back out.
+        let v = serde_json::to_value(&ctr).map_err(|e| e.to_string())?;
+        match v.get("content").and_then(|c| c.get(0)).and_then(|b| b.get("text")).and_then(|t| t.as_str()) {
+            Some(s) => serde_json::from_str::<serde_json::Value>(s).map_err(|e| e.to_string()),
+            None => Ok(v),
+        }
+    }
+
+    #[tool(
         name = "collect.package",
         description = "Bundle a portable case: env snapshot + policy + change ledger + job/dump lists + audit journal into one zipped manifest (references artifacts by path/hash; does not copy multi-GB dumps). Read-only."
     )]
@@ -5282,6 +5587,7 @@ impl Heisenberg {
             "changes": self.state.ledger.lock().unwrap().list(),
             "jobs": self.state.jobs.lock().unwrap().list(),
             "dumps": self.state.dumps.lock().unwrap().list(),
+            "repros": self.state.repros.lock().unwrap().list(),
             "audit": self.state.audit.tail(1000),
         });
         let manifest_path = case_dir.join("manifest.json");
@@ -5361,6 +5667,23 @@ impl Heisenberg {
                 md.push('\n');
             }
         }
+        {
+            let repros = self.state.repros.lock().unwrap();
+            md.push_str(&format!("## Repro recipes ({})\n\n", repros.list().len()));
+            if !repros.list().is_empty() {
+                md.push_str("| id | symptom | target | arming | manual | evidence |\n|---|---|---|---|---|---|\n");
+                for r in repros.list() {
+                    let target = r.image.clone().or_else(|| r.pid.map(|p| format!("pid {p}"))).unwrap_or_else(|| "-".to_string());
+                    let evidence = if r.outcome.dump_ids.is_empty() { "-".to_string() } else { r.outcome.dump_ids.join(", ") };
+                    md.push_str(&format!(
+                        "| {} | {} | {} | {} | {} | {} |\n",
+                        r.id, r.symptom, target, r.arming.len(), r.manual_steps.len(), evidence
+                    ));
+                }
+                md.push('\n');
+            }
+        }
+
         let recent = self.state.audit.tail(25);
         md.push_str(&format!("## Recent activity ({} of last 25)\n\n", recent.len()));
         for e in &recent {
@@ -6920,6 +7243,7 @@ impl ServerHandler for Heisenberg {
             Resource::new("heisenberg://audit", "Audit journal (recent entries)".to_string()),
             Resource::new("heisenberg://calls", "Tool-call result log (recent, JSONL)".to_string()),
             Resource::new("heisenberg://dumps", "Captured dumps".to_string()),
+            Resource::new("heisenberg://repros", "Repro recipes".to_string()),
             Resource::new("heisenberg://captures", "Background capture jobs".to_string()),
             Resource::new("heisenberg://cases", "Exported case bundles".to_string()),
             Resource::new("heisenberg://sessions", "Open debug sessions".to_string()),
@@ -6972,6 +7296,10 @@ impl ServerHandler for Heisenberg {
                 let reg = self.state.dumps.lock().unwrap();
                 serde_json::to_string_pretty(&json!({ "dumps": reg.list() })).ok()
             }
+            "heisenberg://repros" => {
+                let reg = self.state.repros.lock().unwrap();
+                serde_json::to_string_pretty(&json!({ "repros": reg.list() })).ok()
+            }
             "heisenberg://tools" => {
                 serde_json::to_string_pretty(&json!({ "tools": self.state.locator.inventory() })).ok()
             }
@@ -7000,6 +7328,11 @@ impl ServerHandler for Heisenberg {
             other if other.starts_with("heisenberg://dumps/") => {
                 let id = &other["heisenberg://dumps/".len()..];
                 let reg = self.state.dumps.lock().unwrap();
+                reg.get(id).map(|r| serde_json::to_string_pretty(r).unwrap_or_default())
+            }
+            other if other.starts_with("heisenberg://repros/") => {
+                let id = &other["heisenberg://repros/".len()..];
+                let reg = self.state.repros.lock().unwrap();
                 reg.get(id).map(|r| serde_json::to_string_pretty(r).unwrap_or_default())
             }
             other if other.starts_with("heisenberg://captures/") => {
@@ -7350,6 +7683,7 @@ ExceptionCode: c0000374\n";
             "leak.heapTrackStart",
             "postmortem.aeDebug",
             "remote.dumpCapture",
+            "repro.replay",
             "service.startupDebug",
             "session.launchInUser",
             "symbols.configure",
@@ -7394,6 +7728,61 @@ ExceptionCode: c0000374\n";
         let env: serde_json::Value = serde_json::from_str(txt).unwrap();
         assert_eq!(env["ok"], serde_json::json!(false), "must refuse: {env}");
         assert_eq!(env["error"]["kind"], serde_json::json!("RequiresApproval"));
+    }
+
+    /// `repro.record` then `repro.replay mode=emit` round-trips a recipe and emits
+    /// its ordered steps — arming (with the auto-replayable flag), manual steps, and
+    /// trigger — read-only, applying nothing.
+    #[tokio::test]
+    async fn repro_record_then_emit_builds_ordered_recipe() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let home = std::env::temp_dir().join(format!("hb_repro_emit_{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        std::env::set_var("HEISENBERG_HOME", &home);
+        std::fs::remove_file(home.join("repros.json")).ok();
+        let h = super::Heisenberg::new(crate::policy::Policy::default());
+
+        let rec = h
+            .repro_record(Parameters(super::ReproRecordArgs {
+                id: None,
+                title: Some("notepad hang".into()),
+                symptom: Some("hang".into()),
+                image: Some("notepad.exe".into()),
+                pid: None,
+                arming: vec![crate::repro::ArmingStep {
+                    tool: "gflags.set".into(),
+                    args: serde_json::json!({ "image": "notepad.exe" }),
+                    command: Some("gflags /p /enable notepad.exe /full".into()),
+                }],
+                manual_steps: vec!["open a 2GB file, then File > Print".into()],
+                trigger: Some("hang".into()),
+                dump_ids: vec![],
+                job_ids: vec![],
+                change_ids: vec![],
+                notes: None,
+            }))
+            .await
+            .unwrap();
+        let rv = serde_json::to_value(&rec).unwrap();
+        let renv: serde_json::Value = serde_json::from_str(rv.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap()).unwrap();
+        assert_eq!(renv["ok"], serde_json::json!(true), "record failed: {renv}");
+        let id = renv["data"]["recipe"]["id"].as_str().unwrap().to_string();
+        assert!(id.starts_with("rpr-"));
+
+        let emit = h
+            .repro_replay(Parameters(super::ReproReplayArgs { id: id.clone(), mode: Some("emit".into()), dry_run: false, confirm: None }))
+            .await
+            .unwrap();
+        let ev = serde_json::to_value(&emit).unwrap();
+        let env: serde_json::Value = serde_json::from_str(ev.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap()).unwrap();
+        assert_eq!(env["ok"], serde_json::json!(true), "emit failed: {env}");
+        let d = &env["data"];
+        assert_eq!(d["id"], serde_json::json!(id));
+        assert_eq!(d["arming"].as_array().unwrap().len(), 1);
+        assert_eq!(d["arming"][0]["tool"], serde_json::json!("gflags.set"));
+        assert_eq!(d["arming"][0]["autoReplayable"], serde_json::json!(true));
+        assert_eq!(d["manualSteps"].as_array().unwrap().len(), 1);
+        assert_eq!(d["trigger"], serde_json::json!("hang"));
     }
 
     /// The tool-provenance allow-list bites: with third-party tools disallowed,

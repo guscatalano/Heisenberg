@@ -19,6 +19,7 @@ mod patch;
 mod policy;
 mod proc;
 mod regutil;
+mod repro;
 mod server;
 mod session;
 mod sessions;

@@ -74,14 +74,16 @@ Tools today:
 | `changes.list` / `changes.revert` | The reversible-change ledger and one-call undo. |
 | `approvals.list` | Human-approval broker grants (for HumanApproval-gated actions on Critical boxes). |
 | `audit.export` | Export the append-only audit journal (path, count, recent entries). |
-| `collect.package` | Bundle a portable case (env + policy + ledger + jobs + dumps + audit) into a zipped manifest. |
+| `repro.record` | Record (or update) a **repro recipe**: the re-appliable arming conditions (page heap / App Verifier / dump-on-trigger / symbol path), the manual trigger steps Heisenberg can't observe, and the evidence it produced. Pass `id` to attach a dump after you reproduce. |
+| `repro.replay` | Replay a recipe — `mode=emit` (read-only) returns the ordered runnable recipe; `mode=apply` re-arms the conditions on this box by re-invoking each underlying tool (each re-passes its own gate + records a reversible ledger entry; `dry_run` + confirm token). |
+| `collect.package` | Bundle a portable case (env + policy + ledger + jobs + dumps + repros + audit) into a zipped manifest. |
 | `report.generate` | Human-readable Markdown incident report from the current state. |
 | `artifacts.purge` | Reclaim disk by deleting captured artifacts (dry-run by default; optional age filter). |
 
 Resources: `heisenberg://env`, `heisenberg://policy`, `heisenberg://changes`,
-`heisenberg://audit`, `heisenberg://dumps` (+ `/<id>`), `heisenberg://captures`
-(+ `/<id>`), `heisenberg://cases`, `heisenberg://sessions`, `heisenberg://tools`,
-`docs://<tool>`. Plus 11 guided **prompts** (triage-broken-box, diagnose-crash/hang/
+`heisenberg://audit`, `heisenberg://dumps` (+ `/<id>`), `heisenberg://repros`
+(+ `/<id>`), `heisenberg://captures` (+ `/<id>`), `heisenberg://cases`,
+`heisenberg://sessions`, `heisenberg://tools`, `docs://<tool>`. Plus 11 guided **prompts** (triage-broken-box, diagnose-crash/hang/
 deadlock/high-cpu/leak, diagnose-service-start, app-wont-launch, analyze-existing-dump/
 bugcheck, diagnose-verifier-stop).
 

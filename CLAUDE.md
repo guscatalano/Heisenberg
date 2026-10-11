@@ -35,7 +35,8 @@ Useful env vars for testing:
 - `policy.rs` — box class × effect tier → gate matrix; fail-safe to Critical.
 - `gate.rs` — enforcement (`enforce`) that mutating tools call before acting.
 - `ledger.rs` — reversible-change ledger; `RevertPlan` variants per change kind.
-- `audit.rs`, `jobs.rs`, `dumps.rs`, `store.rs` — persisted state.
+- `audit.rs`, `jobs.rs`, `dumps.rs`, `repro.rs`, `store.rs` — persisted state.
+  `repro.rs` is the repro-recipe registry (`repro.record`/`repro.replay`).
 - `env_probe.rs`, `proc.rs`, `regutil.rs`, `session.rs`, `kernel.rs`, `wct.rs` —
   the Win32 work (via the `windows` crate) and registry helpers. `wct.rs` wraps
   the Wait Chain Traversal API (live cross-process deadlock detection).
