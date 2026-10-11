@@ -36,8 +36,9 @@ Useful env vars for testing:
 - `gate.rs` — enforcement (`enforce`) that mutating tools call before acting.
 - `ledger.rs` — reversible-change ledger; `RevertPlan` variants per change kind.
 - `audit.rs`, `jobs.rs`, `dumps.rs`, `store.rs` — persisted state.
-- `env_probe.rs`, `proc.rs`, `regutil.rs`, `session.rs`, `kernel.rs` — the Win32
-  work (via the `windows` crate) and registry helpers.
+- `env_probe.rs`, `proc.rs`, `regutil.rs`, `session.rs`, `kernel.rs`, `wct.rs` —
+  the Win32 work (via the `windows` crate) and registry helpers. `wct.rs` wraps
+  the Wait Chain Traversal API (live cross-process deadlock detection).
 - `tools.rs` — external-tool locator; `docs.rs` — public-doc links; `envelope.rs`
   — the uniform result/error envelope.
 

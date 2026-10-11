@@ -25,6 +25,12 @@ pub const KNOWN_TOOLS: &[(&str, &str)] = &[
     ("poolmon", "poolmon.exe"),
     ("groundhog", "groundhog-agent.exe"),
     ("cv2pdb", "cv2pdb.exe"),
+    // Official WinDbg MCP proxy (ships in the WinDbg package, >= 1.2610.1001.0):
+    // stdio MCP front end that bridges an AI client to a live WinDbg session.
+    ("windbg-mcp", "DbgX.Mcp.Proxy.exe"),
+    // REA (Reverse Engineer Anything): third-party binary-RE MCP server/CLI
+    // (Ghidra/IDA/Hopper). The Windows launcher is `rea` -> rea.cmd on PATH.
+    ("rea", "rea.cmd"),
 ];
 
 /// Who publishes a tool. Governs the policy's third-party allow-list, not the
@@ -44,7 +50,9 @@ pub fn vendor(key: &str) -> Vendor {
         "procdump" | "procmon" | "autoruns" | "psexec" | "sysinternals" | "sysinternals-suite"
         | "livekd" | "windbg" | "ttd" | "windows-sdk" | "sdk" | "cdb" | "gflags" | "umdh"
         | "symchk" | "symbols" | "wpr" | "wpt" | "pktmon" | "poolmon" | "dotnet-dump"
-        | "dotnet-gcdump" | "dotnet-trace" => Vendor::Microsoft,
+        | "dotnet-gcdump" | "dotnet-trace" | "windbg-mcp" => Vendor::Microsoft,
+        // groundhog, cv2pdb, rea (Reverse Engineer Anything), and anything
+        // unrecognised fail safe to third-party (needs the allowance).
         _ => Vendor::ThirdParty,
     }
 }
@@ -61,6 +69,46 @@ pub enum InstallMethod {
 /// The managed directory that direct-download tools extract into (searched by
 /// the locator).
 pub const MANAGED_TOOLS_DIR: &str = r"C:\ProgramData\Heisenberg\tools";
+
+/// Minimum WinDbg version that ships the MCP server + `DbgX.Mcp.Proxy.exe`.
+pub const WINDBG_MCP_MIN_VERSION: &str = "1.2610.1001.0";
+
+fn parse_ver4(s: &str) -> [u64; 4] {
+    let mut a = [0u64; 4];
+    for (i, part) in s.split('.').take(4).enumerate() {
+        a[i] = part.parse().unwrap_or(0);
+    }
+    a
+}
+
+/// True if a WinDbg version string (e.g. "1.2610.1001.0") is new enough to host
+/// the MCP server.
+pub fn windbg_version_has_mcp(ver: &str) -> bool {
+    parse_ver4(ver) >= parse_ver4(WINDBG_MCP_MIN_VERSION)
+}
+
+/// Installed WinDbg (Store/MSIX) packages as (package dir, version string),
+/// newest first. The engine binaries (cdb.exe, DbgX.Shell.exe) and the MCP proxy
+/// (DbgX.Mcp.Proxy.exe) live under a versioned `Microsoft.WinDbg_*` folder in
+/// `%ProgramFiles%\WindowsApps`. Reading that folder can be ACL-restricted, in
+/// which case this returns empty and callers fall back to the GUI flow.
+pub fn windbg_packages() -> Vec<(PathBuf, String)> {
+    let mut out: Vec<(PathBuf, [u64; 4], String)> = Vec::new();
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        let wa = PathBuf::from(pf).join("WindowsApps");
+        if let Ok(rd) = std::fs::read_dir(&wa) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().to_string();
+                if let Some(rest) = name.strip_prefix("Microsoft.WinDbg_") {
+                    let ver = rest.split('_').next().unwrap_or("").to_string();
+                    out.push((e.path(), parse_ver4(&ver), ver));
+                }
+            }
+        }
+    }
+    out.sort_by_key(|e| std::cmp::Reverse(e.1));
+    out.into_iter().map(|(p, _, s)| (p, s)).collect()
+}
 
 /// Map an install key to its method, or None if we don't know how.
 pub fn install_method(key: &str) -> Option<InstallMethod> {
@@ -88,7 +136,8 @@ pub fn install_method(key: &str) -> Option<InstallMethod> {
             url: "https://download.sysinternals.com/files/SysinternalsSuite.zip",
             exe: "procdump.exe",
         },
-        "windbg" | "ttd" => InstallMethod::Winget("Microsoft.WinDbg"),
+        // WinDbg itself, TTD, and the MCP proxy all ship in the WinDbg package.
+        "windbg" | "ttd" | "windbg-mcp" => InstallMethod::Winget("Microsoft.WinDbg"),
         // The classic Debugging Tools (cdb/gflags/umdh/symchk) + WPT ship in the SDK.
         "windows-sdk" | "sdk" | "cdb" | "gflags" | "umdh" | "symchk" | "wpr" | "wpt" => {
             InstallMethod::Winget("Microsoft.WindowsSDK")
@@ -208,9 +257,19 @@ fn known_dirs() -> Vec<PathBuf> {
     v.push(PathBuf::from(r"C:\Tools\Sysinternals"));
     v.push(PathBuf::from(r"C:\Tools\WinDbg"));
     v.push(PathBuf::from(r"C:\Tools"));
+    // WinDbg (Store/MSIX) package dirs: cdb.exe, DbgX.Shell.exe, and the MCP
+    // proxy DbgX.Mcp.Proxy.exe live under a versioned Microsoft.WinDbg_* folder.
+    for (dir, _) in windbg_packages() {
+        v.push(dir.join("amd64"));
+        v.push(dir);
+    }
     // dotnet global tools (dotnet-dump / -gcdump / -trace).
     if let Ok(up) = std::env::var("USERPROFILE") {
         v.push(PathBuf::from(&up).join(r".dotnet\tools"));
+    }
+    // npm global bin (rea.cmd from `npm i -g rea-agents`).
+    if let Ok(ad) = std::env::var("APPDATA") {
+        v.push(PathBuf::from(&ad).join("npm"));
     }
     // TTD may install as an MSIX app here.
     if let Ok(la) = std::env::var("LOCALAPPDATA") {
@@ -225,14 +284,32 @@ mod tests {
 
     #[test]
     fn vendor_classifies_microsoft_and_third_party() {
-        for ms in ["procdump", "ProcMon", "windbg", "cdb", "gflags", "dotnet-trace", "poolmon"] {
+        for ms in ["procdump", "ProcMon", "windbg", "cdb", "gflags", "dotnet-trace", "poolmon", "windbg-mcp"] {
             assert_eq!(vendor(ms), Vendor::Microsoft, "{ms}");
         }
-        for tp in ["cv2pdb", "CV2PDB", "groundhog"] {
+        for tp in ["cv2pdb", "CV2PDB", "groundhog", "rea", "REA"] {
             assert_eq!(vendor(tp), Vendor::ThirdParty, "{tp}");
         }
         // An unrecognised tool fails safe to third-party (needs the allowance).
         assert_eq!(vendor("some-random-tool"), Vendor::ThirdParty);
+    }
+
+    #[test]
+    fn windbg_mcp_is_microsoft_via_the_windbg_package() {
+        // The official WinDbg MCP proxy ships in the WinDbg package.
+        assert_eq!(vendor("windbg-mcp"), Vendor::Microsoft);
+        assert!(matches!(install_method("windbg-mcp"), Some(InstallMethod::Winget("Microsoft.WinDbg"))));
+    }
+
+    #[test]
+    fn windbg_mcp_version_gate() {
+        use super::windbg_version_has_mcp;
+        assert!(windbg_version_has_mcp("1.2610.1001.0"));
+        assert!(windbg_version_has_mcp("1.2611.0.0"));
+        assert!(windbg_version_has_mcp("2.0.0.0"));
+        assert!(!windbg_version_has_mcp("1.2509.1001.0"));
+        assert!(!windbg_version_has_mcp("1.2610.1000.9"));
+        assert!(!windbg_version_has_mcp("garbage"));
     }
 
     #[test]
@@ -271,11 +348,13 @@ mod tests {
 
     #[test]
     fn known_tools_table_is_well_formed() {
-        // Every advertised tool has a non-empty key and an .exe name; the headline
+        // Every advertised tool has a non-empty key and a runnable file name
+        // (.exe for native tools, .cmd for npm-shim CLIs like rea); the headline
         // debugging tools must be present.
         for (key, exe) in KNOWN_TOOLS {
             assert!(!key.is_empty());
-            assert!(exe.to_lowercase().ends_with(".exe"), "{key} -> {exe}");
+            let e = exe.to_lowercase();
+            assert!(e.ends_with(".exe") || e.ends_with(".cmd"), "{key} -> {exe}");
         }
         let keys: Vec<_> = KNOWN_TOOLS.iter().map(|(k, _)| *k).collect();
         for want in ["procdump", "procmon", "windbg", "gflags"] {

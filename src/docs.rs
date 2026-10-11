@@ -70,6 +70,30 @@ pub const DOCS: &[(&str, &str, &str, &str)] = &[
         "https://github.com/rainers/cv2pdb",
         "Converts a binary's DWARF debug info into a cdb-readable PDB (mingw/g++, Rust-GNU).",
     ),
+    (
+        "windbg-mcp",
+        "WinDbg MCP",
+        "https://learn.microsoft.com/windows-hardware/drivers/debuggercmds/windbg-mcp-overview",
+        "Official WinDbg MCP server: bridges an AI client (stdio via DbgX.Mcp.Proxy.exe) to a live WinDbg session. Enabled in the WinDbg GUI; needs WinDbg >= 1.2610.1001.0.",
+    ),
+    (
+        "rea",
+        "Reverse Engineer Anything (REA, third-party)",
+        "https://github.com/morluto/rea",
+        "Third-party MCP server/CLI wrapping Ghidra/IDA/Hopper: static + dynamic binary RE across PE/ELF/Mach-O/.NET/Electron/APK. Install + register with `npx rea-agents setup`.",
+    ),
+    (
+        "verifier",
+        "Driver Verifier",
+        "https://learn.microsoft.com/windows-hardware/drivers/devtest/driver-verifier",
+        "Built-in verifier.exe stresses drivers to force latent bugs into immediate, debuggable bugchecks; settings apply after reboot and are reversible via /reset.",
+    ),
+    (
+        "wct",
+        "Wait Chain Traversal",
+        "https://learn.microsoft.com/windows/win32/debug/wait-chain-traversal",
+        "The OS API that reports what each thread is blocked on and who holds it, across processes - finds GUI hangs and cross-process deadlock cycles.",
+    ),
 ];
 
 /// Look up one tool's doc entry by key.

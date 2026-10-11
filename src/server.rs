@@ -199,6 +199,29 @@ pub struct SymbolsFromDwarfArgs {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WindbgMcpArgs {
+    /// Optionally open a live process (by pid) in WinDbg first, so there is a
+    /// session to enable MCP on and hand off to.
+    #[serde(default)]
+    pub open_pid: Option<u32>,
+    /// ...or open a dump file (.dmp) in WinDbg.
+    #[serde(default)]
+    pub open_dump: Option<String>,
+    /// Which AI client the handoff recipe targets: "vscode", "copilot-cli", or
+    /// "custom" (default — e.g. Claude Code / this agent).
+    #[serde(default)]
+    pub client: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReverseEngineerArgs {
+    /// Optional path to the binary/app to reverse-engineer (echoed into the REA
+    /// handoff recipe, e.g. an .exe/.dll, APK, or Electron app).
+    #[serde(default)]
+    pub target: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ChangesRevertArgs {
     /// The change id to undo (from changes.list).
     pub id: String,
@@ -1310,6 +1333,213 @@ fn gate_matrix() -> serde_json::Value {
     rows.into()
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct LiveTargetArgs {
+    /// Target process pid.
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// ...or exact process name.
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct MemoryReadArgs {
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Where to read: "<module>+0x<rva>" (resolved against the live module base, ASLR-aware) or a raw VA "0x7ff6...".
+    pub address: String,
+    /// Number of bytes to read (default 64, max 4096).
+    #[serde(default = "default_read_len")]
+    pub len: usize,
+}
+fn default_read_len() -> usize { 64 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct PerfCountersArgs {
+    #[serde(default)]
+    pub pid: Option<u32>,
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Number of samples (default 3, max 30).
+    #[serde(default = "default_samples")]
+    pub samples: u32,
+    /// Seconds between samples (default 1, max 10).
+    #[serde(default = "default_interval")]
+    pub interval_sec: u32,
+}
+fn default_samples() -> u32 { 3 }
+fn default_interval() -> u32 { 1 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct WerListArgs {
+    /// Look back this many hours (default 72).
+    #[serde(default = "default_hours")]
+    pub since_hours: u64,
+    /// Optional image-name filter, e.g. "myapp.exe".
+    #[serde(default)]
+    pub image: Option<String>,
+}
+fn default_hours() -> u64 { 72 }
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SymbolsDownloadArgs {
+    /// A dump id/path, or a module/binary path, to fetch matching symbols for.
+    pub target: String,
+    /// Symbol path (default: current _NT_SYMBOL_PATH, else the public server + local cache).
+    #[serde(default)]
+    pub sympath: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DumpCompareArgs {
+    /// Baseline ("good") dump id or path.
+    pub dump_a: String,
+    /// Comparison ("bad") dump id or path.
+    pub dump_b: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DumpRedactArgs {
+    /// Dump id or path to scan and redact.
+    pub dump: String,
+    /// Output path for the redacted copy (default: "<name>.redacted.dmp" beside the original).
+    #[serde(default)]
+    pub out: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct TriageArgs {
+    /// Live target pid...
+    #[serde(default)]
+    pub pid: Option<u32>,
+    /// ...or process name...
+    #[serde(default)]
+    pub name: Option<String>,
+    /// ...or an existing dump id/path (skips capture).
+    #[serde(default)]
+    pub dump: Option<String>,
+    /// Symptom to focus on: "hang" | "crash" | "highcpu" | "highmem" | "handles" | "auto" (default).
+    #[serde(default)]
+    pub symptom: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CpuSampleArgs {
+    /// Sampling duration in seconds (default 10, max 120).
+    #[serde(default = "default_dur")]
+    pub duration_sec: u64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct KernelVerifierArgs {
+    /// Driver image(s) to verify, e.g. ["mydriver.sys"]. Scope to specific drivers; omit with all=true to verify every driver (heavy).
+    #[serde(default)]
+    pub drivers: Vec<String>,
+    /// Verify every driver (verifier /all) - heavy; prefer scoping to specific drivers.
+    #[serde(default)]
+    pub all: bool,
+    /// Turn Driver Verifier OFF entirely (verifier /reset). Takes effect after reboot.
+    #[serde(default)]
+    pub reset: bool,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+/// PowerShell for perf.counters: sample a process N times, incl. GDI/USER object counts.
+const PERF_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
+if(-not ([System.Management.Automation.PSTypeName]'HbGui').Type){ Add-Type @"
+using System;using System.Runtime.InteropServices;
+public class HbGui { [DllImport("user32.dll")] public static extern int GetGuiResources(IntPtr h,int f); }
+"@ }
+$out=@()
+for($i=0;$i -lt __N__;$i++){
+  $p=Get-Process -Id __PID__ -ErrorAction SilentlyContinue
+  if(-not $p){ break }
+  try { $gdi=[HbGui]::GetGuiResources($p.Handle,0); $usr=[HbGui]::GetGuiResources($p.Handle,1) } catch { $gdi=-1; $usr=-1 }
+  $out += [pscustomobject]@{ t=(Get-Date).ToString('o'); wsMB=[math]::Round($p.WorkingSet64/1MB,1); privMB=[math]::Round($p.PrivateMemorySize64/1MB,1); handles=$p.HandleCount; threads=$p.Threads.Count; gdi=$gdi; user=$usr; cpuSec=[math]::Round($p.TotalProcessorTime.TotalSeconds,2) }
+  if($i -lt (__N__-1)){ Start-Sleep -Seconds __IV__ }
+}
+$out | ConvertTo-Json -Compress"#;
+
+/// PowerShell for wer.list: recent crash events + WER report folders.
+const WER_SCRIPT: &str = r#"$ErrorActionPreference='SilentlyContinue'
+$since=(Get-Date).AddHours(-__HOURS__)
+$app = Get-WinEvent -FilterHashtable @{LogName='Application'; Id=1000,1002,1026; StartTime=$since} -MaxEvents 80 -ErrorAction SilentlyContinue __FILTER__ | ForEach-Object { $m=($_.Message -replace "\s+"," "); [pscustomobject]@{ time=$_.TimeCreated.ToString('o'); id=$_.Id; provider=$_.ProviderName; msg=$m.Substring(0,[Math]::Min(300,$m.Length)) } }
+$sys = Get-WinEvent -FilterHashtable @{LogName='System'; Id=1001,41; StartTime=$since} -MaxEvents 40 -ErrorAction SilentlyContinue | ForEach-Object { $m=($_.Message -replace "\s+"," "); [pscustomobject]@{ time=$_.TimeCreated.ToString('o'); id=$_.Id; provider=$_.ProviderName; msg=$m.Substring(0,[Math]::Min(300,$m.Length)) } }
+$wer = Get-ChildItem 'C:\ProgramData\Microsoft\Windows\WER\ReportArchive','C:\ProgramData\Microsoft\Windows\WER\ReportQueue' -Directory -ErrorAction SilentlyContinue | Sort-Object LastWriteTime -Descending | Select-Object -First 30 | ForEach-Object { [pscustomobject]@{ name=$_.Name; time=$_.LastWriteTime.ToString('o'); path=$_.FullName } }
+[pscustomobject]@{ applicationErrors=$app; systemErrors=$sys; werReports=$wer } | ConvertTo-Json -Depth 4 -Compress"#;
+
+/// Overwrite likely-secret runs (keyword + a following value run, ASCII and UTF-16LE) with '*'
+/// in a dump's bytes. Returns per-keyword hit counts. Best-effort, not a guarantee.
+fn redact_secrets(bytes: &mut [u8]) -> Vec<(&'static str, usize)> {
+    const KW: [&str; 11] = [
+        "password", "passwd", "pwd=", "secret", "api_key", "apikey", "Bearer ", "AKIA",
+        "AccountKey=", "SharedAccessKey", "-----BEGIN",
+    ];
+    let mut counts = Vec::new();
+    for kw in KW {
+        let mut c = redact_pattern(bytes, kw.as_bytes());
+        let mut wide = Vec::with_capacity(kw.len() * 2);
+        for &b in kw.as_bytes() {
+            wide.push(b);
+            wide.push(0);
+        }
+        c += redact_pattern(bytes, &wide);
+        if c > 0 {
+            counts.push((kw, c));
+        }
+    }
+    counts
+}
+
+/// Find each occurrence of `pat` (ASCII case-insensitive) and overwrite it plus a following
+/// value run (up to 96 bytes, until a delimiter or two consecutive NULs) with '*'.
+fn redact_pattern(bytes: &mut [u8], pat: &[u8]) -> usize {
+    if pat.is_empty() || bytes.len() < pat.len() {
+        return 0;
+    }
+    let mut count = 0usize;
+    let mut i = 0usize;
+    while i + pat.len() <= bytes.len() {
+        let matched = bytes[i..i + pat.len()].iter().zip(pat).all(|(b, p)| b.eq_ignore_ascii_case(p));
+        if matched {
+            let cap = (i + pat.len() + 96).min(bytes.len());
+            let mut j = i;
+            let mut zeros = 0u8;
+            while j < cap {
+                let b = bytes[j];
+                if j >= i + pat.len() {
+                    if b == 0 {
+                        zeros += 1;
+                        if zeros >= 2 {
+                            break;
+                        }
+                    } else {
+                        zeros = 0;
+                        if matches!(b, b'\n' | b'\r' | b'"' | b'\'' | b'&' | b';' | b'<' | b'>') {
+                            break;
+                        }
+                    }
+                }
+                if b != 0 {
+                    bytes[j] = b'*';
+                }
+                j += 1;
+            }
+            count += 1;
+            i = j.max(i + 1);
+        } else {
+            i += 1;
+        }
+    }
+    count
+}
+
 #[tool_router]
 impl Heisenberg {
     pub fn new(policy: Policy) -> Self {
@@ -1653,6 +1883,190 @@ impl Heisenberg {
     }
 
     #[tool(
+        name = "debug.windbgMcp",
+        description = "Hand off to the OFFICIAL WinDbg MCP server for interactive debugging: locate DbgX.Mcp.Proxy.exe, report whether WinDbg is new enough (>= 1.2610.1001.0), and emit the connect recipe (stdio MCP client config + the list_sessions/connect_session/show_output tools). Pass open_dump to open a dump HEADLESSLY via `-startmcp` (auto-starts the MCP server, no consent dialog, no GUI/desktop automation) - ideal after dump.capture. Pass open_pid to attach a live process (the MCP service must then be enabled in the WinDbg GUI; a live attach can't start headlessly). Read-only to the machine; complements Heisenberg's headless cdb analysis."
+    )]
+    async fn debug_windbg_mcp(
+        &self,
+        Parameters(a): Parameters<WindbgMcpArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "debug.windbgMcp";
+        let docs = crate::docs::lookup("windbg-mcp")
+            .map(|(_, _, u, _)| *u)
+            .unwrap_or("https://learn.microsoft.com/windows-hardware/drivers/debuggercmds/windbg-mcp-overview");
+        // Locate the proxy + the installed WinDbg package/version (best-effort; the
+        // WindowsApps package dir can be ACL-restricted, in which case we fall back
+        // to the GUI flow and name the proxy by file name only).
+        let pkgs = crate::tools::windbg_packages();
+        let (pkg_dir, version) = match pkgs.first().cloned() {
+            Some((d, v)) => (Some(d), Some(v)),
+            None => (None, None),
+        };
+        let version_ok = version.as_deref().map(crate::tools::windbg_version_has_mcp);
+        let proxy = self.state.locator.find("DbgX.Mcp.Proxy.exe").or_else(|| {
+            pkg_dir.as_ref().and_then(|d| {
+                ["", "amd64", "arm64", "x86"].into_iter().find_map(|sub| {
+                    let p = if sub.is_empty() {
+                        d.join("DbgX.Mcp.Proxy.exe")
+                    } else {
+                        d.join(sub).join("DbgX.Mcp.Proxy.exe")
+                    };
+                    p.is_file().then_some(p)
+                })
+            })
+        });
+        let proxy_display = proxy.as_ref().map(|p| p.display().to_string());
+        // Locate the WinDbg launcher (store alias or package DbgX.Shell.exe).
+        let windbg = self
+            .state
+            .locator
+            .find("WinDbgX.exe")
+            .or_else(|| self.state.locator.find("DbgX.Shell.exe"));
+        // Optionally open a target so there's a session to enable MCP on.
+        let mut launch_cmd: Option<String> = None;
+        let mut launch_note: Option<String> = None;
+        // Opening a DUMP can be fully headless: `-startmcp` auto-starts the MCP
+        // server on launch and bypasses the interactive consent dialog (it's the
+        // documented switch for automated workflows), so no GUI/desktop automation
+        // is needed. A live PID attach can't be headless - `-startmcp` ignores the
+        // target, and there's no MCP tool to attach one after start - so a live
+        // attach still requires enabling the MCP service in the WinDbg GUI.
+        let mut headless = false;
+        if a.open_pid.is_some() || a.open_dump.is_some() {
+            match &windbg {
+                Some(wd) => {
+                    let mut cmd = Command::new(wd);
+                    let desc = if let Some(dump) = a.open_dump.as_deref() {
+                        cmd.arg("-z").arg(dump).arg("-startmcp");
+                        headless = true;
+                        format!("{} -z \"{dump}\" -startmcp", wd.display())
+                    } else {
+                        let pid = a.open_pid.unwrap_or(0);
+                        cmd.arg("-p").arg(pid.to_string());
+                        format!("{} -p {pid}", wd.display())
+                    };
+                    match cmd.spawn() {
+                        Ok(_) => {
+                            launch_cmd = Some(desc);
+                            launch_note = Some(if headless {
+                                "WinDbg opened the dump with -startmcp: the MCP server auto-started headlessly (no consent dialog). Connect your client and go.".into()
+                            } else {
+                                "WinDbg attached to the live process. A live attach can't start the MCP server headlessly - enable the MCP service in its GUI, then connect your client.".into()
+                            });
+                        }
+                        Err(e) => launch_note = Some(format!("could not launch WinDbg: {e}")),
+                    }
+                }
+                None => {
+                    launch_note = Some("WinDbgX.exe/DbgX.Shell.exe not found to open the target; launch WinDbg manually.".into())
+                }
+            }
+        }
+        let client = a.client.as_deref().unwrap_or("custom").to_string();
+        let client_config = json!({
+            "transport": "stdio",
+            "command": proxy_display.clone().unwrap_or_else(|| "DbgX.Mcp.Proxy.exe".into()),
+            "note": "VS Code / GitHub Copilot CLI: use WinDbg's File > Settings > MCP service settings > Install MCP to register automatically. A custom client points at this stdio command.",
+        });
+        let enable_steps = json!([
+            "Headless (a dump): launch `WinDbgX.exe -z <dump.dmp> -startmcp` (or pass open_dump here) - the MCP server auto-starts, no consent dialog, no GUI.",
+            "Live attach (a pid): WinDbg can't start the MCP server headlessly on a live target - attach, then File > Settings > MCP service settings: Enable Server (or click MCP Service), confirm the consent.",
+            "Then in your AI client: list_sessions, connect_session(<windbg pid>), and show_output / get_target_state.",
+        ]);
+        let summary = match (&proxy_display, version_ok) {
+            (Some(p), Some(true)) => format!(
+                "WinDbg MCP ready: proxy at {p} (WinDbg {}); enable the MCP service in WinDbg, then connect_session.",
+                version.as_deref().unwrap_or("?")
+            ),
+            (_, Some(false)) => format!(
+                "WinDbg {} is too old for MCP (needs >= {}); update WinDbg, then enable the MCP service.",
+                version.as_deref().unwrap_or("?"),
+                crate::tools::WINDBG_MCP_MIN_VERSION
+            ),
+            _ => format!(
+                "WinDbg MCP proxy not located; install/update WinDbg (>= {}) and enable the MCP service in its GUI.",
+                crate::tools::WINDBG_MCP_MIN_VERSION
+            ),
+        };
+        self.state.audit.record(tool, &summary, None, "ok", None);
+        let mut out = Outcome::new(tool, summary)
+            .data(json!({
+                "proxyExe": "DbgX.Mcp.Proxy.exe",
+                "proxyPath": proxy_display,
+                "windbgVersion": version,
+                "versionOk": version_ok,
+                "minVersion": crate::tools::WINDBG_MCP_MIN_VERSION,
+                "client": client,
+                "clientConfig": client_config,
+                "connectionTools": ["list_sessions", "connect_session", "disconnect_session"],
+                "builtinPrompts": ["investigate_symbol_loading_issues", "write_extension", "create_graph", "configure_ttd"],
+                "enableSteps": enable_steps,
+                "launched": launch_cmd.is_some(),
+                "headless": headless,
+                "launchNote": launch_note,
+            }))
+            .docs(docs)
+            .warn("Dumps start headlessly via `-startmcp` (no GUI). A live-process attach can't: WinDbg requires enabling the MCP service in its GUI (an intentional consent gate).")
+            .warn("Secure Mode is on by default and blocks high-risk commands (e.g. .shell). XPIA (cross-prompt-injection) protection routes command output through the client's model via MCP sampling; non-model clients can't satisfy it, so it's disabled per box in WinDbg's MCP settings - use only on authorized targets.");
+        if let Some(c) = launch_cmd {
+            out = out.command(c);
+        }
+        Ok(text(out.to_value()))
+    }
+
+    #[tool(
+        name = "re.reverseEngineer",
+        description = "Hand off to REA (Reverse Engineer Anything), a THIRD-PARTY MCP server/CLI wrapping Ghidra/IDA/Hopper for deep binary RE (PE/ELF/Mach-O/.NET/Electron/APK) when there's no source. Locates the `rea` CLI and emits the install + MCP-registration recipe (`npx rea-agents setup`) and capabilities. Read-only to the machine; blocked when the box policy restricts tooling to Microsoft-published only."
+    )]
+    async fn re_reverse_engineer(
+        &self,
+        Parameters(a): Parameters<ReverseEngineerArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "re.reverseEngineer";
+        let docs = crate::docs::lookup("rea")
+            .map(|(_, _, u, _)| *u)
+            .unwrap_or("https://github.com/morluto/rea");
+        if let Err(e) = self.require_tool_allowed(tool, "rea", docs) {
+            return Ok(e);
+        }
+        let rea = self
+            .state
+            .locator
+            .find("rea.cmd")
+            .or_else(|| self.state.locator.find("rea.exe"));
+        let rea_display = rea.as_ref().map(|p| p.display().to_string());
+        let installed = rea.is_some();
+        let summary = if installed {
+            format!(
+                "REA found at {}; it registers its MCP server with your agent via `rea setup`. Deep binary RE (Ghidra/IDA/Hopper) hands off to REA.",
+                rea_display.as_deref().unwrap_or("rea")
+            )
+        } else {
+            "REA not installed. Install + register with `npx rea-agents setup` (needs Node >= 22.19), then restart your agent to pick up its MCP tools.".to_string()
+        };
+        self.state.audit.record(tool, &summary, None, "ok", None);
+        Ok(text(
+            Outcome::new(tool, summary)
+                .data(json!({
+                    "cli": "rea",
+                    "path": rea_display,
+                    "installed": installed,
+                    "npmPackage": "rea-agents",
+                    "install": "npx rea-agents setup",
+                    "oneOff": "npx rea-agents@latest analyze-javascript-application <path> --json",
+                    "update": "rea update",
+                    "requires": "Node.js >= 22.19 (22.x), >= 24.11 (24.x), or 26+",
+                    "registersWith": ["Claude Code", "Codex", "Cursor", "Gemini CLI", "Grok"],
+                    "capabilities": "41 inspection tools + 14 workflows across Mach-O/ELF/PE, .NET, Electron, websites and Android APKs; local static + dynamic analysis.",
+                    "target": a.target,
+                }))
+                .docs(docs)
+                .warn("REA is a third-party MCP server and pulls in backends (Ghidra, and commercial IDA if configured). Treat AI-generated/loaded scripts and extensions as untrusted; use only on authorized targets.")
+                .to_value(),
+        ))
+    }
+
+    #[tool(
         name = "memory.patch",
         description = "Write bytes into a LIVE process's memory (WriteProcessMemory) - e.g. to patch code in place. Address is \"<module>+0x<rva>\" (resolved against the live module base, so it tracks ASLR) or a raw VA. State-changing, reversible via the ledger (restores the original bytes if the process is still alive); needs elevation. dry_run + confirm."
     )]
@@ -1727,6 +2141,531 @@ impl Heisenberg {
                 self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
                 Ok(text(error(tool, ErrorKind::Internal, format!("WriteProcessMemory failed: {e}"), "check rights and the address", Some(docs))))
             }
+        }
+    }
+
+    /// Run `lm1m; ~; q` on a dump and return (lowercased module-name set, thread count).
+    async fn dump_mods_threads(
+        &self,
+        tool: &str,
+        dump_ref: &str,
+    ) -> Result<(std::collections::HashSet<String>, usize), CallToolResult> {
+        let (_path, raw, _cmd) = self.run_cdb_on(tool, dump_ref, "lm1m; ~; q").await?;
+        let mut mods = std::collections::HashSet::new();
+        let mut threads = 0usize;
+        for line in raw.lines() {
+            let t = line.trim();
+            // lm1m rows start with a "<hi>`<lo>" address; the 3rd token is the module name.
+            if line.contains('`') {
+                if let Some(name) = t.split_whitespace().nth(2) {
+                    if name.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false) {
+                        mods.insert(name.to_ascii_lowercase());
+                    }
+                }
+            }
+            // `~` lists one thread per line, each carrying "Id:".
+            if t.contains("Id:") {
+                threads += 1;
+            }
+        }
+        Ok((mods, threads))
+    }
+
+    // ---- dump-based read-only analyses (reuse simple_analyze / cdb) ----
+
+    #[tool(
+        name = "kernel.analyze",
+        description = "Run !analyze -v on a KERNEL dump (MEMORY.DMP / a kernel minidump) to decode a bugcheck - the stop code, the faulting module, and the probable cause. Read-only; needs cdb."
+    )]
+    async fn kernel_analyze(
+        &self,
+        Parameters(a): Parameters<DumpAnalyzeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.simple_analyze("kernel.analyze", &a.dump, a.commands.as_deref(), "!analyze -v; lm t; q").await
+    }
+
+    #[tool(
+        name = "kernel.poolAnalyze",
+        description = "Summarize kernel pool usage in a KERNEL dump (!poolused) to find the tag leaking paged/nonpaged pool, plus a memory overview (!vm). Read-only; needs cdb and a kernel dump."
+    )]
+    async fn kernel_pool_analyze(
+        &self,
+        Parameters(a): Parameters<DumpAnalyzeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.simple_analyze("kernel.poolAnalyze", &a.dump, a.commands.as_deref(), "!vm; !poolused 2; q").await
+    }
+
+    #[tool(
+        name = "inspect.addressSpace",
+        description = "Break down a process dump's address space (!address -summary then the regions) - committed / reserved / free / image / heap / stack - for memory-footprint and leak triage. Read-only; needs cdb."
+    )]
+    async fn inspect_address_space(
+        &self,
+        Parameters(a): Parameters<DumpAnalyzeArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        self.simple_analyze("inspect.addressSpace", &a.dump, a.commands.as_deref(), "!address -summary; !address; q").await
+    }
+
+    // ---- CLI / PowerShell read-only ----
+
+    #[tool(
+        name = "inspect.drivers",
+        description = "List installed kernel drivers (driverquery) with their type, link date, and path, plus signing status. Read-only."
+    )]
+    async fn inspect_drivers(&self) -> Result<CallToolResult, McpError> {
+        let tool = "inspect.drivers";
+        let docs = "https://learn.microsoft.com/windows-server/administration/windows-commands/driverquery";
+        let output = tokio::time::timeout(Duration::from_secs(60), Command::new("driverquery.exe").args(["/v", "/fo", "csv"]).output()).await;
+        match output {
+            Ok(Ok(o)) => {
+                let raw = String::from_utf8_lossy(&o.stdout).to_string();
+                let count = raw.lines().count().saturating_sub(1);
+                self.state.audit.record(tool, "drivers enumerated", None, "captured", None);
+                Ok(text(Outcome::new(tool, format!("{count} drivers")).data(json!({ "count": count, "csv": last_chars(&raw, 12000) })).command("driverquery /v /fo csv").docs(docs).to_value()))
+            }
+            Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to run driverquery: {e}"), "driverquery ships with Windows", Some(docs)))),
+            Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "driverquery timed out", "retry", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "inspect.mitigations",
+        description = "Show a live process's exploit-mitigation policy (DEP, ASLR, CFG, CET shadow stack, signature/dynamic-code policies) via Get-ProcessMitigation. Read-only."
+    )]
+    async fn inspect_mitigations(
+        &self,
+        Parameters(a): Parameters<LiveTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "inspect.mitigations";
+        let docs = "https://learn.microsoft.com/powershell/module/processmitigations/get-processmitigation";
+        let pid = match self.resolve_pid(tool, a.pid, a.name.as_deref(), docs) { Ok(p) => p, Err(e) => return Ok(e) };
+        let script = format!("$ErrorActionPreference='SilentlyContinue'; Get-ProcessMitigation -Id {pid} | ConvertTo-Json -Depth 4 -Compress");
+        let output = tokio::time::timeout(Duration::from_secs(60), Command::new("powershell").args(["-NoProfile", "-Command", &script]).output()).await;
+        match output {
+            Ok(Ok(o)) => {
+                let raw = String::from_utf8_lossy(&o.stdout).to_string();
+                let parsed: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or(json!(raw.trim()));
+                self.state.audit.record(tool, &format!("mitigations for pid {pid}"), None, "captured", None);
+                Ok(text(Outcome::new(tool, format!("mitigation policy for pid {pid}")).data(json!({ "pid": pid, "mitigations": parsed })).command(format!("Get-ProcessMitigation -Id {pid}")).docs(docs).to_value()))
+            }
+            Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to run powershell: {e}"), "check powershell", Some(docs)))),
+            Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "Get-ProcessMitigation timed out", "retry", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "perf.counters",
+        description = "Sample a live process's resource counters over time - working set, private bytes, handle count, thread count, GDI and USER objects, and CPU seconds - to catch leaks and runaway growth. Read-only."
+    )]
+    async fn perf_counters(
+        &self,
+        Parameters(a): Parameters<PerfCountersArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "perf.counters";
+        let docs = "https://learn.microsoft.com/windows-server/administration/windows-commands/typeperf";
+        let pid = match self.resolve_pid(tool, a.pid, a.name.as_deref(), docs) { Ok(p) => p, Err(e) => return Ok(e) };
+        let n = a.samples.clamp(1, 30);
+        let iv = a.interval_sec.clamp(1, 10);
+        let script = PERF_SCRIPT.replace("__PID__", &pid.to_string()).replace("__N__", &n.to_string()).replace("__IV__", &iv.to_string());
+        let output = tokio::time::timeout(Duration::from_secs((n as u64 * iv as u64) + 60), Command::new("powershell").args(["-NoProfile", "-Command", &script]).output()).await;
+        match output {
+            Ok(Ok(o)) => {
+                let raw = String::from_utf8_lossy(&o.stdout).to_string();
+                let parsed: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or(json!(raw.trim()));
+                self.state.audit.record(tool, &format!("perf counters for pid {pid}"), None, "captured", None);
+                Ok(text(Outcome::new(tool, format!("{n} samples of pid {pid}")).data(json!({ "pid": pid, "samples": parsed })).docs(docs).to_value()))
+            }
+            Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to run powershell: {e}"), "check powershell", Some(docs)))),
+            Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "perf sampling timed out", "retry", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "wer.list",
+        description = "List recent crashes on this box - Application Error (1000), App Hang (1002), .NET Runtime (1026) and bugcheck (1001) events, plus the WER ReportArchive/ReportQueue folders (any dumps already collected). The entry point for \"what's been crashing\". Read-only."
+    )]
+    async fn wer_list(
+        &self,
+        Parameters(a): Parameters<WerListArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "wer.list";
+        let docs = "https://learn.microsoft.com/windows/win32/wer/windows-error-reporting";
+        let hours = a.since_hours.clamp(1, 24 * 90);
+        let filter = match &a.image {
+            Some(img) => format!("| Where-Object {{ $_.message -like '*{}*' }}", img.replace('\'', "")),
+            None => String::new(),
+        };
+        let script = WER_SCRIPT.replace("__HOURS__", &hours.to_string()).replace("__FILTER__", &filter);
+        let output = tokio::time::timeout(Duration::from_secs(90), Command::new("powershell").args(["-NoProfile", "-Command", &script]).output()).await;
+        match output {
+            Ok(Ok(o)) => {
+                let raw = String::from_utf8_lossy(&o.stdout).to_string();
+                let parsed: serde_json::Value = serde_json::from_str(raw.trim()).unwrap_or(json!(raw.trim()));
+                self.state.audit.record(tool, "WER crash history listed", None, "captured", None);
+                Ok(text(Outcome::new(tool, format!("recent crashes (last {hours}h)")).data(json!({ "sinceHours": hours, "crashes": parsed })).docs(docs).warn("to auto-dump future crashes of an image use dump.onCrashInstall").to_value()))
+            }
+            Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to run powershell: {e}"), "check powershell", Some(docs)))),
+            Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "WER query timed out", "retry with a smaller since_hours", Some(docs)))),
+        }
+    }
+
+    // ---- live (non-dump) process inspection ----
+
+    #[tool(
+        name = "inspect.stacks",
+        description = "Grab every thread's call stack and the loaded modules of a LIVE process (noninvasive cdb -pv: ~*kb; lm) - a fast first look without capturing a full, sensitive dump. Read-only; needs cdb; cross-user/elevated targets need SeDebug."
+    )]
+    async fn inspect_stacks(
+        &self,
+        Parameters(a): Parameters<LiveTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "inspect.stacks";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/";
+        let pid = match self.resolve_pid(tool, a.pid, a.name.as_deref(), docs) { Ok(p) => p, Err(e) => return Ok(e) };
+        let cdb = match self.state.locator.find("cdb.exe") {
+            Some(p) => p,
+            None => { let mut v = error(tool, ErrorKind::ToolNotInstalled, "cdb.exe not found", "install the Debugging Tools for Windows (winget install Microsoft.WinDbg)", Some(docs)); v["error"]["wingetId"] = json!("Microsoft.WinDbg"); return Ok(text(v)); }
+        };
+        let sympath = self.symbol_path(None);
+        let cmds = "~*kb; lm t; q";
+        let cmd_str = format!("{} -pv -p {pid} -y \"{}\" -c \"{cmds}\"", cdb.display(), sympath);
+        // -pv = noninvasive: it freezes the target to read it and never kills it on quit.
+        let output = tokio::time::timeout(Duration::from_secs(120), Command::new(&cdb).arg("-pv").arg("-p").arg(pid.to_string()).arg("-y").arg(&sympath).arg("-c").arg(cmds).output()).await;
+        match output {
+            Ok(Ok(o)) => {
+                let raw = String::from_utf8_lossy(&o.stdout).to_string();
+                let sym_missing = raw.contains("could not be loaded") || raw.contains("could not be found");
+                let mut out = Outcome::new(tool, format!("captured live stacks + modules of pid {pid}")).data(json!({ "pid": pid, "raw": last_chars(&raw, 10000) })).command(cmd_str).docs(docs);
+                if sym_missing { out = out.warn("some symbols could not be loaded; frames may show module+offset"); }
+                self.state.audit.record(tool, &format!("live stacks of pid {pid}"), None, "captured", None);
+                Ok(text(out.to_value()))
+            }
+            Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch cdb: {e}"), "check the cdb path", Some(docs)))),
+            Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "cdb timed out", "retry once symbols are cached", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "analyze.waitChain",
+        description = "Ask the OS (Wait Chain Traversal API) what each thread of a LIVE process is blocked on and who holds it - ACROSS processes. Finds GUI hangs and cross-process deadlocks that a single process's !locks can't see; flags cycles as deadlocks. Read-only; native Win32, no cdb needed; cross-user/elevated targets need SeDebug."
+    )]
+    async fn analyze_wait_chain(
+        &self,
+        Parameters(a): Parameters<LiveTargetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "analyze.waitChain";
+        let docs = "https://learn.microsoft.com/windows/win32/debug/wait-chain-traversal";
+        let pid = match self.resolve_pid(tool, a.pid, a.name.as_deref(), docs) { Ok(p) => p, Err(e) => return Ok(e) };
+        match crate::wct::wait_chains(pid) {
+            Ok(v) => {
+                let deadlock = v.get("deadlockDetected").and_then(|b| b.as_bool()).unwrap_or(false);
+                let mut out = Outcome::new(tool, format!("walked the OS wait chains of pid {pid}")).data(v).docs(docs);
+                if deadlock {
+                    out = out.warn("a deadlock CYCLE was detected: threads in the chain wait on each other. Confirm with inspect.stacks or a full dump.");
+                }
+                self.state.audit.record(tool, &format!("wait-chain of pid {pid}"), None, if deadlock { "deadlock-detected" } else { "captured" }, None);
+                Ok(text(out.to_value()))
+            }
+            Err(e) => Ok(text(error(tool, ErrorKind::Internal, format!("wait-chain traversal failed: {e}"), "ensure the pid exists; cross-user/elevated targets need an elevated Heisenberg (SeDebug)", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "memory.read",
+        description = "Read bytes from a LIVE process's memory (ReadProcessMemory) and return them as hex + ASCII. Address is \"<module>+0x<rva>\" (resolved against the live module base, ASLR-aware) or a raw VA. Read-only; cross-user/elevated targets need SeDebug (elevation)."
+    )]
+    async fn memory_read(
+        &self,
+        Parameters(a): Parameters<MemoryReadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "memory.read";
+        let docs = PATCH_DOCS;
+        let pid = match self.resolve_pid(tool, a.pid, a.name.as_deref(), docs) { Ok(p) => p, Err(e) => return Ok(e) };
+        let len = a.len.clamp(1, 4096);
+        let (module, val) = match split_module_addr(&a.address) {
+            Some(x) => x,
+            None => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad address '{}'", a.address), "use \"module+0xrva\" or a raw \"0xVA\"", Some(docs)))),
+        };
+        let address = match &module {
+            Some(m) => match proc::module_base(pid, m) {
+                Some(base) => base + val,
+                None => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("module '{m}' not loaded in pid {pid}"), "check the module name", Some(docs)))),
+            },
+            None => val,
+        };
+        match crate::patch::read_process_memory(pid, address, len) {
+            Ok(bytes) => {
+                let ascii: String = bytes.iter().map(|&b| if (0x20..0x7f).contains(&b) { b as char } else { '.' }).collect();
+                self.state.audit.record(tool, &format!("read {len} bytes from pid {pid} at 0x{address:x}"), None, "read", None);
+                Ok(text(Outcome::new(tool, format!("read {len} bytes from pid {pid} at 0x{address:x}")).data(json!({ "pid": pid, "address": format!("0x{address:x}"), "len": bytes.len(), "hex": hex(&bytes), "ascii": ascii })).command(format!("ReadProcessMemory(pid {pid}, 0x{address:x}, {len})")).docs(docs).to_value()))
+            }
+            Err(e) => Ok(text(error(tool, ErrorKind::AccessDenied, format!("ReadProcessMemory failed: {e}"), "check the address is mapped; cross-user/elevated targets need an elevated Heisenberg (SeDebug)", Some(docs)))),
+        }
+    }
+
+    // ---- dump compare / redact ----
+
+    #[tool(
+        name = "dump.compare",
+        description = "Diff two process dumps (a good vs a bad one): which modules were added/removed and the thread-count delta - a quick regression triage. Read-only; needs cdb."
+    )]
+    async fn dump_compare(
+        &self,
+        Parameters(a): Parameters<DumpCompareArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.compare";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/";
+        let (mods_a, thr_a) = match self.dump_mods_threads(tool, &a.dump_a).await { Ok(x) => x, Err(e) => return Ok(e) };
+        let (mods_b, thr_b) = match self.dump_mods_threads(tool, &a.dump_b).await { Ok(x) => x, Err(e) => return Ok(e) };
+        let added: Vec<&String> = mods_b.iter().filter(|m| !mods_a.contains(*m)).collect();
+        let removed: Vec<&String> = mods_a.iter().filter(|m| !mods_b.contains(*m)).collect();
+        self.state.audit.record(tool, "compared two dumps", None, "analyzed", None);
+        Ok(text(Outcome::new(tool, format!("A: {} modules / {thr_a} threads  vs  B: {} modules / {thr_b} threads", mods_a.len(), mods_b.len()))
+            .data(json!({ "modulesOnlyInB": added, "modulesOnlyInA": removed, "threadDelta": thr_b as i64 - thr_a as i64, "threadsA": thr_a, "threadsB": thr_b }))
+            .docs(docs).to_value()))
+    }
+
+    #[tool(
+        name = "dump.redact",
+        description = "Scan a dump for likely secrets (passwords, API keys, bearer/JWT tokens, PEM private keys, connection strings - ASCII and UTF-16) and write a redacted COPY with those bytes overwritten, so a sensitive dump can be shared more safely. The original is untouched. Returns per-pattern hit counts. Not a guarantee - review before sharing."
+    )]
+    async fn dump_redact(
+        &self,
+        Parameters(a): Parameters<DumpRedactArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "dump.redact";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/";
+        let path = {
+            let reg = self.state.dumps.lock().unwrap();
+            let id = a.dump.trim_start_matches("heisenberg://dumps/");
+            reg.get(id).map(|r| r.path.clone()).unwrap_or_else(|| a.dump.clone())
+        };
+        if !std::path::Path::new(&path).is_file() {
+            return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no dump at {path}"), "pass a dump id or a valid path", Some(docs))));
+        }
+        let mut bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => return Ok(text(error(tool, ErrorKind::Internal, format!("could not read dump: {e}"), "check the path", Some(docs)))),
+        };
+        let counts = redact_secrets(&mut bytes);
+        let total: usize = counts.iter().map(|(_, c)| c).sum();
+        let out = a.out.unwrap_or_else(|| {
+            let p = std::path::Path::new(&path);
+            let stem = p.file_stem().and_then(|s| s.to_str()).unwrap_or("dump");
+            p.with_file_name(format!("{stem}.redacted.dmp")).display().to_string()
+        });
+        if let Err(e) = std::fs::write(&out, &bytes) {
+            return Ok(text(error(tool, ErrorKind::Internal, format!("could not write redacted copy: {e}"), "check the output path", Some(docs))));
+        }
+        self.state.audit.record(tool, &format!("redacted {total} secrets into {out}"), None, "redacted", None);
+        Ok(text(Outcome::new(tool, format!("redacted {total} likely secrets; wrote {out}"))
+            .data(json!({ "source": path, "redactedCopy": out, "totalRedactions": total, "byPattern": counts.iter().map(|(k, c)| json!({ "pattern": k, "count": c })).collect::<Vec<_>>() }))
+            .artifact(Artifact { kind: "dump".to_string(), path: out.clone(), bytes: bytes.len() as u64, resource: out, sensitivity: Some("medium".to_string()) })
+            .docs(docs)
+            .warn("best-effort: scans ASCII + UTF-16 keyword/value runs; encoded or unusual secrets may remain - review before sharing")
+            .to_value()))
+    }
+
+    // ---- symbols prefetch ----
+
+    #[tool(
+        name = "symbols.download",
+        description = "Prefetch and validate symbols so later offline analysis resolves names. For a dump: forces cdb to .reload /f all its modules (populating the local cache). For a module/binary path: runs symchk against it. Read-only (writes only to the symbol cache)."
+    )]
+    async fn symbols_download(
+        &self,
+        Parameters(a): Parameters<SymbolsDownloadArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "symbols.download";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/symchk";
+        let sympath = self.symbol_path(a.sympath.as_deref());
+        let looks_like_dump = a.target.ends_with(".dmp") || a.target.starts_with("heisenberg://dumps/") || a.target.starts_with("dmp-");
+        if looks_like_dump {
+            let path = {
+                let reg = self.state.dumps.lock().unwrap();
+                let id = a.target.trim_start_matches("heisenberg://dumps/");
+                reg.get(id).map(|r| r.path.clone()).unwrap_or_else(|| a.target.clone())
+            };
+            if !std::path::Path::new(&path).is_file() {
+                return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no dump at {path}"), "pass a dump id/path or a module path", Some(docs))));
+            }
+            match self.cdb_oneshot(&path, &sympath, ".reload /f; lm; q", 300).await {
+                Ok(raw) => {
+                    let loaded = raw.matches("(private pdb symbols)").count() + raw.matches("(pdb symbols)").count() + raw.matches("(public pdb symbols)").count();
+                    self.state.audit.record(tool, &format!("prefetched symbols for {path}"), None, "downloaded", None);
+                    Ok(text(Outcome::new(tool, format!("forced symbol load for {path}; {loaded} modules now have PDBs")).data(json!({ "target": path, "symbolPath": sympath, "modulesWithPdb": loaded, "raw": last_chars(&raw, 6000) })).command(format!("cdb -z \"{path}\" -y \"{sympath}\" -c \".reload /f; lm; q\"")).docs(docs).to_value()))
+                }
+                Err((k, m)) => Ok(text(error(tool, k, m, "install the Debugging Tools for Windows", Some(docs)))),
+            }
+        } else {
+            let symchk = match self.state.locator.find("symchk.exe") {
+                Some(p) => p,
+                None => { let mut v = error(tool, ErrorKind::ToolNotInstalled, "symchk.exe not found", "install the Windows SDK / Debugging Tools (winget install Microsoft.WindowsSDK)", Some(docs)); v["error"]["wingetId"] = json!("Microsoft.WindowsSDK"); return Ok(text(v)); }
+            };
+            if !std::path::Path::new(&a.target).exists() {
+                return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no file at {}", a.target), "pass a module/binary path or a dump", Some(docs))));
+            }
+            let args = vec!["/r".to_string(), a.target.clone(), "/s".to_string(), sympath.clone()];
+            let cmd_str = format!("symchk /r \"{}\" /s \"{sympath}\"", a.target);
+            let output = tokio::time::timeout(Duration::from_secs(300), Command::new(&symchk).args(&args).output()).await;
+            match output {
+                Ok(Ok(o)) => {
+                    let raw = format!("{}{}", String::from_utf8_lossy(&o.stdout), String::from_utf8_lossy(&o.stderr));
+                    self.state.audit.record(tool, &format!("symchk for {}", a.target), None, "downloaded", None);
+                    Ok(text(Outcome::new(tool, format!("ran symchk for {}", a.target)).data(json!({ "target": a.target, "symbolPath": sympath, "raw": last_chars(&raw, 6000) })).command(cmd_str).docs(docs).to_value()))
+                }
+                Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch symchk: {e}"), "check the symchk path", Some(docs)))),
+                Err(_) => Ok(text(error(tool, ErrorKind::Timeout, "symchk timed out", "retry", Some(docs)))),
+            }
+        }
+    }
+
+    // ---- symptom-driven auto triage ----
+
+    #[tool(
+        name = "triage.auto",
+        description = "One-call triage: capture a dump of a live pid/name (or use an existing dump), then run the cdb analyses that fit the symptom and return the raw findings + the dump. symptom: hang | crash | highcpu | highmem | handles | auto (default). For the full classified verdict see dump.diagnose."
+    )]
+    async fn triage_auto(
+        &self,
+        Parameters(a): Parameters<TriageArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "triage.auto";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/debugger/";
+        let symptom = a.symptom.as_deref().unwrap_or("auto").to_ascii_lowercase();
+        let cmds = match symptom.as_str() {
+            "hang" | "deadlock" => "!analyze -v -hang; !locks; !cs -l; !syncblk; ~*kb; q",
+            "crash" => "!analyze -v; ~*kb; lm t; q",
+            "highcpu" | "cpu" => "!runaway 7; ~*kb; q",
+            "highmem" | "memory" | "leak" => "!address -summary; !heap -s; ~*kb; q",
+            "handles" => "!handle 0 2; q",
+            _ => "!analyze -v; !locks; !runaway 7; ~*kb; lm t; q",
+        };
+        // Resolve a dump: use the provided one, else capture the live target.
+        let (dump_ref, captured): (String, Option<serde_json::Value>) = if let Some(d) = a.dump.clone() {
+            (d, None)
+        } else {
+            let pid = match self.resolve_pid(tool, a.pid, a.name.as_deref(), docs) { Ok(p) => p, Err(e) => return Ok(e) };
+            match self.capture_pid(tool, pid, true, docs).await {
+                Ok(c) => (c.path.clone(), Some(json!({ "dumpId": c.dump_id, "path": c.path, "bytes": c.bytes }))),
+                Err(e) => return Ok(e),
+            }
+        };
+        match self.run_cdb_on(tool, &dump_ref, cmds).await {
+            Ok((path, raw, cmd_str)) => {
+                self.state.audit.record(tool, &format!("triaged {path} ({symptom})"), None, "analyzed", None);
+                let mut out = Outcome::new(tool, format!("triaged {path} for '{symptom}'"))
+                    .data(json!({ "symptom": symptom, "dump": path, "captured": captured, "commands": cmds, "raw": last_chars(&raw, 9000) }))
+                    .command(cmd_str).docs(docs)
+                    .warn("AI-assisted triage - validate against the raw output; dump.diagnose gives a classified verdict");
+                if raw.contains("could not be loaded") { out = out.warn("some symbols missing; results may be incomplete"); }
+                Ok(text(out.to_value()))
+            }
+            Err(ct) => Ok(ct),
+        }
+    }
+
+    // ---- CPU sampling profile ----
+
+    #[tool(
+        name = "trace.cpuSample",
+        description = "Record a timed CPU-sampling profile of the whole system to an .etl (Windows Performance Recorder, CPU profile) for hot-path analysis in WPA. Read-only; needs elevation and wpr; only one WPR session at a time."
+    )]
+    async fn trace_cpu_sample(
+        &self,
+        Parameters(a): Parameters<CpuSampleArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "trace.cpuSample";
+        let docs = "https://learn.microsoft.com/windows-hardware/test/wpt/record-cpu-and-disk";
+        let wpr = match self.state.locator.find("wpr.exe") {
+            Some(p) => p,
+            None => return Ok(text(error(tool, ErrorKind::ToolNotInstalled, "wpr.exe not found", "install the Windows Performance Toolkit (part of the Windows SDK)", Some(docs)))),
+        };
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "WPR tracing needs an elevated token", "re-run Heisenberg elevated", Some(docs))));
+        }
+        let secs = a.duration_sec.clamp(1, 120);
+        let ts = chrono::Utc::now().format("%Y%m%dT%H%M%S");
+        let out = self.state.store.artifacts_dir().join(format!("cpu_{ts}.etl"));
+        let start = tokio::time::timeout(Duration::from_secs(60), Command::new(&wpr).args(["-start", "CPU", "-filemode"]).output()).await;
+        match start {
+            Ok(Ok(o)) if o.status.success() => {}
+            Ok(Ok(o)) => return Ok(text(error(tool, ErrorKind::AnalysisFailed, format!("wpr -start failed: {}", String::from_utf8_lossy(&o.stderr).trim()), "another WPR session may be running; run `wpr -cancel`", Some(docs)))),
+            Ok(Err(e)) => return Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch wpr: {e}"), "check the wpr path", Some(docs)))),
+            Err(_) => return Ok(text(error(tool, ErrorKind::Timeout, "wpr -start timed out", "retry", Some(docs)))),
+        }
+        tokio::time::sleep(Duration::from_secs(secs)).await;
+        let stop = tokio::time::timeout(Duration::from_secs(120), Command::new(&wpr).arg("-stop").arg(&out).output()).await;
+        let produced = out.is_file() && std::fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false);
+        match stop {
+            Ok(Ok(_)) if produced => {
+                let bytes = std::fs::metadata(&out).map(|m| m.len()).unwrap_or(0);
+                self.state.audit.record(tool, &format!("captured a {secs}s CPU profile"), None, "captured", None);
+                Ok(text(Outcome::new(tool, format!("captured a {secs}s CPU profile ({:.1} MB)", bytes as f64 / 1048576.0))
+                    .data(json!({ "durationSec": secs, "path": out.display().to_string(), "bytes": bytes }))
+                    .artifact(Artifact { kind: "etl".to_string(), path: out.display().to_string(), bytes, resource: out.display().to_string(), sensitivity: Some("medium".to_string()) })
+                    .command(format!("wpr -start CPU -filemode; (wait {secs}s); wpr -stop \"{}\"", out.display()))
+                    .docs(docs).warn("open the .etl in Windows Performance Analyzer (WPA) for the hot-path flame graph").to_value()))
+            }
+            Ok(Ok(o)) => { let _ = Command::new(&wpr).arg("-cancel").output().await; Ok(text(error(tool, ErrorKind::AnalysisFailed, format!("wpr -stop produced no .etl: {}", String::from_utf8_lossy(&o.stderr).trim()), "retry", Some(docs)))) }
+            Ok(Err(e)) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to stop wpr: {e}"), "run `wpr -cancel`", Some(docs)))),
+            Err(_) => { let _ = Command::new(&wpr).arg("-cancel").output().await; Ok(text(error(tool, ErrorKind::Timeout, "wpr -stop timed out", "run `wpr -cancel`", Some(docs)))) }
+        }
+    }
+
+    // ---- Driver Verifier (kernel-mode App Verifier analog) ----
+
+    #[tool(
+        name = "kernel.verifier",
+        description = "Configure Driver Verifier (verifier.exe) - the kernel-mode analog of App Verifier - to stress specific drivers with standard checks (special pool, IRQL, deadlock detection, etc.), or reset it off. State-changing, reversible via the ledger (verifier /reset); needs elevation and a REBOOT to take effect. dry_run + confirm."
+    )]
+    async fn kernel_verifier(
+        &self,
+        Parameters(a): Parameters<KernelVerifierArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "kernel.verifier";
+        let docs = "https://learn.microsoft.com/windows-hardware/drivers/devtest/driver-verifier";
+        let (args, desc, cmd): (Vec<String>, String, String) = if a.reset {
+            (vec!["/reset".into()], "turn Driver Verifier off (verifier /reset)".into(), "verifier /reset".into())
+        } else if a.all {
+            (vec!["/standard".into(), "/all".into()], "enable Driver Verifier standard checks for ALL drivers".into(), "verifier /standard /all".into())
+        } else if !a.drivers.is_empty() {
+            let clean: Vec<String> = a.drivers.iter().map(|d| d.replace(['"', '\'', '&', '|'], "")).collect();
+            let mut v = vec!["/standard".into(), "/driver".into()];
+            v.extend(clean.iter().cloned());
+            (v, format!("enable Driver Verifier standard checks for {}", clean.join(", ")), format!("verifier /standard /driver {}", clean.join(" ")))
+        } else {
+            return Ok(text(error(tool, ErrorKind::InvalidArgument, "nothing to do", "pass drivers:[...], or all:true, or reset:true", Some(docs))));
+        };
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(Outcome::new(tool, format!("[dry-run] would {desc} (gate: {:?})", decision.gate))
+                .data(json!({ "desc": desc, "gate": decision })).command(&cmd).docs(docs)
+                .warn("dry-run: no change made; Driver Verifier needs a REBOOT to take effect and can bugcheck a buggy driver on purpose").to_value()));
+        }
+        if !env_probe::is_elevated() {
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "Driver Verifier needs an elevated token", "re-run Heisenberg elevated", Some(docs))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, "kernel-verifier", a.confirm.as_deref(), &self.state.approvals) {
+            Ok(d) => d,
+            Err(b) => { self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None); return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs)))); }
+        };
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(tool, &desc, RevertPlan::Command { program: "verifier".into(), args: vec!["/reset".into()], describe: "verifier /reset (clears all Driver Verifier settings; reboot to apply)".into() })
+        };
+        let output = tokio::time::timeout(Duration::from_secs(60), Command::new("verifier.exe").args(&args).output()).await;
+        match output {
+            Ok(Ok(o)) if o.status.success() => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(tool, &desc, Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                Ok(text(Outcome::new(tool, format!("{desc}; change {id}")).data(json!({ "desc": desc, "changeId": id })).command(&cmd).docs(docs)
+                    .warn("REBOOT required for this to take effect; a verified buggy driver will bugcheck (that's the point - have a kernel debugger or crash-dump ready). Revert with changes.revert (verifier /reset) then reboot.").to_value()))
+            }
+            Ok(Ok(o)) => { self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed); Ok(text(error(tool, ErrorKind::AnalysisFailed, format!("verifier failed: {}", String::from_utf8_lossy(&o.stderr).trim()), "check the driver name(s)", Some(docs)))) }
+            Ok(Err(e)) => { self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed); Ok(text(error(tool, ErrorKind::Internal, format!("failed to launch verifier: {e}"), "verifier.exe ships with Windows", Some(docs)))) }
+            Err(_) => { self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed); Ok(text(error(tool, ErrorKind::Timeout, "verifier timed out", "retry", Some(docs)))) }
         }
     }
 
@@ -1957,7 +2896,7 @@ impl Heisenberg {
                     tool,
                     ErrorKind::InvalidArgument,
                     format!("don't know how to install '{}'", a.tool),
-                    "known: procdump, procmon, autoruns, psexec, sysinternals, windbg, windows-sdk, dotnet-dump, dotnet-gcdump, dotnet-trace, cv2pdb",
+                    "known: procdump, procmon, autoruns, psexec, sysinternals, windbg, windbg-mcp, windows-sdk, dotnet-dump, dotnet-gcdump, dotnet-trace, cv2pdb",
                     Some(docs),
                 )))
             }
@@ -6403,6 +7342,7 @@ ExceptionCode: c0000374\n";
             "dump.onExit",
             "env.provision",
             "gflags.set",
+            "kernel.verifier",
             "memory.patch",
             "kernel.netDebugSetup",
             "kernel.serialDebugSetup",
@@ -6482,5 +7422,60 @@ ExceptionCode: c0000374\n";
         let env: serde_json::Value = serde_json::from_str(txt).unwrap();
         assert_eq!(env["ok"], serde_json::json!(false), "must refuse: {env}");
         assert_eq!(env["error"]["kind"], serde_json::json!("PolicyDenied"), "{env}");
+    }
+
+    /// REA is third-party, so `re.reverseEngineer` is refused up front with
+    /// PolicyDenied when the box restricts tooling to Microsoft-published only.
+    #[tokio::test]
+    async fn re_reverse_engineer_refused_when_third_party_disallowed() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let home = std::env::temp_dir().join(format!("hb_rea_test_{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        std::env::set_var("HEISENBERG_HOME", &home);
+        let mut policy = crate::policy::Policy::default();
+        policy.class = crate::policy::BoxClass::Development;
+        policy.allow_third_party_tools = false;
+        let h = super::Heisenberg::new(policy);
+        let res = h
+            .re_reverse_engineer(Parameters(super::ReverseEngineerArgs { target: None }))
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res).unwrap();
+        let txt = v.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap();
+        let env: serde_json::Value = serde_json::from_str(txt).unwrap();
+        assert_eq!(env["ok"], serde_json::json!(false), "must refuse: {env}");
+        assert_eq!(env["error"]["kind"], serde_json::json!("PolicyDenied"), "{env}");
+    }
+
+    /// `debug.windbgMcp` is a Microsoft-vendor read-only handoff: it runs even on
+    /// a third-party-restricted box, and never claims the proxy without locating
+    /// it (version gate + GUI-enable caveat are always surfaced).
+    #[tokio::test]
+    async fn windbg_mcp_handoff_runs_and_is_honest() {
+        use rmcp::handler::server::wrapper::Parameters;
+        let home = std::env::temp_dir().join(format!("hb_wmcp_test_{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        std::env::set_var("HEISENBERG_HOME", &home);
+        let mut policy = crate::policy::Policy::default();
+        policy.class = crate::policy::BoxClass::Development;
+        policy.allow_third_party_tools = false;
+        let h = super::Heisenberg::new(policy);
+        let res = h
+            .debug_windbg_mcp(Parameters(super::WindbgMcpArgs {
+                open_pid: None,
+                open_dump: None,
+                client: None,
+            }))
+            .await
+            .unwrap();
+        let v = serde_json::to_value(&res).unwrap();
+        let txt = v.pointer("/content/0/text").and_then(|t| t.as_str()).unwrap();
+        let env: serde_json::Value = serde_json::from_str(txt).unwrap();
+        assert_eq!(env["ok"], serde_json::json!(true), "{env}");
+        assert_eq!(env["data"]["minVersion"], serde_json::json!("1.2610.1001.0"));
+        assert_eq!(
+            env["data"]["connectionTools"],
+            serde_json::json!(["list_sessions", "connect_session", "disconnect_session"])
+        );
     }
 }

@@ -25,6 +25,7 @@ mod sessions;
 mod signing;
 mod store;
 mod tools;
+mod wct;
 
 use anyhow::Result;
 use rmcp::{transport::stdio, ServiceExt};
