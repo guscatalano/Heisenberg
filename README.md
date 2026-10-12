@@ -6,6 +6,45 @@ dumps, drive TTD, launch from session 0 into a user session — wrapping free
 debugging tools (Microsoft-published by default, plus opt-in third-party helpers
 like cv2pdb and the REA reverse-engineering MCP) and citing public docs.
 
+## Why it's useful
+
+Native Windows debugging normally means a human at a WinDbg prompt who already
+knows which SDK tool to reach for, what registry key arms it, and how to read the
+output. Heisenberg hands that whole loop to an agent — safely, reversibly, and
+with every step citing the public doc it came from. Some concrete situations:
+
+- **"It crashes in the field and I can't repro it."** The agent arms
+  `dump.onCrashInstall` (WER LocalDumps) or `dump.onTrigger` so the *next* crash
+  auto-captures a dump, then runs `symbols.download` + `dump.analyze` /
+  `analyze.highCpu` / `analyze.handles` to get a symbolized root-cause stack — no
+  live repro, no human watching the box.
+
+- **"It's hung and nothing's obviously wrong."** `analyze.waitChain` asks the OS
+  (Wait Chain Traversal) what every thread is blocked on and who holds it —
+  *across processes* — and flags deadlock cycles that a single process's `!locks`
+  can't see. `inspect.stacks` grabs all thread stacks live, without a full dump.
+
+- **"Memory's getting corrupted somewhere."** `gflags.set` turns on full page
+  heap so the bad write faults at the *exact* instruction instead of crashing
+  later in innocent code; `appverifier.enable` adds handle/lock checks. Both are
+  reversible — one `changes.revert` undoes them.
+
+- **"This is a production box — don't break it."** Every mutation runs through the
+  box-class safety spine: gated by a confirm token or out-of-band human approval
+  on Critical boxes, recorded with its inverse in the ledger *before* it's applied,
+  and full dumps flagged sensitive before anything leaves the machine. The agent
+  can act on a live server without being a liability.
+
+- **"A driver is bugchecking the machine."** `kernel.analyze` reads the crash dump
+  (`!analyze -v`), `kernel.poolAnalyze` localizes pool-tag leaks, and
+  `kernel.verifier` turns on Driver Verifier to force a latent driver bug into an
+  immediate, debuggable bugcheck (reversible, applies on reboot).
+
+- **"Make it reproducible / hand it off."** `repro.record` captures the arming
+  conditions + the manual trigger steps + the resulting dump as a replayable
+  recipe; `repro.replay` re-arms them on any box; `collect.package` bundles a
+  portable case and `report.generate` writes the human-readable incident report.
+
 ## Status
 
 **Phases 1–3 — implemented.** The static single-binary `rmcp` server, the
