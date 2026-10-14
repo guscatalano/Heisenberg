@@ -18,6 +18,7 @@ mod kernel;
 mod ledger;
 mod patch;
 mod policy;
+mod portal;
 mod proc;
 mod regutil;
 mod repro;
@@ -73,6 +74,57 @@ async fn main() -> Result<()> {
         }
         Some("version") | Some("--version") | Some("-V") => {
             println!("heisenberg {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        Some("serve-http") | Some("http") => {
+            // Opt-in HTTP MCP endpoint + web portal. Logs go to stderr (stdout is
+            // not the protocol stream in HTTP mode).
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+                .with_writer(std::io::stderr)
+                .with_ansi(false)
+                .init();
+
+            let addr_s = args
+                .get(2)
+                .cloned()
+                .or_else(|| std::env::var("HEISENBERG_HTTP_ADDR").ok())
+                .unwrap_or_else(|| "127.0.0.1:8787".to_string());
+            let addr: std::net::SocketAddr = addr_s
+                .parse()
+                .map_err(|e| anyhow::anyhow!("bad listen address '{addr_s}': {e} (use HOST:PORT, e.g. 127.0.0.1:8787)"))?;
+
+            // Token: env override, else persisted, else freshly generated + stored.
+            let store = store::Store::discover();
+            let token = std::env::var("HEISENBERG_HTTP_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .or_else(|| {
+                    std::fs::read_to_string(store.http_token_path())
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_else(|| {
+                    let t = portal::gen_token();
+                    let _ = std::fs::write(store.http_token_path(), &t);
+                    t
+                });
+
+            if !addr.ip().is_loopback() {
+                tracing::warn!(
+                    "listening on {addr} which is NOT loopback — this exposes a machine-mutating server on the network. Ensure the token stays secret and the box is trusted."
+                );
+            }
+
+            let policy = config::load_policy();
+            tracing::info!(class = ?policy.effective_class(), source = %policy.source.origin, "Heisenberg HTTP starting");
+            eprintln!("\nHeisenberg HTTP MCP + portal:");
+            eprintln!("  MCP endpoint : http://{addr}/mcp   (Authorization: Bearer <token>)");
+            eprintln!("  Web portal   : http://{addr}/?token={token}");
+            eprintln!("  Token        : {token}\n");
+
+            portal::serve(policy, addr, token).await?;
             return Ok(());
         }
         Some("selfcheck") | Some("doctor") => {

@@ -29,6 +29,9 @@ Useful env vars for testing:
 - `HEISENBERG_TOOLS` — extra dirs to search for staged tools.
 - `HEISENBERG_BACKUP_KEEP` — max retained *non-original* `binary.replace` backups
   (default 20; `0` = unlimited). The pristine original is always kept.
+- `HEISENBERG_HTTP_ADDR` / `HEISENBERG_HTTP_TOKEN` — listen address (default
+  `127.0.0.1:8787`) and bearer token for `heisenberg serve-http` (the HTTP MCP
+  endpoint `/mcp` + web portal `/`). Token is generated + persisted if unset.
 
 ## Module map
 
@@ -46,6 +49,10 @@ Useful env vars for testing:
   the Wait Chain Traversal API (live cross-process deadlock detection).
 - `tools.rs` — external-tool locator; `docs.rs` — public-doc links; `envelope.rs`
   — the uniform result/error envelope.
+- `portal.rs` — opt-in HTTP surface (`heisenberg serve-http`): rmcp
+  `StreamableHttpService` at `/mcp` + a bearer-gated, loopback-default web portal at
+  `/` (an embedded SPA that drives `/mcp` as an MCP client — no separate dispatch, so
+  the gate/ledger/audit still apply).
 
 ## Adding a tool (the pattern)
 

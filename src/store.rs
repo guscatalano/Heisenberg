@@ -43,6 +43,10 @@ impl Store {
         d
     }
 
+    pub fn http_token_path(&self) -> PathBuf {
+        self.root.join("http_token")
+    }
+
     pub fn jobs_path(&self) -> PathBuf {
         self.root.join("jobs.json")
     }

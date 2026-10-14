@@ -138,6 +138,31 @@ cargo build --release        # -> target\release\heisenberg.exe
 cargo test                   # policy + envelope unit tests
 ```
 
+## Transports: stdio (default) and HTTP + web portal
+
+By default Heisenberg speaks MCP over **stdio** (an MCP client spawns the process).
+It can also serve the full tool set over **HTTP**, with an interactive **web portal**:
+
+```powershell
+heisenberg serve-http                 # binds 127.0.0.1:8787
+heisenberg serve-http 127.0.0.1:9000  # or a custom HOST:PORT (HEISENBERG_HTTP_ADDR)
+```
+
+On start it prints a bearer **token** and the URLs:
+
+- **MCP endpoint** — `POST http://<addr>/mcp` with `Authorization: Bearer <token>`
+  (streamable HTTP). Point any HTTP MCP client at it.
+- **Web portal** — open `http://<addr>/?token=<token>` for a dashboard of the live
+  state (env, policy + gate matrix, ledger, dumps, backups, captures, repros, audit)
+  and a tool runner. The portal is itself an MCP client, so **every tool call goes
+  through the same gate / confirm-token / ledger / audit as any other client** — the
+  safety spine is not bypassed.
+
+Security: HTTP is **opt-in**, **loopback-bound by default**, and **token-gated**
+(set `HEISENBERG_HTTP_TOKEN`, else one is generated and persisted under
+`HEISENBERG_HOME`). A non-loopback bind is allowed but warns loudly. On a Critical
+box, mutations over HTTP still require out-of-band `heisenberg approve`.
+
 ## Register with an MCP client
 
 ```powershell
