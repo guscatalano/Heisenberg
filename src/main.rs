@@ -6,6 +6,7 @@
 
 mod approvals;
 mod audit;
+mod backup;
 mod config;
 mod docs;
 mod dumps;

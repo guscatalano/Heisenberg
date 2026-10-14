@@ -57,6 +57,19 @@ pub enum RevertPlan {
         offset: u64,
         original: Vec<u8>,
     },
+    /// Restore a whole file from a backup snapshot (undoes binary.replace), putting
+    /// back the TrustedInstaller owner/ACL if we had to take ownership, and cleaning
+    /// up a renamed-aside loaded image.
+    FileReplace {
+        path: String,
+        backup_file: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_acl: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        restore_owner: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stray_old: Option<String>,
+    },
     /// Run a command to undo the change (e.g. `bcdedit /debug off`).
     Command {
         program: String,
@@ -119,6 +132,16 @@ impl RevertPlan {
                 crate::patch::patch_file(std::path::Path::new(path), *offset, original)
                     .map(|_| ())
                     .map_err(|e| anyhow::anyhow!("restore original bytes in {path}: {e}"))
+            }
+            RevertPlan::FileReplace { path, backup_file, restore_acl, restore_owner, stray_old } => {
+                crate::backup::restore(
+                    backup_file,
+                    std::path::Path::new(path),
+                    restore_acl.as_deref(),
+                    restore_owner.as_deref(),
+                    stray_old.as_deref(),
+                )
+                .map_err(|e| anyhow::anyhow!("restore {path} from backup: {e}"))
             }
             RevertPlan::Command {
                 program,
@@ -211,6 +234,15 @@ impl Ledger {
         });
         self.save();
         id
+    }
+
+    /// Replace a change's stored revert plan — e.g. once the exact backup path and
+    /// any ownership change are known after the mutation was applied. Persists.
+    pub fn set_revert(&mut self, id: &str, revert: RevertPlan) {
+        if let Some(c) = self.changes.iter_mut().find(|c| c.id == id) {
+            c.revert = revert;
+        }
+        self.save();
     }
 
     /// Move a pending change to its final applied/failed state.

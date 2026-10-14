@@ -27,6 +27,8 @@ Useful env vars for testing:
 - `HEISENBERG_TRUST_UNSIGNED=1` — dev escape hatch to trust an unsigned policy
   (otherwise it clamps to Critical). Not for production.
 - `HEISENBERG_TOOLS` — extra dirs to search for staged tools.
+- `HEISENBERG_BACKUP_KEEP` — max retained *non-original* `binary.replace` backups
+  (default 20; `0` = unlimited). The pristine original is always kept.
 
 ## Module map
 
@@ -35,8 +37,10 @@ Useful env vars for testing:
 - `policy.rs` — box class × effect tier → gate matrix; fail-safe to Critical.
 - `gate.rs` — enforcement (`enforce`) that mutating tools call before acting.
 - `ledger.rs` — reversible-change ledger; `RevertPlan` variants per change kind.
-- `audit.rs`, `jobs.rs`, `dumps.rs`, `repro.rs`, `store.rs` — persisted state.
-  `repro.rs` is the repro-recipe registry (`repro.record`/`repro.replay`).
+- `audit.rs`, `jobs.rs`, `dumps.rs`, `repro.rs`, `backup.rs`, `store.rs` — persisted
+  state. `repro.rs` is the repro-recipe registry (`repro.record`/`repro.replay`);
+  `backup.rs` is the versioned binary-replacement backup store + replace/restore
+  mechanics (loaded-image rename, TrustedInstaller ownership) behind `binary.replace`.
 - `env_probe.rs`, `proc.rs`, `regutil.rs`, `session.rs`, `kernel.rs`, `wct.rs` —
   the Win32 work (via the `windows` crate) and registry helpers. `wct.rs` wraps
   the Wait Chain Traversal API (live cross-process deadlock detection).

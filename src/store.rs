@@ -37,6 +37,12 @@ impl Store {
         self.root.join("repros.json")
     }
 
+    pub fn backups_dir(&self) -> PathBuf {
+        let d = self.root.join("backups");
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
     pub fn jobs_path(&self) -> PathBuf {
         self.root.join("jobs.json")
     }

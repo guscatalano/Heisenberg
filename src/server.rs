@@ -79,6 +79,9 @@ const MEM_PATCH_TOKEN: &str = "patch-process-memory";
 const BIN_PATCH_TOKEN: &str = "patch-binary-file";
 const PATCH_DOCS: &str =
     "https://learn.microsoft.com/windows/win32/api/memoryapi/nf-memoryapi-writeprocessmemory";
+const BIN_REPLACE_TOKEN: &str = "replace-binary-file";
+const REPLACE_DOCS: &str =
+    "https://learn.microsoft.com/windows/win32/fileio/deleting-and-renaming-files";
 
 const SILENT_EXIT_TOKEN: &str = "set-silent-process-exit";
 const SILENT_PROCESS_EXIT: &str =
@@ -674,6 +677,21 @@ pub struct MemoryPatchArgs {
     pub address: String,
     /// New bytes as hex, e.g. "90 90 90" or "4889c8".
     pub bytes: String,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BinaryReplaceArgs {
+    /// Path to the file to replace on disk (e.g. "C:\\app\\app.exe").
+    pub path: String,
+    /// Path to the replacement file whose bytes get written over `path`.
+    pub source: String,
+    /// Optional note stored with this backup version.
+    #[serde(default)]
+    pub note: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
@@ -2817,6 +2835,118 @@ impl Heisenberg {
             Err(e) => {
                 self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
                 Ok(text(error(tool, ErrorKind::Internal, format!("patch failed: {e}"), "check file permissions and that it isn't running", Some(docs))))
+            }
+        }
+    }
+
+    #[tool(
+        name = "binary.replace",
+        description = "Replace a whole binary file on disk (e.g. a .exe/.dll) with another file's bytes - to run a rebuilt, instrumented, or privately-fixed build in place. The pristine original is backed up (pinned forever) and each replace is versioned; a retention cap (HEISENBERG_BACKUP_KEEP, default 20) prunes only the oldest non-original backups. Handles loaded images (renames aside) and TrustedInstaller/System32 files (takes ownership, restored on revert). State-changing, reversible via the ledger; needs elevation. dry_run + confirm. WARNING: replacing a signed binary breaks its Authenticode signature and may be reverted by SFC/WRP; kernel drivers won't load under Driver Signature Enforcement."
+    )]
+    async fn binary_replace(
+        &self,
+        Parameters(a): Parameters<BinaryReplaceArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "binary.replace";
+        let docs = REPLACE_DOCS;
+        let target = std::path::PathBuf::from(&a.path);
+        if !target.is_file() {
+            return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("target not found: {}", a.path), "pass a path to an existing file", Some(docs))));
+        }
+        let source = std::path::PathBuf::from(&a.source);
+        if !source.is_file() {
+            return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("source not found: {}", a.source), "pass a path to the replacement file", Some(docs))));
+        }
+        let backups_dir = self.state.store.backups_dir();
+        let key = crate::backup::key_for(&target.display().to_string());
+        let src_meta = std::fs::metadata(&source).ok();
+        let src_bytes = src_meta.as_ref().map(|m| m.len()).unwrap_or(0);
+        let existing = crate::backup::BackupStore::for_target(&backups_dir, &target.display().to_string())
+            .map(|s| s.list().len())
+            .unwrap_or(0);
+        let cmd = format!("replace {} with {} ({} bytes)", a.path, a.source, src_bytes);
+        let sig_warn = "replacing a signed binary breaks its Authenticode signature (and may be reverted by SFC/WRP); kernel drivers won't load under DSE";
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would replace {} with {} ({} bytes)", a.path, a.source, src_bytes))
+                    .data(json!({
+                        "path": a.path, "source": a.source, "sourceBytes": src_bytes,
+                        "backupKey": key, "existingVersions": existing,
+                        "retentionKeep": crate::backup::keep_limit(),
+                        "resource": format!("heisenberg://backups/{key}"),
+                        "gate": decision
+                    }))
+                    .command(cmd).docs(docs).warn(format!("dry-run: no change made. {sig_warn}")).to_value(),
+            ));
+        }
+
+        if !env_probe::is_elevated() {
+            self.state.audit.record(tool, "not elevated", None, "blocked", None);
+            return Ok(text(error(
+                tool,
+                ErrorKind::RequiresElevation,
+                "replacing a binary needs an elevated (admin) token - and TrustedInstaller/System32 files need it even to rename",
+                "re-run Heisenberg elevated, or via the elevated broker",
+                Some(docs),
+            )));
+        }
+
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, BIN_REPLACE_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs))));
+            }
+        };
+
+        // Record the inverse BEFORE applying. The backup_file is the snapshot the
+        // replace is about to take (v<next>.bin); we compute its path up front so the
+        // ledger entry is complete even if the process dies mid-apply.
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(tool, &format!("replace {}", a.path), RevertPlan::FileReplace {
+                path: a.path.clone(),
+                backup_file: String::new(), // filled in after snapshot via a second mark
+                restore_acl: None,
+                restore_owner: None,
+                stray_old: None,
+            })
+        };
+        match crate::backup::replace_file(&backups_dir, &target, &source, a.note.clone()) {
+            Ok(rep) => {
+                // Rewrite the ledger entry now that we know the exact snapshot + ACL/owner.
+                {
+                    let mut l = self.state.ledger.lock().unwrap();
+                    l.set_revert(&id, RevertPlan::FileReplace {
+                        path: a.path.clone(),
+                        backup_file: rep.backup_file.clone(),
+                        restore_acl: rep.acl_sddl.clone(),
+                        restore_owner: rep.owner.clone(),
+                        stray_old: rep.stray_old.clone(),
+                    });
+                    l.mark(&id, ChangeStatus::Applied);
+                }
+                self.state.audit.record(tool, &format!("replaced {} (backup v{})", a.path, rep.backup_n), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                let mut out = Outcome::new(tool, format!("replaced {} with {} ({} bytes); backup v{}{}; change {id}", a.path, a.source, src_bytes, rep.backup_n, if rep.original { " (original, pinned)" } else { "" }))
+                    .data(json!({
+                        "path": a.path, "source": a.source,
+                        "backupKey": rep.key, "backupVersion": rep.backup_n, "backupSha256": rep.backup_sha,
+                        "wasOriginal": rep.original, "totalVersions": rep.total_versions,
+                        "renamedAside": rep.stray_old, "tookOwnership": rep.owner.is_some(),
+                        "resource": format!("heisenberg://backups/{}", rep.key), "changeId": id
+                    }))
+                    .command(cmd).docs(docs)
+                    .warn(format!("revert with changes.revert to restore this step's backup. {sig_warn}"));
+                if rep.owner.is_some() {
+                    out = out.warn("took ownership of a protected (TrustedInstaller) file; the original owner + ACL are restored on revert");
+                }
+                Ok(text(out.to_value()))
+            }
+            Err(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                Ok(text(error(tool, ErrorKind::Internal, format!("replace failed: {e}"), "check the path, permissions, and that it isn't locked by a service", Some(docs))))
             }
         }
     }
@@ -7244,6 +7374,7 @@ impl ServerHandler for Heisenberg {
             Resource::new("heisenberg://calls", "Tool-call result log (recent, JSONL)".to_string()),
             Resource::new("heisenberg://dumps", "Captured dumps".to_string()),
             Resource::new("heisenberg://repros", "Repro recipes".to_string()),
+            Resource::new("heisenberg://backups", "Binary-replacement backups".to_string()),
             Resource::new("heisenberg://captures", "Background capture jobs".to_string()),
             Resource::new("heisenberg://cases", "Exported case bundles".to_string()),
             Resource::new("heisenberg://sessions", "Open debug sessions".to_string()),
@@ -7300,6 +7431,10 @@ impl ServerHandler for Heisenberg {
                 let reg = self.state.repros.lock().unwrap();
                 serde_json::to_string_pretty(&json!({ "repros": reg.list() })).ok()
             }
+            "heisenberg://backups" => {
+                let all = crate::backup::list_all(&self.state.store.backups_dir());
+                serde_json::to_string_pretty(&json!({ "backups": all })).ok()
+            }
             "heisenberg://tools" => {
                 serde_json::to_string_pretty(&json!({ "tools": self.state.locator.inventory() })).ok()
             }
@@ -7334,6 +7469,13 @@ impl ServerHandler for Heisenberg {
                 let id = &other["heisenberg://repros/".len()..];
                 let reg = self.state.repros.lock().unwrap();
                 reg.get(id).map(|r| serde_json::to_string_pretty(r).unwrap_or_default())
+            }
+            other if other.starts_with("heisenberg://backups/") => {
+                let key = &other["heisenberg://backups/".len()..];
+                crate::backup::list_all(&self.state.store.backups_dir())
+                    .into_iter()
+                    .find(|b| b.key == key)
+                    .map(|b| serde_json::to_string_pretty(&b).unwrap_or_default())
             }
             other if other.starts_with("heisenberg://captures/") => {
                 let id = &other["heisenberg://captures/".len()..];
@@ -7670,6 +7812,7 @@ ExceptionCode: c0000374\n";
         let mut expected = vec![
             "appverifier.enable",
             "binary.patch",
+            "binary.replace",
             "boot.trace",
             "dump.onCrashInstall",
             "dump.onExit",

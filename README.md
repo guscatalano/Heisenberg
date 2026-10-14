@@ -87,6 +87,8 @@ Tools today:
 | `analyze.deadlock` / `analyze.highCpu` / `analyze.handles` / `analyze.async` / `analyze.verifierStop` / `analyze.foreignDump` | Targeted cdb analyses of a dump (lock contention, CPU by thread, handle leaks, .NET async, verifier stops, off-box dumps with matched symbols). |
 | `gflags.get` / `gflags.set` | Show / enable full page heap for an image via IFEO (reversible via the ledger; `dry_run` + confirm token; needs elevation). Disable by reverting the change. |
 | `appverifier.enable` | Enable Application Verifier for an image via IFEO (reversible; needs elevation). |
+| `memory.patch` / `binary.patch` | Patch bytes in a live process (`WriteProcessMemory`, ASLR-aware module+RVA) or in a PE file on disk (RVA→file offset). Reversible via the ledger; `dry_run` + confirm. |
+| `binary.replace` | Replace a whole binary file with another (rebuilt / instrumented / fixed build). Pristine original pinned, each replace versioned, retention-capped (`HEISENBERG_BACKUP_KEEP`); handles loaded images (renames aside) and TrustedInstaller/System32 (takes ownership, restored on revert). Reversible; needs elevation; `dry_run` + confirm. |
 | `ttd.record` / `ttd.stop` / `ttd.replay` | Record a process to a Time Travel Debugging `.run` trace (a `job.*` capture) and replay it in cdb. |
 | `leak.heapTrackStart` / `leak.heapSnapshot` / `leak.heapDiff` | Enable the UMDH stack DB (IFEO), snapshot a heap, and diff snapshots to find leaks. |
 | `boot.trace` | Configure a WPR boot trace (arm / collect / cancel) for pre-login and startup issues. |
