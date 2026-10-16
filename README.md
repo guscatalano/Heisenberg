@@ -89,6 +89,7 @@ Tools today:
 | `appverifier.enable` | Enable Application Verifier for an image via IFEO (reversible; needs elevation). |
 | `memory.patch` / `binary.patch` | Patch bytes in a live process (`WriteProcessMemory`, ASLR-aware module+RVA) or in a PE file on disk (RVA→file offset). Reversible via the ledger; `dry_run` + confirm. |
 | `binary.replace` | Replace a whole binary file with another (rebuilt / instrumented / fixed build). Pristine original pinned, each replace versioned, retention-capped (`HEISENBERG_BACKUP_KEEP`); handles loaded images (renames aside) and TrustedInstaller/System32 (takes ownership, restored on revert). Reversible; needs elevation; `dry_run` + confirm. |
+| `binary.deploy` | Deploy a binary from an **uploaded** file (bytes inline, base64) — push a private/rebuilt build without staging it first. Creates the destination (parent dirs made) or backs-up-and-replaces it, including ACL'd TrustedInstaller/System32 targets (same path as `binary.replace`). Reversible (revert restores prior bytes, or deletes a newly-created file); needs elevation; `dry_run` + confirm. Powers the portal's **Deploy binary** tab. |
 | `ttd.record` / `ttd.stop` / `ttd.replay` | Record a process to a Time Travel Debugging `.run` trace (a `job.*` capture) and replay it in cdb. |
 | `leak.heapTrackStart` / `leak.heapSnapshot` / `leak.heapDiff` | Enable the UMDH stack DB (IFEO), snapshot a heap, and diff snapshots to find leaks. |
 | `boot.trace` | Configure a WPR boot trace (arm / collect / cancel) for pre-login and startup issues. |
@@ -153,10 +154,12 @@ On start it prints a bearer **token** and the URLs:
 - **MCP endpoint** — `POST http://<addr>/mcp` with `Authorization: Bearer <token>`
   (streamable HTTP). Point any HTTP MCP client at it.
 - **Web portal** — open `http://<addr>/?token=<token>` for a dashboard of the live
-  state (env, policy + gate matrix, ledger, dumps, backups, captures, repros, audit)
-  and a tool runner. The portal is itself an MCP client, so **every tool call goes
-  through the same gate / confirm-token / ledger / audit as any other client** — the
-  safety spine is not bypassed.
+  state (env, policy + gate matrix, ledger, dumps, backups, captures, repros, audit),
+  a tool runner, and a **Deploy binary** tab (pick a local file + destination path →
+  `binary.deploy`, create-or-replace, reversible — works on ACL'd System32 targets).
+  The portal is itself an MCP client, so **every tool call goes through the same gate /
+  confirm-token / ledger / audit as any other client** — the safety spine is not
+  bypassed. The token is kept in the browser's `localStorage`, so a refresh keeps it.
 
 Security: HTTP is **opt-in**, **loopback-bound by default**, and **token-gated**
 (set `HEISENBERG_HTTP_TOKEN`, else one is generated and persisted under

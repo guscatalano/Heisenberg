@@ -57,6 +57,9 @@ pub enum RevertPlan {
         offset: u64,
         original: Vec<u8>,
     },
+    /// Delete a file we created (undoes a `binary.deploy` that placed a NEW file
+    /// where none existed). Best-effort: a missing file counts as already reverted.
+    FileCreate { path: String },
     /// Restore a whole file from a backup snapshot (undoes binary.replace), putting
     /// back the TrustedInstaller owner/ACL if we had to take ownership, and cleaning
     /// up a renamed-aside loaded image.
@@ -132,6 +135,13 @@ impl RevertPlan {
                 crate::patch::patch_file(std::path::Path::new(path), *offset, original)
                     .map(|_| ())
                     .map_err(|e| anyhow::anyhow!("restore original bytes in {path}: {e}"))
+            }
+            RevertPlan::FileCreate { path } => {
+                match std::fs::remove_file(path) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(anyhow::anyhow!("delete created file {path}: {e}")),
+                }
             }
             RevertPlan::FileReplace { path, backup_file, restore_acl, restore_owner, stray_old } => {
                 crate::backup::restore(
@@ -275,5 +285,41 @@ impl Ledger {
 
     pub fn list(&self) -> &[Change] {
         &self.changes
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn file_create_revert_deletes_the_file() {
+        let dir = std::env::temp_dir().join(format!("hb_ledger_fc_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("deployed.bin");
+        std::fs::write(&target, b"NEWBINARY").unwrap();
+        let ledger_path = dir.join("ledger.json");
+
+        let mut l = Ledger::load(ledger_path);
+        let id = l.begin("binary.deploy", "deploy (create) deployed.bin", RevertPlan::FileCreate { path: target.display().to_string() });
+        l.mark(&id, ChangeStatus::Applied);
+        assert!(target.is_file());
+
+        // revert deletes the created file; reverting again is a no-op (file already gone).
+        l.revert(&id).unwrap();
+        assert!(!target.exists(), "FileCreate revert must delete the deployed file");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn file_create_revert_tolerates_missing_file() {
+        let dir = std::env::temp_dir().join(format!("hb_ledger_fc2_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut l = Ledger::load(dir.join("ledger.json"));
+        let id = l.begin("binary.deploy", "deploy", RevertPlan::FileCreate { path: dir.join("never-created.bin").display().to_string() });
+        l.mark(&id, ChangeStatus::Applied);
+        assert!(l.revert(&id).is_ok(), "missing file should count as already reverted");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

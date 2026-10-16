@@ -80,6 +80,7 @@ const BIN_PATCH_TOKEN: &str = "patch-binary-file";
 const PATCH_DOCS: &str =
     "https://learn.microsoft.com/windows/win32/api/memoryapi/nf-memoryapi-writeprocessmemory";
 const BIN_REPLACE_TOKEN: &str = "replace-binary-file";
+const BIN_DEPLOY_TOKEN: &str = "deploy-binary";
 const REPLACE_DOCS: &str =
     "https://learn.microsoft.com/windows/win32/fileio/deleting-and-renaming-files";
 
@@ -690,6 +691,22 @@ pub struct BinaryReplaceArgs {
     /// Path to the replacement file whose bytes get written over `path`.
     pub source: String,
     /// Optional note stored with this backup version.
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct BinaryDeployArgs {
+    /// Destination path on the box (e.g. "C:\\app\\app.exe"). Replaced if it exists,
+    /// created (with parent dirs) if it doesn't.
+    pub path: String,
+    /// The binary's bytes, base64-encoded (standard base64). This is the uploaded file.
+    pub source_b64: String,
+    /// Optional note stored with the backup version (when replacing).
     #[serde(default)]
     pub note: Option<String>,
     #[serde(default)]
@@ -2947,6 +2964,110 @@ impl Heisenberg {
             Err(e) => {
                 self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
                 Ok(text(error(tool, ErrorKind::Internal, format!("replace failed: {e}"), "check the path, permissions, and that it isn't locked by a service", Some(docs))))
+            }
+        }
+    }
+
+    #[tool(
+        name = "binary.deploy",
+        description = "Deploy a binary to the box from an UPLOADED file (bytes inline as base64 in source_b64) - e.g. push a private/rebuilt/instrumented build through the portal without staging it first. If the destination exists it is backed up (pinned original + versioned, HEISENBERG_BACKUP_KEEP) and replaced; if it doesn't exist it is created (parent dirs made). Handles loaded images and TrustedInstaller/System32 (takes ownership, restored on revert). State-changing, reversible via the ledger; needs elevation. dry_run + confirm. WARNING: a replacement/unsigned binary breaks Authenticode and may be reverted by SFC/WRP; kernel drivers won't load under Driver Signature Enforcement."
+    )]
+    async fn binary_deploy(
+        &self,
+        Parameters(a): Parameters<BinaryDeployArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        use base64::Engine as _;
+        let tool = "binary.deploy";
+        let docs = REPLACE_DOCS;
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(a.source_b64.trim()) {
+            Ok(b) if !b.is_empty() => b,
+            Ok(_) => return Ok(text(error(tool, ErrorKind::InvalidArgument, "empty file (source_b64 decoded to 0 bytes)", "upload a non-empty binary", Some(docs)))),
+            Err(e) => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad base64 in source_b64: {e}"), "send the file bytes as standard base64", Some(docs)))),
+        };
+        let target = std::path::PathBuf::from(&a.path);
+        let exists = target.is_file();
+        let sha = crate::signing::sha256_hex(&bytes);
+        let size = bytes.len();
+        let key = crate::backup::key_for(&target.display().to_string());
+        let action = if exists { "replace" } else { "create" };
+        let cmd = format!("deploy {size} bytes -> {} ({action})", a.path);
+        let sig_warn = "a replacement/unsigned binary breaks Authenticode (and may be reverted by SFC/WRP); kernel drivers won't load under DSE";
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(
+                Outcome::new(tool, format!("[dry-run] would {action} {} with {size} uploaded bytes", a.path))
+                    .data(json!({ "path": a.path, "exists": exists, "action": action, "bytes": size, "sha256": sha, "backupKey": key, "retentionKeep": crate::backup::keep_limit(), "gate": decision }))
+                    .command(cmd).docs(docs).warn(format!("dry-run: no change made. {sig_warn}")).to_value(),
+            ));
+        }
+
+        if !env_probe::is_elevated() {
+            self.state.audit.record(tool, "not elevated", None, "blocked", None);
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "deploying a binary needs an elevated (admin) token - and TrustedInstaller/System32 destinations need it even to rename", "re-run Heisenberg elevated, or via the elevated broker", Some(docs))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, BIN_DEPLOY_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs))));
+            }
+        };
+
+        if exists {
+            // Stage the uploaded bytes to a temp file, then reuse the versioned-backup
+            // replace path (handles locked images + TrustedInstaller ownership).
+            let backups_dir = self.state.store.backups_dir();
+            let tmp = self.state.store.artifacts_dir().join(format!("deploy-{}.bin", chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")));
+            if let Err(e) = std::fs::write(&tmp, &bytes) {
+                return Ok(text(error(tool, ErrorKind::Internal, format!("failed to stage upload: {e}"), "check HEISENBERG_HOME is writable", Some(docs))));
+            }
+            let id = {
+                let mut l = self.state.ledger.lock().unwrap();
+                l.begin(tool, &format!("deploy (replace) {}", a.path), RevertPlan::FileReplace { path: a.path.clone(), backup_file: String::new(), restore_acl: None, restore_owner: None, stray_old: None })
+            };
+            let res = crate::backup::replace_file(&backups_dir, &target, &tmp, a.note.clone());
+            let _ = std::fs::remove_file(&tmp);
+            match res {
+                Ok(rep) => {
+                    {
+                        let mut l = self.state.ledger.lock().unwrap();
+                        l.set_revert(&id, RevertPlan::FileReplace { path: a.path.clone(), backup_file: rep.backup_file.clone(), restore_acl: rep.acl_sddl.clone(), restore_owner: rep.owner.clone(), stray_old: rep.stray_old.clone() });
+                        l.mark(&id, ChangeStatus::Applied);
+                    }
+                    self.state.audit.record(tool, &format!("deployed (replaced) {} (backup v{})", a.path, rep.backup_n), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                    let mut out = Outcome::new(tool, format!("deployed {size} bytes -> {} (replaced; backup v{}{}); change {id}", a.path, rep.backup_n, if rep.original { " original, pinned" } else { "" }))
+                        .data(json!({ "path": a.path, "action": "replace", "bytes": size, "sha256": sha, "backupKey": rep.key, "backupVersion": rep.backup_n, "wasOriginal": rep.original, "tookOwnership": rep.owner.is_some(), "resource": format!("heisenberg://backups/{}", rep.key), "changeId": id }))
+                        .command(cmd).docs(docs).warn(format!("revert with changes.revert to restore the prior binary. {sig_warn}"));
+                    if rep.owner.is_some() { out = out.warn("took ownership of a protected (TrustedInstaller) file; original owner + ACL restored on revert"); }
+                    Ok(text(out.to_value()))
+                }
+                Err(e) => {
+                    self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                    Ok(text(error(tool, ErrorKind::Internal, format!("deploy failed: {e}"), "check the path, permissions, and that it isn't locked by a service", Some(docs))))
+                }
+            }
+        } else {
+            // New file: create parent dirs, write, ledger FileCreate (revert deletes).
+            if let Some(parent) = target.parent() { let _ = std::fs::create_dir_all(parent); }
+            let id = {
+                let mut l = self.state.ledger.lock().unwrap();
+                l.begin(tool, &format!("deploy (create) {}", a.path), RevertPlan::FileCreate { path: a.path.clone() })
+            };
+            match std::fs::write(&target, &bytes) {
+                Ok(()) => {
+                    self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                    self.state.audit.record(tool, &format!("deployed (created) {}", a.path), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                    Ok(text(
+                        Outcome::new(tool, format!("deployed {size} bytes -> {} (created new); change {id}", a.path))
+                            .data(json!({ "path": a.path, "action": "create", "bytes": size, "sha256": sha, "changeId": id }))
+                            .command(cmd).docs(docs).warn(format!("revert with changes.revert to delete the deployed file. {sig_warn}")).to_value(),
+                    ))
+                }
+                Err(e) => {
+                    self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                    Ok(text(error(tool, ErrorKind::Internal, format!("deploy (create) failed: {e}"), "check the destination path and that its folder is writable", Some(docs))))
+                }
             }
         }
     }
@@ -7811,6 +7932,7 @@ ExceptionCode: c0000374\n";
         gated.sort();
         let mut expected = vec![
             "appverifier.enable",
+            "binary.deploy",
             "binary.patch",
             "binary.replace",
             "boot.trace",

@@ -59,6 +59,8 @@ pub async fn serve(policy: Policy, addr: SocketAddr, token: String) -> anyhow::R
         }
         Err(_) => {}
     }
+    // Allow large uploads for binary.deploy (file inline as base64 ≈ 1.37x). Default is 4 MB.
+    config = config.with_max_request_body_bytes(350 * 1024 * 1024);
 
     let mcp = StreamableHttpService::new(
         move || Ok(hb.clone()),
@@ -191,6 +193,7 @@ a{color:var(--acc)}
 <header>
   <h1>Heisenberg</h1><span class="badge" id="ver">HTTP portal</span>
   <span id="conn">connecting…</span>
+  <a href="#" id="forget" onclick="forgetToken();return false" style="margin-left:14px;font-size:12px">forget token</a>
 </header>
 <div class="wrap">
   <nav id="nav"></nav>
@@ -203,8 +206,11 @@ const RES = [
   ["repros","heisenberg://repros"],["sessions","heisenberg://sessions"],["tools (inv.)","heisenberg://tools"],
   ["audit","heisenberg://audit"],
 ];
-let TOKEN = new URLSearchParams(location.search).get("token") || sessionStorage.getItem("hb_token") || "";
-if(TOKEN){ sessionStorage.setItem("hb_token", TOKEN); history.replaceState({}, "", location.pathname); }
+let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem("hb_token") || "";
+// Persist in localStorage so a refresh / tab close / restart keeps the token
+// (sessionStorage was lost on refresh). Still bootstraps from ?token= and strips it.
+if(TOKEN){ try{ localStorage.setItem("hb_token", TOKEN); }catch(e){} history.replaceState({}, "", location.pathname); }
+function forgetToken(){ try{ localStorage.removeItem("hb_token"); }catch(e){} location.href = location.pathname; }
 let SESSION = null;
 
 function hdrs(){
@@ -302,10 +308,51 @@ async function openTools(){
   show(wrap);
 }
 
+async function openDeploy(){
+  const wrap = document.createElement("div");
+  const h=document.createElement("h2"); h.textContent="Deploy a binary"; wrap.append(h);
+  const card=document.createElement("div"); card.className="card";
+  card.innerHTML = "<small>Upload a file and place it on the box. If the destination exists it is backed up and replaced (reversible via changes.revert); if not, it is created. Gated like any mutation — needs elevation, and a Production/Critical box may want a confirm token or approval. Large files are held in memory while encoding.</small>";
+  wrap.append(card);
+  const row1=document.createElement("div"); row1.className="row";
+  const file=document.createElement("input"); file.type="file"; row1.append(file); wrap.append(row1);
+  const row2=document.createElement("div"); row2.className="row";
+  const path=document.createElement("input"); path.type="text"; path.placeholder="destination path, e.g. C:\\app\\app.exe"; path.style.flex="1"; path.style.minWidth="320px"; row2.append(path); wrap.append(row2);
+  const row3=document.createElement("div"); row3.className="row";
+  const note=document.createElement("input"); note.type="text"; note.placeholder="note (optional)"; note.style.flex="1";
+  const conf=document.createElement("input"); conf.type="text"; conf.placeholder="confirm token (if asked)";
+  row3.append(note, conf); wrap.append(row3);
+  const row4=document.createElement("div"); row4.className="row";
+  const prev=document.createElement("button"); prev.className="go"; prev.textContent="Preview (dry-run)"; prev.style.background="#2a3550"; prev.style.color="#cfe0ff";
+  const dep=document.createElement("button"); dep.className="go"; dep.textContent="Deploy";
+  row4.append(prev, dep); wrap.append(row4);
+  const out=document.createElement("pre"); out.textContent="(result)"; wrap.append(out);
+  async function readB64(f){
+    const buf = await f.arrayBuffer(); const b=new Uint8Array(buf); let bin=""; const CH=0x8000;
+    for(let i=0;i<b.length;i+=CH){ bin += String.fromCharCode.apply(null, b.subarray(i,i+CH)); }
+    return btoa(bin);
+  }
+  async function run(dry){
+    if(!file.files || !file.files[0]){ out.className="err"; out.textContent="pick a file first"; return; }
+    if(!path.value.trim()){ out.className="err"; out.textContent="enter a destination path"; return; }
+    const f=file.files[0];
+    out.className=""; out.textContent=(dry?"previewing ":"deploying ")+f.name+" ("+f.size+" bytes)…";
+    let b64; try{ b64=await readB64(f); }catch(e){ out.className="err"; out.textContent="failed to read file: "+e.message; return; }
+    const args={ path:path.value.trim(), source_b64:b64, dry_run:dry };
+    if(note.value.trim()) args.note=note.value.trim();
+    if(!dry && conf.value.trim()) args.confirm=conf.value.trim();
+    try{ const r=await toolCall("binary.deploy", args); out.textContent=JSON.stringify(r,null,2); out.className=(r&&r.ok===false)?"err":"good"; }
+    catch(e){ out.className="err"; out.textContent="ERROR: "+e.message; }
+  }
+  prev.onclick=()=>run(true); dep.onclick=()=>run(false);
+  show(wrap);
+}
+
 function buildNav(){
   const nav = document.getElementById("nav"); nav.innerHTML="";
   const mk = (label, fn)=>{ const b=document.createElement("button"); b.textContent=label; b.onclick=()=>{ [...nav.children].forEach(c=>c.classList.remove("on")); b.classList.add("on"); fn(); }; nav.append(b); return b; };
   const toolsBtn = mk("▶ Run a tool", openTools);
+  mk("⬆ Deploy binary", openDeploy);
   RES.forEach(([label,uri])=> mk(label, ()=>openResource(uri,label)) );
   toolsBtn.classList.add("on");
 }
