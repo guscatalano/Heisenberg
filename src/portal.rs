@@ -19,7 +19,7 @@ use axum::{
 };
 use base64::Engine;
 use rmcp::transport::streamable_http_server::{
-    session::local::LocalSessionManager, StreamableHttpService,
+    session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
 
 use crate::policy::Policy;
@@ -38,10 +38,32 @@ pub async fn serve(policy: Policy, addr: SocketAddr, token: String) -> anyhow::R
     // One shared service instance; the factory clones it so every HTTP MCP session
     // shares the same AppState (ledger/dumps/jobs/repros/backups/audit).
     let hb = Heisenberg::new(policy);
+
+    // Host-header (anti-DNS-rebinding) policy. rmcp defaults to a loopback-only
+    // allowlist, which 403s remote requests (by box IP / DNS name / proxy) even
+    // with a valid token. Since we ALWAYS require a bearer token — which already
+    // defeats DNS rebinding (an attacker page can't supply the secret) — a remote
+    // bind drops the Host check; an explicit allowlist can still pin it.
+    let mut config = StreamableHttpServerConfig::default();
+    match std::env::var("HEISENBERG_HTTP_ALLOWED_HOSTS") {
+        Ok(hosts) => {
+            let list: Vec<String> = hosts.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+            if !list.is_empty() {
+                tracing::info!("Host allowlist pinned to {list:?} (HEISENBERG_HTTP_ALLOWED_HOSTS)");
+                config = config.with_allowed_hosts(list);
+            }
+        }
+        Err(_) if !addr.ip().is_loopback() => {
+            tracing::info!("non-loopback bind: Host allowlist disabled (bearer token is the guard). Pin it with HEISENBERG_HTTP_ALLOWED_HOSTS.");
+            config = config.disable_allowed_hosts();
+        }
+        Err(_) => {}
+    }
+
     let mcp = StreamableHttpService::new(
         move || Ok(hb.clone()),
         Arc::new(LocalSessionManager::default()),
-        Default::default(),
+        config,
     );
 
     let token = Arc::new(token);

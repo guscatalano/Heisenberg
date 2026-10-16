@@ -34,7 +34,12 @@ Useful env vars for testing:
   endpoint `/mcp` + web portal `/`). Token is generated + persisted if unset.
 - `HEISENBERG_HTTP_ALLOW_REMOTE=1` — required to bind a **non-loopback** address
   (e.g. `0.0.0.0:8787`). Without it, `serve-http` refuses any non-loopback bind;
-  with it, it binds and warns. Loopback is always allowed.
+  with it, it binds and warns. Loopback is always allowed. A non-loopback bind also
+  **drops the Host (anti-DNS-rebinding) allowlist** — the bearer token is the guard —
+  so remote clients reaching the box by IP/DNS/proxy aren't 403'd.
+- `HEISENBERG_HTTP_ALLOWED_HOSTS` — comma-separated Host/`host:port` allowlist to pin
+  exactly which `Host` headers `/mcp` accepts (overrides the above). Loopback default
+  is `localhost,127.0.0.1,::1`.
 
 ## Module map
 
