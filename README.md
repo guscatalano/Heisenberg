@@ -160,7 +160,9 @@ On start it prints a bearer **token** and the URLs:
 
 Security: HTTP is **opt-in**, **loopback-bound by default**, and **token-gated**
 (set `HEISENBERG_HTTP_TOKEN`, else one is generated and persisted under
-`HEISENBERG_HOME`). A non-loopback bind is allowed but warns loudly. On a Critical
+`HEISENBERG_HOME`). Binding a **non-loopback** address (e.g. `0.0.0.0:8787`)
+requires the explicit opt-in `HEISENBERG_HTTP_ALLOW_REMOTE=1` — otherwise
+`serve-http` refuses it; with it set, it binds and warns loudly. On a Critical
 box, mutations over HTTP still require out-of-band `heisenberg approve`.
 
 ## Register with an MCP client

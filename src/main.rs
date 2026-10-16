@@ -112,9 +112,18 @@ async fn main() -> Result<()> {
                 });
 
             if !addr.ip().is_loopback() {
-                tracing::warn!(
-                    "listening on {addr} which is NOT loopback — this exposes a machine-mutating server on the network. Ensure the token stays secret and the box is trusted."
-                );
+                // Non-loopback exposure is an explicit, config-gated opt-in: a
+                // machine-mutating server on the network is a deliberate choice.
+                let allow_remote = std::env::var("HEISENBERG_HTTP_ALLOW_REMOTE")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false);
+                if !allow_remote {
+                    return Err(anyhow::anyhow!(
+                        "refusing to bind the non-loopback address {addr}: set HEISENBERG_HTTP_ALLOW_REMOTE=1 to expose the HTTP MCP + portal beyond localhost (this serves a machine-mutating server on the network — keep the bearer token secret and only on a trusted box), or bind a loopback address like 127.0.0.1:8787"
+                    ));
+                }
+                tracing::warn!("listening on {addr} (NON-loopback; HEISENBERG_HTTP_ALLOW_REMOTE=1) — exposes a machine-mutating server on the network. Keep the token secret and the box trusted.");
+                eprintln!("WARNING: bound to {addr} — reachable beyond localhost (HEISENBERG_HTTP_ALLOW_REMOTE=1). The bearer token is the only thing protecting it.");
             }
 
             let policy = config::load_policy();

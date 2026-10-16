@@ -32,6 +32,9 @@ Useful env vars for testing:
 - `HEISENBERG_HTTP_ADDR` / `HEISENBERG_HTTP_TOKEN` — listen address (default
   `127.0.0.1:8787`) and bearer token for `heisenberg serve-http` (the HTTP MCP
   endpoint `/mcp` + web portal `/`). Token is generated + persisted if unset.
+- `HEISENBERG_HTTP_ALLOW_REMOTE=1` — required to bind a **non-loopback** address
+  (e.g. `0.0.0.0:8787`). Without it, `serve-http` refuses any non-loopback bind;
+  with it, it binds and warns. Loopback is always allowed.
 
 ## Module map
 
