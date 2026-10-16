@@ -216,16 +216,29 @@ function hdrs(){
 async function rpc(method, params, notif){
   const body = {jsonrpc:"2.0", method}; if(params!==undefined) body.params=params;
   if(!notif){ body.id = Math.floor(Math.random()*1e6); }
-  const r = await fetch("mcp", {method:"POST", headers:hdrs(), body:JSON.stringify(body)});
+  let r;
+  try { r = await fetch("mcp", {method:"POST", headers:hdrs(), body:JSON.stringify(body)}); }
+  catch(e){ throw new Error("network error reaching /mcp: "+e.message); }
   const sid = r.headers.get("mcp-session-id"); if(sid) SESSION = sid;
-  if(r.status === 401){ throw new Error("401 unauthorized — bad or missing token"); }
   if(notif || r.status === 202) return null;
   const txt = await r.text();
-  let obj;
+  // Surface the real HTTP status instead of blindly JSON.parsing (an empty 403
+  // body otherwise reads as "JSON.parse: unexpected end of data").
+  if(!r.ok){
+    const snip = (txt||"").trim().slice(0,200);
+    let hint = "";
+    if(r.status === 401) hint = " — bad or missing bearer token";
+    else if(r.status === 403) hint = " — forbidden (Host not in the server's allowlist; a remote bind needs HEISENBERG_HTTP_ALLOW_REMOTE=1, or pin HEISENBERG_HTTP_ALLOWED_HOSTS)";
+    throw new Error("HTTP "+r.status+(r.statusText?(" "+r.statusText):"")+hint+(snip?(" · "+snip):""));
+  }
+  let raw = txt;
   if((r.headers.get("content-type")||"").includes("event-stream")){
     const line = txt.split("\n").find(l=>l.startsWith("data:"));
-    obj = JSON.parse(line ? line.slice(5).trim() : txt);
-  } else { obj = JSON.parse(txt); }
+    raw = line ? line.slice(5).trim() : txt;
+  }
+  let obj;
+  try { obj = JSON.parse(raw); }
+  catch(e){ throw new Error("unexpected non-JSON response (HTTP "+r.status+"): "+((raw||"").trim().slice(0,200) || "empty body")); }
   if(obj.error) throw new Error(obj.error.message || JSON.stringify(obj.error));
   return obj.result;
 }
