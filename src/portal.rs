@@ -189,7 +189,7 @@ a{color:var(--acc)}
 </style></head>
 <body>
 <header>
-  <h1>Heisenberg</h1><span class="badge">HTTP portal</span>
+  <h1>Heisenberg</h1><span class="badge" id="ver">HTTP portal</span>
   <span id="conn">connecting…</span>
 </header>
 <div class="wrap">
@@ -231,10 +231,13 @@ async function rpc(method, params, notif){
     else if(r.status === 403) hint = " — forbidden (Host not in the server's allowlist; a remote bind needs HEISENBERG_HTTP_ALLOW_REMOTE=1, or pin HEISENBERG_HTTP_ALLOWED_HOSTS)";
     throw new Error("HTTP "+r.status+(r.statusText?(" "+r.statusText):"")+hint+(snip?(" · "+snip):""));
   }
-  let raw = txt;
+  let raw = (txt||"").trim();
   if((r.headers.get("content-type")||"").includes("event-stream")){
-    const line = txt.split("\n").find(l=>l.startsWith("data:"));
-    raw = line ? line.slice(5).trim() : txt;
+    // SSE: the stream opens with an empty priming event (data: / retry:) and may
+    // carry keep-alive comments; the JSON-RPC payload is a later data line. Take
+    // the first `data:` line that actually parses as JSON.
+    const datas = txt.split(/\r?\n/).filter(l=>l.startsWith("data:")).map(l=>l.slice(5).trim()).filter(Boolean);
+    raw = datas.find(s => { try { JSON.parse(s); return true; } catch(e){ return false; } }) || "";
   }
   let obj;
   try { obj = JSON.parse(raw); }
@@ -245,7 +248,11 @@ async function rpc(method, params, notif){
 async function connect(){
   const init = await rpc("initialize", {protocolVersion:"2024-11-05", capabilities:{}, clientInfo:{name:"portal",version:"0"}});
   await rpc("notifications/initialized", undefined, true);
-  document.getElementById("conn").innerHTML = "connected to <b>"+init.serverInfo.name+" "+init.serverInfo.version+"</b>";
+  const name = (init.serverInfo&&init.serverInfo.name)||"heisenberg";
+  const version = (init.serverInfo&&init.serverInfo.version)||"?";
+  document.getElementById("ver").textContent = name+" v"+version;
+  document.title = "Heisenberg v"+version;
+  document.getElementById("conn").innerHTML = "connected to <b>"+name+" v"+version+"</b>";
 }
 async function resource(uri){
   const res = await rpc("resources/read", {uri});
