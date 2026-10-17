@@ -327,23 +327,41 @@ async function openDeploy(){
   const dep=document.createElement("button"); dep.className="go"; dep.textContent="Deploy";
   row4.append(prev, dep); wrap.append(row4);
   const out=document.createElement("pre"); out.textContent="(result)"; wrap.append(out);
-  async function readB64(f){
-    const buf = await f.arrayBuffer(); const b=new Uint8Array(buf); let bin=""; const CH=0x8000;
-    for(let i=0;i<b.length;i+=CH){ bin += String.fromCharCode.apply(null, b.subarray(i,i+CH)); }
-    return btoa(bin);
+  // Upload the local file to the box in small chunks (no single large request to get
+  // reset) via upload.chunk, then deploy by reference. Cached so Preview->Deploy of the
+  // same file doesn't re-upload.
+  function sliceB64(buf){ const b=new Uint8Array(buf); let bin=""; const SUB=0x8000; for(let i=0;i<b.length;i+=SUB){ bin+=String.fromCharCode.apply(null,b.subarray(i,i+SUB)); } return btoa(bin); }
+  let staged=null;
+  function fkey(f){ return f.name+"|"+f.size+"|"+f.lastModified; }
+  async function stage(f){
+    if(f.size===0) throw new Error("empty file");
+    const id="up-"+Date.now().toString(36)+"-"+Math.random().toString(36).slice(2,8);
+    const CH=1024*1024; const total=f.size; let seq=0, sent=0;
+    for(let off=0; off<total; off+=CH){
+      const end=Math.min(off+CH,total);
+      const buf=await f.slice(off,end).arrayBuffer();
+      const r=await toolCall("upload.chunk", { id:id, seq:seq, data_b64:sliceB64(buf) });
+      if(r && r.ok===false) throw new Error("upload.chunk failed: "+((r.error&&r.error.message)||JSON.stringify(r.error)));
+      seq++; sent=end;
+      out.textContent="uploading "+f.name+" — "+Math.round(sent/total*100)+"% ("+sent+"/"+total+")";
+    }
+    return id;
   }
+  async function ensureStaged(f){ if(staged && staged.key===fkey(f)) return staged.uid; const uid=await stage(f); staged={key:fkey(f), uid:uid}; return uid; }
   async function run(dry){
     if(!file.files || !file.files[0]){ out.className="err"; out.textContent="pick a file first"; return; }
     if(!path.value.trim()){ out.className="err"; out.textContent="enter a destination path"; return; }
-    const f=file.files[0];
-    out.className=""; out.textContent=(dry?"previewing ":"deploying ")+f.name+" ("+f.size+" bytes)…";
-    let b64; try{ b64=await readB64(f); }catch(e){ out.className="err"; out.textContent="failed to read file: "+e.message; return; }
-    const args={ path:path.value.trim(), source_b64:b64, dry_run:dry };
+    const f=file.files[0]; out.className="";
+    let uid; try{ uid=await ensureStaged(f); }catch(e){ out.className="err"; out.textContent="upload failed: "+e.message; staged=null; return; }
+    out.textContent=(dry?"previewing…":"deploying…");
+    const args={ path:path.value.trim(), upload_id:uid, dry_run:dry };
     if(note.value.trim()) args.note=note.value.trim();
     if(!dry && conf.value.trim()) args.confirm=conf.value.trim();
-    try{ const r=await toolCall("binary.deploy", args); out.textContent=JSON.stringify(r,null,2); out.className=(r&&r.ok===false)?"err":"good"; }
+    try{ const r=await toolCall("binary.deploy", args); out.textContent=JSON.stringify(r,null,2); out.className=(r&&r.ok===false)?"err":"good";
+      if(!dry && r && r.ok!==false){ staged=null; } }  // server consumed the staged upload
     catch(e){ out.className="err"; out.textContent="ERROR: "+e.message; }
   }
+  file.onchange=()=>{ staged=null; };
   prev.onclick=()=>run(true); dep.onclick=()=>run(false);
   show(wrap);
 }

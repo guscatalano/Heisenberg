@@ -89,7 +89,8 @@ Tools today:
 | `appverifier.enable` | Enable Application Verifier for an image via IFEO (reversible; needs elevation). |
 | `memory.patch` / `binary.patch` | Patch bytes in a live process (`WriteProcessMemory`, ASLR-aware module+RVA) or in a PE file on disk (RVA→file offset). Reversible via the ledger; `dry_run` + confirm. |
 | `binary.replace` | Replace a whole binary file with another (rebuilt / instrumented / fixed build). Pristine original pinned, each replace versioned, retention-capped (`HEISENBERG_BACKUP_KEEP`); handles loaded images (renames aside) and TrustedInstaller/System32 (takes ownership, restored on revert). Reversible; needs elevation; `dry_run` + confirm. |
-| `binary.deploy` | Deploy a binary from an **uploaded** file (bytes inline, base64) — push a private/rebuilt build without staging it first. Creates the destination (parent dirs made) or backs-up-and-replaces it, including ACL'd TrustedInstaller/System32 targets (same path as `binary.replace`). Reversible (revert restores prior bytes, or deletes a newly-created file); needs elevation; `dry_run` + confirm. Powers the portal's **Deploy binary** tab. |
+| `upload.chunk` | Stage one chunk of a file upload (base64) under `HEISENBERG_HOME`, keyed by `id` (seq 0 starts fresh, later seqs append). Lets the portal upload a local file in small pieces instead of one large request. Read-only to the machine (no gate). |
+| `binary.deploy` | Deploy an **uploaded** binary — inline (`source_b64`, small files) or a chunked upload (`upload_id` from `upload.chunk`, large files). Creates the destination (parent dirs made) or backs-up-and-replaces it, including ACL'd TrustedInstaller/System32 targets (same path as `binary.replace`). Reversible (revert restores prior bytes, or deletes a newly-created file); needs elevation; `dry_run` + confirm. Powers the portal's **Deploy binary** tab. |
 | `ttd.record` / `ttd.stop` / `ttd.replay` | Record a process to a Time Travel Debugging `.run` trace (a `job.*` capture) and replay it in cdb. |
 | `leak.heapTrackStart` / `leak.heapSnapshot` / `leak.heapDiff` | Enable the UMDH stack DB (IFEO), snapshot a heap, and diff snapshots to find leaks. |
 | `boot.trace` | Configure a WPR boot trace (arm / collect / cancel) for pre-login and startup issues. |
@@ -156,6 +157,7 @@ On start it prints a bearer **token** and the URLs:
 - **Web portal** — open `http://<addr>/?token=<token>` for a dashboard of the live
   state (env, policy + gate matrix, ledger, dumps, backups, captures, repros, audit),
   a tool runner, and a **Deploy binary** tab (pick a local file + destination path →
+  uploaded in small chunks with a progress bar via `upload.chunk`, then placed with
   `binary.deploy`, create-or-replace, reversible — works on ACL'd System32 targets).
   The portal is itself an MCP client, so **every tool call goes through the same gate /
   confirm-token / ledger / audit as any other client** — the safety spine is not

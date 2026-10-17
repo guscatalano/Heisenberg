@@ -47,6 +47,12 @@ impl Store {
         self.root.join("http_token")
     }
 
+    pub fn uploads_dir(&self) -> PathBuf {
+        let d = self.root.join("uploads");
+        let _ = std::fs::create_dir_all(&d);
+        d
+    }
+
     pub fn jobs_path(&self) -> PathBuf {
         self.root.join("jobs.json")
     }

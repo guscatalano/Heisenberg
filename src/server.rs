@@ -238,6 +238,11 @@ fn default_true() -> bool {
     true
 }
 
+/// Sanitize an upload id into a safe staging filename component (no path traversal).
+fn sanitize_upload_id(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(128).collect()
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DumpCaptureArgs {
     /// Target process id (preferred — unambiguous).
@@ -704,8 +709,14 @@ pub struct BinaryDeployArgs {
     /// Destination path on the box (e.g. "C:\\app\\app.exe"). Replaced if it exists,
     /// created (with parent dirs) if it doesn't.
     pub path: String,
-    /// The binary's bytes, base64-encoded (standard base64). This is the uploaded file.
-    pub source_b64: String,
+    /// The binary's bytes, base64-encoded (one-shot, for small files). Provide this OR
+    /// upload_id.
+    #[serde(default)]
+    pub source_b64: Option<String>,
+    /// Id of a chunked upload staged via upload.chunk (for larger files). Provide this
+    /// OR source_b64. The staged file is consumed (deleted) on a successful deploy.
+    #[serde(default)]
+    pub upload_id: Option<String>,
     /// Optional note stored with the backup version (when replacing).
     #[serde(default)]
     pub note: Option<String>,
@@ -713,6 +724,19 @@ pub struct BinaryDeployArgs {
     pub dry_run: bool,
     #[serde(default)]
     pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct UploadChunkArgs {
+    /// Upload id tying the chunks of one file together (e.g. "up-abc123"). Reused as
+    /// the staging filename; sanitized to [A-Za-z0-9_-].
+    pub id: String,
+    /// This chunk's bytes, base64-encoded.
+    pub data_b64: String,
+    /// 0-based chunk index. seq 0 (or omitted) starts a fresh staging file (truncates);
+    /// later chunks append. Send in order.
+    #[serde(default)]
+    pub seq: Option<u64>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2969,8 +2993,50 @@ impl Heisenberg {
     }
 
     #[tool(
+        name = "upload.chunk",
+        description = "Stage one chunk of a file upload into Heisenberg's uploads area (bytes as base64 in data_b64), to be placed later with binary.deploy using the same id as upload_id. Call once per chunk, in order: seq 0 (or omitted) starts a fresh staging file, later seq values append. Read-only to the machine (writes only under HEISENBERG_HOME; no gate). Returns the total staged bytes so far."
+    )]
+    async fn upload_chunk(
+        &self,
+        Parameters(a): Parameters<UploadChunkArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        use base64::Engine as _;
+        use std::io::Write;
+        let tool = "upload.chunk";
+        let docs = REPLACE_DOCS;
+        let id = sanitize_upload_id(&a.id);
+        if id.is_empty() {
+            return Ok(text(error(tool, ErrorKind::InvalidArgument, "bad id", "use a short id like \"up-abc123\" ([A-Za-z0-9_-])", Some(docs))));
+        }
+        let bytes = match base64::engine::general_purpose::STANDARD.decode(a.data_b64.trim()) {
+            Ok(b) => b,
+            Err(e) => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad base64 in data_b64: {e}"), "send the chunk bytes as standard base64", Some(docs)))),
+        };
+        let path = self.state.store.uploads_dir().join(format!("{id}.part"));
+        let first = a.seq.map(|s| s == 0).unwrap_or(true);
+        let res = (|| -> std::io::Result<u64> {
+            let mut f = if first {
+                std::fs::File::create(&path)?
+            } else {
+                std::fs::OpenOptions::new().append(true).open(&path)?
+            };
+            f.write_all(&bytes)?;
+            f.flush()?;
+            Ok(std::fs::metadata(&path)?.len())
+        })();
+        match res {
+            Ok(total) => Ok(text(
+                Outcome::new(tool, format!("staged chunk for '{id}' ({} bytes; {total} total)", bytes.len()))
+                    .data(json!({ "id": id, "uploadId": id, "chunkBytes": bytes.len(), "stagedBytes": total, "seq": a.seq }))
+                    .docs(docs).to_value(),
+            )),
+            Err(e) => Ok(text(error(tool, ErrorKind::Internal, format!("failed to stage chunk: {e}"), "check HEISENBERG_HOME is writable; send seq=0 first", Some(docs)))),
+        }
+    }
+
+    #[tool(
         name = "binary.deploy",
-        description = "Deploy a binary to the box from an UPLOADED file (bytes inline as base64 in source_b64) - e.g. push a private/rebuilt/instrumented build through the portal without staging it first. If the destination exists it is backed up (pinned original + versioned, HEISENBERG_BACKUP_KEEP) and replaced; if it doesn't exist it is created (parent dirs made). Handles loaded images and TrustedInstaller/System32 (takes ownership, restored on revert). State-changing, reversible via the ledger; needs elevation. dry_run + confirm. WARNING: a replacement/unsigned binary breaks Authenticode and may be reverted by SFC/WRP; kernel drivers won't load under Driver Signature Enforcement."
+        description = "Deploy a binary to the box from an UPLOADED file (bytes inline as base64 in source_b64, or chunked via upload.chunk + upload_id) - e.g. push a private/rebuilt/instrumented build through the portal without staging it first. If the destination exists it is backed up (pinned original + versioned, HEISENBERG_BACKUP_KEEP) and replaced; if it doesn't exist it is created (parent dirs made). Handles loaded images and TrustedInstaller/System32 (takes ownership, restored on revert). State-changing, reversible via the ledger; needs elevation. dry_run + confirm. WARNING: a replacement/unsigned binary breaks Authenticode and may be reverted by SFC/WRP; kernel drivers won't load under Driver Signature Enforcement."
     )]
     async fn binary_deploy(
         &self,
@@ -2979,11 +3045,28 @@ impl Heisenberg {
         use base64::Engine as _;
         let tool = "binary.deploy";
         let docs = REPLACE_DOCS;
-        let bytes = match base64::engine::general_purpose::STANDARD.decode(a.source_b64.trim()) {
-            Ok(b) if !b.is_empty() => b,
-            Ok(_) => return Ok(text(error(tool, ErrorKind::InvalidArgument, "empty file (source_b64 decoded to 0 bytes)", "upload a non-empty binary", Some(docs)))),
-            Err(e) => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad base64 in source_b64: {e}"), "send the file bytes as standard base64", Some(docs)))),
+        // Source the bytes from a chunked upload (staged via upload.chunk) or inline base64.
+        let staged_path = a.upload_id.as_deref().map(|uid| self.state.store.uploads_dir().join(format!("{}.part", sanitize_upload_id(uid))));
+        let bytes = match (&staged_path, a.source_b64.as_deref()) {
+            (Some(sp), _) => {
+                if sp.file_name().map(|n| n == ".part").unwrap_or(true) {
+                    return Ok(text(error(tool, ErrorKind::InvalidArgument, "bad upload_id", "use the id returned by upload.chunk", Some(docs))));
+                }
+                match std::fs::read(sp) {
+                    Ok(b) if !b.is_empty() => b,
+                    Ok(_) => return Ok(text(error(tool, ErrorKind::InvalidArgument, "the staged upload is empty", "re-stage the file with upload.chunk", Some(docs)))),
+                    Err(_) => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no staged upload '{}'", a.upload_id.as_deref().unwrap_or("")), "stage the file with upload.chunk first", Some(docs)))),
+                }
+            }
+            (None, Some(b64)) => match base64::engine::general_purpose::STANDARD.decode(b64.trim()) {
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) => return Ok(text(error(tool, ErrorKind::InvalidArgument, "empty file (source_b64 decoded to 0 bytes)", "upload a non-empty binary", Some(docs)))),
+                Err(e) => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad base64 in source_b64: {e}"), "send the file bytes as standard base64", Some(docs)))),
+            },
+            (None, None) => return Ok(text(error(tool, ErrorKind::InvalidArgument, "no bytes: provide source_b64 (small files) or upload_id (chunked via upload.chunk)", "give one of source_b64 / upload_id", Some(docs)))),
         };
+        // On a successful real deploy, consume the staged upload.
+        let cleanup = |dry: bool| { if !dry { if let Some(sp) = &staged_path { let _ = std::fs::remove_file(sp); } } };
         let target = std::path::PathBuf::from(&a.path);
         let exists = target.is_file();
         let sha = crate::signing::sha256_hex(&bytes);
@@ -3040,6 +3123,7 @@ impl Heisenberg {
                         .data(json!({ "path": a.path, "action": "replace", "bytes": size, "sha256": sha, "backupKey": rep.key, "backupVersion": rep.backup_n, "wasOriginal": rep.original, "tookOwnership": rep.owner.is_some(), "resource": format!("heisenberg://backups/{}", rep.key), "changeId": id }))
                         .command(cmd).docs(docs).warn(format!("revert with changes.revert to restore the prior binary. {sig_warn}"));
                     if rep.owner.is_some() { out = out.warn("took ownership of a protected (TrustedInstaller) file; original owner + ACL restored on revert"); }
+                    cleanup(false);
                     Ok(text(out.to_value()))
                 }
                 Err(e) => {
@@ -3058,6 +3142,7 @@ impl Heisenberg {
                 Ok(()) => {
                     self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
                     self.state.audit.record(tool, &format!("deployed (created) {}", a.path), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                    cleanup(false);
                     Ok(text(
                         Outcome::new(tool, format!("deployed {size} bytes -> {} (created new); change {id}", a.path))
                             .data(json!({ "path": a.path, "action": "create", "bytes": size, "sha256": sha, "changeId": id }))
