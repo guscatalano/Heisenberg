@@ -26,6 +26,10 @@ pub struct Knob {
     pub off_value: u32,
     pub requires_reboot: bool,
     pub danger: Option<&'static str>,
+    /// An app (winget/appx id) this knob needs to actually work when ON, e.g. the
+    /// Windows App that Windows 365 Boot signs in to the Cloud PC with.
+    pub requires_app: Option<&'static str>,
+    pub requires_app_label: Option<&'static str>,
 }
 
 pub const KNOBS: &[Knob] = &[
@@ -42,6 +46,8 @@ pub const KNOBS: &[Knob] = &[
         off_value: 0,
         requires_reboot: true,
         danger: Some("the device boots to the Cloud PC sign-in instead of local Windows — make sure you can reach and sign in to the Cloud PC first"),
+        requires_app: Some("Microsoft.WindowsApp"),
+        requires_app_label: Some("Windows App"),
     },
     Knob {
         id: "lsa.runAsPPL",
@@ -53,6 +59,8 @@ pub const KNOBS: &[Knob] = &[
         off_value: 0,
         requires_reboot: true,
         danger: Some("OFF leaves LSASS unprotected — prepared test VM only; re-enable before the box is used for anything real"),
+        requires_app: None,
+        requires_app_label: None,
     },
     Knob {
         id: "cloudap.fixState",
@@ -67,6 +75,8 @@ pub const KNOBS: &[Knob] = &[
         off_value: 0,
         requires_reboot: false,
         danger: None,
+        requires_app: None,
+        requires_app_label: None,
     },
     Knob {
         id: "cloudap.debugBreak",
@@ -78,6 +88,8 @@ pub const KNOBS: &[Knob] = &[
         off_value: 0,
         requires_reboot: false,
         danger: Some("requires a connected kernel debugger handling the break, or LSASS will hang"),
+        requires_app: None,
+        requires_app_label: None,
     },
 ];
 

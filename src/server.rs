@@ -82,6 +82,7 @@ const PATCH_DOCS: &str =
 const BIN_REPLACE_TOKEN: &str = "replace-binary-file";
 const BIN_DEPLOY_TOKEN: &str = "deploy-binary";
 const CONTROL_TOKEN: &str = "set-control";
+const APP_INSTALL_TOKEN: &str = "install-app";
 const CONTROLS_DOCS: &str =
     "https://learn.microsoft.com/windows-server/security/credentials-protection-and-management/configuring-additional-lsa-protection";
 const REPLACE_DOCS: &str =
@@ -244,6 +245,35 @@ fn default_true() -> bool {
 /// Sanitize an upload id into a safe staging filename component (no path traversal).
 fn sanitize_upload_id(s: &str) -> String {
     s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').take(128).collect()
+}
+
+/// Keep only characters valid in a winget/appx package id.
+fn sanitize_app_id(s: &str) -> String {
+    s.chars().filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_')).take(128).collect()
+}
+
+/// Whether an appx package (by family/name id) is installed for any user. `None` if
+/// it couldn't be determined.
+#[cfg(windows)]
+async fn app_installed(id: &str) -> Option<bool> {
+    let safe = sanitize_app_id(id);
+    if safe.is_empty() {
+        return None;
+    }
+    let script = format!("if (Get-AppxPackage -AllUsers -Name '{safe}' -ErrorAction SilentlyContinue) {{ 'yes' }} else {{ 'no' }}");
+    let out = tokio::time::timeout(Duration::from_secs(20), Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", &script]).output()).await.ok()?.ok()?;
+    let s = String::from_utf8_lossy(&out.stdout);
+    if s.contains("yes") {
+        Some(true)
+    } else if s.contains("no") {
+        Some(false)
+    } else {
+        None
+    }
+}
+#[cfg(not(windows))]
+async fn app_installed(_id: &str) -> Option<bool> {
+    None
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -739,6 +769,19 @@ pub struct DownloadChunkArgs {
     /// Max bytes to return (default 1 MiB, capped at 4 MiB).
     #[serde(default)]
     pub len: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AppInstallArgs {
+    /// winget package id, e.g. "Microsoft.WindowsApp".
+    pub id: String,
+    /// Optional winget source, e.g. "msstore" or "winget".
+    #[serde(default)]
+    pub source: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3228,6 +3271,76 @@ impl Heisenberg {
     }
 
     #[tool(
+        name = "app.install",
+        description = "Install an app by winget id (e.g. Microsoft.WindowsApp - the Windows App that Windows 365 Boot signs in to the Cloud PC with). Runs winget; state-changing, reversible via the ledger (winget uninstall); needs elevation. dry_run + confirm. Note: winget under a SYSTEM service can be flaky - if it fails, provision via env.provision / Groundhog."
+    )]
+    async fn app_install(
+        &self,
+        Parameters(a): Parameters<AppInstallArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "app.install";
+        let docs = CONTROLS_DOCS;
+        let id = sanitize_app_id(&a.id);
+        if id.is_empty() {
+            return Ok(text(error(tool, ErrorKind::InvalidArgument, "bad app id", "pass a winget id like Microsoft.WindowsApp", Some(docs))));
+        }
+        let source = a.source.as_deref().map(|s| s.chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>()).filter(|s| !s.is_empty());
+        let mut args: Vec<String> = vec!["install".into(), "--id".into(), id.clone(), "--silent".into(), "--accept-package-agreements".into(), "--accept-source-agreements".into()];
+        if let Some(src) = &source {
+            args.push("--source".into());
+            args.push(src.clone());
+        }
+        let cmd = format!("winget {}", args.join(" "));
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            return Ok(text(Outcome::new(tool, format!("[dry-run] would install {id} via winget"))
+                .data(json!({ "id": id, "source": source, "gate": decision })).command(cmd).docs(docs).warn("dry-run: no change made").to_value()));
+        }
+        if !env_probe::is_elevated() {
+            self.state.audit.record(tool, "not elevated", None, "blocked", None);
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "installing an app needs an elevated (admin) token", "re-run Heisenberg elevated", Some(docs))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, APP_INSTALL_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs))));
+            }
+        };
+        let change_id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(tool, &format!("install {id}"), RevertPlan::Command {
+                program: "winget".into(),
+                args: vec!["uninstall".into(), "--id".into(), id.clone(), "--silent".into(), "--accept-source-agreements".into()],
+                describe: format!("winget uninstall {id}"),
+            })
+        };
+        let run = tokio::time::timeout(Duration::from_secs(300), Command::new("winget").args(&args).output()).await;
+        match run {
+            Ok(Ok(o)) if o.status.success() => {
+                self.state.ledger.lock().unwrap().mark(&change_id, ChangeStatus::Applied);
+                self.state.audit.record(tool, &format!("installed {id}"), Some(&format!("{:?}", decision.gate)), "applied", Some(&change_id));
+                Ok(text(Outcome::new(tool, format!("installed {id}; change {change_id}"))
+                    .data(json!({ "id": id, "changeId": change_id })).command(cmd).docs(docs).warn("revert with changes.revert to winget-uninstall it").to_value()))
+            }
+            Ok(Ok(o)) => {
+                self.state.ledger.lock().unwrap().mark(&change_id, ChangeStatus::Failed);
+                let err = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
+                Ok(text(error(tool, ErrorKind::Internal, format!("winget failed (exit {:?}): {}", o.status.code(), last_chars(&err, 400)), "winget under a SYSTEM service is flaky; provision the app via env.provision / Groundhog instead", Some(docs))))
+            }
+            Ok(Err(e)) => {
+                self.state.ledger.lock().unwrap().mark(&change_id, ChangeStatus::Failed);
+                Ok(text(error(tool, ErrorKind::ToolNotInstalled, format!("couldn't run winget: {e}"), "winget isn't available in this context; provision via env.provision / Groundhog", Some(docs))))
+            }
+            Err(_) => {
+                self.state.ledger.lock().unwrap().mark(&change_id, ChangeStatus::Failed);
+                Ok(text(error(tool, ErrorKind::Timeout, "winget timed out", "retry, or provision via env.provision / Groundhog", Some(docs))))
+            }
+        }
+    }
+
+    #[tool(
         name = "control.set",
         description = "Flip a declared control/knob (see heisenberg://controls) on or off - a reversible HKLM registry toggle (e.g. LSA RunAsPPL, CloudAP GE FixState / DebugBreak). State-changing, reversible via the ledger; needs elevation. dry_run + confirm. Some knobs take effect only after reboot. This is what the portal's Controls panel drives."
     )]
@@ -3303,6 +3416,13 @@ impl Heisenberg {
                     .command(cmd).docs(docs).warn("revert with changes.revert to restore the prior value");
                 if knob.requires_reboot { out = out.warn("takes effect only after a reboot"); }
                 if let Some(d) = knob.danger { out = out.warn(d); }
+                if want == "on" {
+                    if let Some(app) = knob.requires_app {
+                        if app_installed(app).await == Some(false) {
+                            out = out.warn(format!("{} ({app}) is NOT installed — this won't fully work without it. Install it via app.install (id={app}) or env.provision / Groundhog.", knob.requires_app_label.unwrap_or(app)));
+                        }
+                    }
+                }
                 Ok(text(out.to_value()))
             }
             Some(e) => {
@@ -7798,15 +7918,20 @@ impl ServerHandler for Heisenberg {
                 serde_json::to_string_pretty(&json!({ "backups": all })).ok()
             }
             "heisenberg://controls" => {
-                let knobs: Vec<serde_json::Value> = crate::controls::KNOBS.iter().map(|k| {
+                let mut knobs: Vec<serde_json::Value> = Vec::new();
+                for k in crate::controls::KNOBS {
                     let (cur, raw) = crate::controls::current_state(k);
-                    json!({
+                    let requires = match k.requires_app {
+                        Some(id) => Some(json!({ "id": id, "label": k.requires_app_label, "installed": app_installed(id).await })),
+                        None => None,
+                    };
+                    knobs.push(json!({
                         "id": k.id, "label": k.label, "group": k.group, "description": k.description,
                         "kind": "toggle", "options": ["on", "off"], "current": cur,
-                        "requiresReboot": k.requires_reboot, "danger": k.danger,
+                        "requiresReboot": k.requires_reboot, "danger": k.danger, "requires": requires,
                         "regs": raw.iter().map(|(n, v)| json!({ "name": n, "value": v })).collect::<Vec<_>>(),
-                    })
-                }).collect();
+                    }));
+                }
                 serde_json::to_string_pretty(&json!({ "controls": knobs })).ok()
             }
             "heisenberg://tools" => {
@@ -8184,6 +8309,7 @@ ExceptionCode: c0000374\n";
         }
         gated.sort();
         let mut expected = vec![
+            "app.install",
             "appverifier.enable",
             "binary.deploy",
             "binary.patch",

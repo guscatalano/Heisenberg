@@ -468,6 +468,21 @@ async function openControls(){
       const onBtn=document.createElement("button"); onBtn.className="go"; onBtn.textContent="On"; onBtn.style.padding="4px 12px";
       const offBtn=document.createElement("button"); offBtn.className="go"; offBtn.textContent="Off"; offBtn.style.cssText="padding:4px 12px;background:#2a3550;color:#cfe0ff";
       top.append(name, state, onBtn, offBtn); card.append(top);
+      if(k.requires){
+        const dep=document.createElement("div"); dep.style.cssText="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap";
+        const inst=k.requires.installed; const chip=document.createElement("span"); chip.className="badge";
+        const dlabel=(k.requires.label||k.requires.id);
+        if(inst===true){ chip.textContent="needs "+dlabel+": installed"; chip.style.color="var(--ok)"; }
+        else if(inst===false){ chip.textContent="needs "+dlabel+": NOT installed"; chip.style.color="var(--warn)"; }
+        else { chip.textContent="needs "+dlabel+": unknown"; chip.style.color="var(--mut)"; }
+        dep.append(chip);
+        if(inst===false){ const ib=document.createElement("button"); ib.className="go"; ib.style.cssText="padding:3px 10px"; ib.textContent="Install "+dlabel;
+          ib.onclick=async()=>{ ib.textContent="installing… (winget, can be slow)"; ib.disabled=true;
+            try{ const r=await toolCall("app.install",{id:k.requires.id, source:"msstore"}); if(r&&r.ok===false){ ib.textContent="failed — "+(((r.error&&r.error.message)||"")+(r.error&&r.error.remedy?(" · "+r.error.remedy):"")).slice(0,120); } else { chip.textContent="needs "+dlabel+": installed"; chip.style.color="var(--ok)"; ib.remove(); } }
+            catch(e){ ib.disabled=false; ib.textContent="Install "+dlabel+" (error)"; } };
+          dep.append(ib); }
+        card.append(dep);
+      }
       const desc=document.createElement("div"); desc.innerHTML="<small>"+(k.description||"").replace(/</g,"&lt;")+(k.requiresReboot?" <b>(reboot to apply)</b>":"")+(k.danger?(" — <span style='color:var(--warn)'>"+(""+k.danger).replace(/</g,"&lt;")+"</span>"):"")+"</small>"; card.append(desc);
       const res=document.createElement("div"); res.className="hint"; card.append(res);
       async function set(st){
