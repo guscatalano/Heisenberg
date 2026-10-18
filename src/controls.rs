@@ -7,6 +7,8 @@
 const LSA: &str = r"SYSTEM\CurrentControlSet\Control\Lsa";
 const CLOUDAP_POLICY: &str =
     r"SOFTWARE\Microsoft\IdentityStore\LoadParameters\{B16898C6-A148-4967-9171-64D755DA8520}";
+const W365_CLOUDDESKTOP: &str = r"SOFTWARE\Microsoft\PolicyManager\current\device\CloudDesktop";
+const W365_WINLOGON: &str = r"SOFTWARE\Microsoft\PolicyManager\current\device\WindowsLogon";
 
 pub struct RegDword {
     pub subkey: &'static str,
@@ -27,6 +29,20 @@ pub struct Knob {
 }
 
 pub const KNOBS: &[Knob] = &[
+    Knob {
+        id: "w365.bootToCloud",
+        label: "Windows 365 Boot (boot to Cloud PC)",
+        group: "Windows 365",
+        description: "Boot the physical device straight into the Cloud PC: BootToCloudMode + the lightweight logon shell (OverrideShellProgram). Turn OFF to boot into the local Windows desktop instead. Takes effect on reboot.",
+        regs: &[
+            RegDword { subkey: W365_CLOUDDESKTOP, name: "BootToCloudMode" },
+            RegDword { subkey: W365_WINLOGON, name: "OverrideShellProgram" },
+        ],
+        on_value: 1,
+        off_value: 0,
+        requires_reboot: true,
+        danger: Some("the device boots to the Cloud PC sign-in instead of local Windows — make sure you can reach and sign in to the Cloud PC first"),
+    },
     Knob {
         id: "lsa.runAsPPL",
         label: "LSA protection (RunAsPPL)",
@@ -67,11 +83,6 @@ pub const KNOBS: &[Knob] = &[
 
 pub fn find(id: &str) -> Option<&'static Knob> {
     KNOBS.iter().find(|k| k.id == id)
-}
-
-/// The single registry subkey a knob lives under (all its regs share one).
-pub fn subkey(k: &Knob) -> &'static str {
-    k.regs.first().map(|r| r.subkey).unwrap_or("")
 }
 
 /// Current state of a knob: "on" | "off" | "unset" | "mixed", plus each reg's raw value.

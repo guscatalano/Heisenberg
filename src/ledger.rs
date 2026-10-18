@@ -8,6 +8,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::{regutil, store};
 
+/// One HKLM subkey's prior DWORD state, for `RegRestoreMulti`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegGroup {
+    pub subkey: String,
+    pub dwords: Vec<(String, Option<u32>)>,
+    pub created_key: bool,
+}
+
 /// How to undo one change.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind")]
@@ -60,6 +68,10 @@ pub enum RevertPlan {
     /// Delete a file we created (undoes a `binary.deploy` that placed a NEW file
     /// where none existed). Best-effort: a missing file counts as already reverted.
     FileCreate { path: String },
+    /// Restore several HKLM subkeys at once (undoes a knob that spans more than one
+    /// key, e.g. Windows 365 Boot: CloudDesktop + WindowsLogon). Each group restores
+    /// its prior DWORD values, or deletes the key if we created it.
+    RegRestoreMulti { groups: Vec<RegGroup> },
     /// Restore a whole file from a backup snapshot (undoes binary.replace), putting
     /// back the TrustedInstaller owner/ACL if we had to take ownership, and cleaning
     /// up a renamed-aside loaded image.
@@ -142,6 +154,12 @@ impl RevertPlan {
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                     Err(e) => Err(anyhow::anyhow!("delete created file {path}: {e}")),
                 }
+            }
+            RevertPlan::RegRestoreMulti { groups } => {
+                for g in groups {
+                    regutil::hklm_restore(&g.subkey, &[], &g.dwords, g.created_key)?;
+                }
+                Ok(())
             }
             RevertPlan::FileReplace { path, backup_file, restore_acl, restore_owner, stray_old } => {
                 crate::backup::restore(

@@ -485,7 +485,7 @@ async function openControls(){
 }
 
 async function openChanges(){
-  const KIND={ FileReplace:"restore the previous binary", FileCreate:"delete the deployed file", RegRestore:"restore registry value(s)", IfeoFlags:"restore IFEO/page-heap flags", HkcuEnv:"restore an environment variable", CrashControl:"restore crash-dump mode", MemoryPatch:"rewrite the original bytes in the live process", FilePatch:"restore the original file bytes", SilentProcessExit:"restore silent-process-exit settings", Command:"run a command to undo", Manual:"manual undo required" };
+  const KIND={ FileReplace:"restore the previous binary", FileCreate:"delete the deployed file", RegRestore:"restore registry value(s)", RegRestoreMulti:"restore registry value(s)", IfeoFlags:"restore IFEO/page-heap flags", HkcuEnv:"restore an environment variable", CrashControl:"restore crash-dump mode", MemoryPatch:"rewrite the original bytes in the live process", FilePatch:"restore the original file bytes", SilentProcessExit:"restore silent-process-exit settings", Command:"run a command to undo", Manual:"manual undo required" };
   const wrap=document.createElement("div");
   const h=document.createElement("h2"); h.textContent="Changes"; wrap.append(h);
   const bar=document.createElement("div"); bar.className="row"; bar.style.alignItems="center";

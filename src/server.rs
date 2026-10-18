@@ -3248,7 +3248,6 @@ impl Heisenberg {
             _ => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad state '{}'", a.state), "state must be \"on\" or \"off\"", Some(docs)))),
         };
         let (cur, raw) = crate::controls::current_state(knob);
-        let subkey = crate::controls::subkey(knob);
         let cmd = format!("set control {} = {want}", knob.id);
 
         if a.dry_run {
@@ -3273,17 +3272,20 @@ impl Heisenberg {
             }
         };
 
-        // Capture prior DWORDs for revert, record the inverse, then apply.
-        let priors: Vec<(String, Option<u32>)> = knob.regs.iter().map(|r| (r.name.to_string(), regutil::hklm_read_dword(r.subkey, r.name))).collect();
-        let created_key = !regutil::hklm_key_exists(subkey);
+        // Group the knob's regs by subkey (a knob may span multiple keys, e.g. W365 Boot),
+        // capturing prior values per key so one revert restores them all.
+        let mut by_subkey: std::collections::BTreeMap<&str, Vec<&crate::controls::RegDword>> = std::collections::BTreeMap::new();
+        for r in knob.regs {
+            by_subkey.entry(r.subkey).or_default().push(r);
+        }
+        let groups: Vec<crate::ledger::RegGroup> = by_subkey.iter().map(|(sk, regs)| crate::ledger::RegGroup {
+            subkey: sk.to_string(),
+            dwords: regs.iter().map(|r| (r.name.to_string(), regutil::hklm_read_dword(r.subkey, r.name))).collect(),
+            created_key: !regutil::hklm_key_exists(sk),
+        }).collect();
         let id = {
             let mut l = self.state.ledger.lock().unwrap();
-            l.begin(tool, &format!("set {} = {want}", knob.id), RevertPlan::RegRestore {
-                subkey: subkey.to_string(),
-                strings: vec![],
-                dwords: priors,
-                created_key,
-            })
+            l.begin(tool, &format!("set {} = {want}", knob.id), RevertPlan::RegRestoreMulti { groups })
         };
         let mut apply_err = None;
         for r in knob.regs {
