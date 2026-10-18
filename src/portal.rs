@@ -201,7 +201,7 @@ a{color:var(--acc)}
 </div>
 <script>
 const RES = [
-  ["env","heisenberg://env"],["policy","heisenberg://policy"],["changes","heisenberg://changes"],
+  ["env","heisenberg://env"],["policy","heisenberg://policy"],
   ["dumps","heisenberg://dumps"],["backups","heisenberg://backups"],["captures","heisenberg://captures"],
   ["repros","heisenberg://repros"],["sessions","heisenberg://sessions"],["tools (inv.)","heisenberg://tools"],
   ["audit","heisenberg://audit"],
@@ -484,6 +484,49 @@ async function openControls(){
   show(wrap);
 }
 
+async function openChanges(){
+  const KIND={ FileReplace:"restore the previous binary", FileCreate:"delete the deployed file", RegRestore:"restore registry value(s)", IfeoFlags:"restore IFEO/page-heap flags", HkcuEnv:"restore an environment variable", CrashControl:"restore crash-dump mode", MemoryPatch:"rewrite the original bytes in the live process", FilePatch:"restore the original file bytes", SilentProcessExit:"restore silent-process-exit settings", Command:"run a command to undo", Manual:"manual undo required" };
+  const wrap=document.createElement("div");
+  const h=document.createElement("h2"); h.textContent="Changes"; wrap.append(h);
+  const bar=document.createElement("div"); bar.className="row"; bar.style.alignItems="center";
+  const sub=document.createElement("small"); bar.append(sub);
+  const revAll=document.createElement("button"); revAll.className="go"; revAll.style.cssText="padding:4px 10px;background:var(--bad);color:#200"; revAll.textContent="Revert all applied";
+  const rf=document.createElement("button"); rf.className="go"; rf.style.cssText="padding:4px 10px;background:#2a3550;color:#cfe0ff"; rf.textContent="↻ refresh";
+  bar.append(revAll, rf); wrap.append(bar);
+  const list=document.createElement("div"); wrap.append(list);
+  async function doRevert(id, btn){ if(btn){ btn.textContent="…"; btn.disabled=true; } try{ const r=await toolCall("changes.revert",{id:id}); if(r&&r.ok===false){ if(btn){ btn.textContent="failed"; btn.title=(r.error&&r.error.message)||""; } return false; } return true; }catch(e){ if(btn){ btn.textContent="err"; } return false; } }
+  async function load(){
+    list.innerHTML="";
+    let data; try{ data=await resource("heisenberg://changes"); }catch(e){ list.append(pre("ERROR: "+e.message)); return; }
+    const changes=((data&&data.changes)||[]).slice().reverse();
+    const applied=changes.filter(c=>c.status==="applied");
+    sub.textContent=changes.length+" change(s) · "+applied.length+" currently applied";
+    revAll.style.display=applied.length?"":"none";
+    if(!changes.length){ list.append(pre("Nothing has been changed yet. Mutations (deploy / replace / knobs / gflags …) show up here, each with a one-click Revert.")); return; }
+    changes.forEach(c=>{
+      const card=document.createElement("div"); card.className="card";
+      const top=document.createElement("div"); top.style.cssText="display:flex;align-items:center;gap:10px;flex-wrap:wrap";
+      const sm=document.createElement("b"); sm.textContent=c.summary;
+      const st=document.createElement("span"); st.className="badge"; st.textContent=c.status;
+      st.style.color = c.status==="applied"?"var(--ok)":(c.status==="reverted"?"var(--mut)":(c.status==="failed"?"var(--bad)":"var(--warn)"));
+      top.append(sm, st);
+      if(c.status==="applied"){ const rb=document.createElement("button"); rb.className="go"; rb.style.cssText="padding:4px 12px;background:var(--bad);color:#200"; rb.textContent="Revert"; rb.onclick=async()=>{ if(await doRevert(c.id, rb)){ load(); } }; top.append(rb); }
+      card.append(top);
+      const kind=(c.revert&&c.revert.kind)||"";
+      const when = (c.status==="reverted" && c.reverted_at) ? ("reverted "+c.reverted_at) : ("applied "+c.applied_at);
+      const meta=document.createElement("div"); meta.innerHTML="<small>"+(""+c.tool).replace(/</g,"&lt;")+" · "+when+" · undo: "+((KIND[kind]||kind)).replace(/</g,"&lt;")+" · <span style='color:var(--mut)'>"+c.id+"</span></small>"; card.append(meta);
+      list.append(card);
+    });
+  }
+  revAll.onclick=async()=>{ revAll.disabled=true; const t=revAll.textContent; revAll.textContent="reverting…";
+    let data; try{ data=await resource("heisenberg://changes"); }catch(e){ revAll.disabled=false; revAll.textContent=t; return; }
+    const applied=((data&&data.changes)||[]).filter(c=>c.status==="applied").reverse();
+    for(const c of applied){ await doRevert(c.id); }
+    revAll.disabled=false; revAll.textContent=t; load();
+  };
+  rf.onclick=load; await load(); show(wrap);
+}
+
 function buildNav(){
   const nav = document.getElementById("nav"); nav.innerHTML="";
   const mk = (label, fn)=>{ const b=document.createElement("button"); b.textContent=label; b.onclick=()=>{ [...nav.children].forEach(c=>c.classList.remove("on")); b.classList.add("on"); fn(); }; nav.append(b); return b; };
@@ -491,6 +534,7 @@ function buildNav(){
   mk("🎛 Controls", openControls);
   mk("📈 Traces", openTraces);
   mk("⬆ Deploy binary", openDeploy);
+  mk("📝 Changes", openChanges);
   RES.forEach(([label,uri])=> mk(label, ()=>openResource(uri,label)) );
   toolsBtn.classList.add("on");
 }
