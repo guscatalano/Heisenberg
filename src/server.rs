@@ -276,6 +276,40 @@ async fn app_installed(_id: &str) -> Option<bool> {
     None
 }
 
+/// Locate winget.exe, which isn't on PATH for a SYSTEM service / fresh profile
+/// (mirrors Groundhog's finder: PATH, the WindowsApps alias, then the newest
+/// Microsoft.DesktopAppInstaller package directly).
+#[cfg(windows)]
+fn locate_winget() -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    let exists = |p: &PathBuf| std::fs::symlink_metadata(p).is_ok();
+    let on_path: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|p| std::env::split_paths(&p).map(|d| d.join("winget.exe")).collect())
+        .unwrap_or_default();
+    let alias = std::env::var_os("LOCALAPPDATA").map(|d| PathBuf::from(d).join(r"Microsoft\WindowsApps\winget.exe"));
+    if let Some(found) = on_path.into_iter().chain(alias).find(exists) {
+        return Some(found);
+    }
+    let apps = PathBuf::from(std::env::var_os("ProgramFiles")?).join("WindowsApps");
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(apps)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            let n = p.file_name().and_then(|n| n.to_str()).unwrap_or_default();
+            n.starts_with("Microsoft.DesktopAppInstaller_") && n.contains("_x64__")
+        })
+        .map(|p| p.join("winget.exe"))
+        .filter(|p| p.is_file())
+        .collect();
+    candidates.sort();
+    candidates.pop()
+}
+#[cfg(not(windows))]
+fn locate_winget() -> Option<std::path::PathBuf> {
+    None
+}
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DumpCaptureArgs {
     /// Target process id (preferred — unambiguous).
@@ -769,6 +803,12 @@ pub struct DownloadChunkArgs {
     /// Max bytes to return (default 1 MiB, capped at 4 MiB).
     #[serde(default)]
     pub len: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AppStatusArgs {
+    /// winget/appx id to check, e.g. "Microsoft.WindowsApp".
+    pub id: String,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3308,36 +3348,64 @@ impl Heisenberg {
                 return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs))));
             }
         };
+        // Resolve winget (not on PATH for a SYSTEM service) before committing a ledger entry.
+        let winget = match locate_winget() {
+            Some(p) => p,
+            None => return Ok(text(error(tool, ErrorKind::ToolNotInstalled, "winget (App Installer) not found", "install App Installer, or provision the app via env.provision / Groundhog", Some(docs)))),
+        };
+        let wg = winget.display().to_string();
         let change_id = {
             let mut l = self.state.ledger.lock().unwrap();
             l.begin(tool, &format!("install {id}"), RevertPlan::Command {
-                program: "winget".into(),
+                program: wg.clone(),
                 args: vec!["uninstall".into(), "--id".into(), id.clone(), "--silent".into(), "--accept-source-agreements".into()],
                 describe: format!("winget uninstall {id}"),
             })
         };
-        let run = tokio::time::timeout(Duration::from_secs(300), Command::new("winget").args(&args).output()).await;
+        // winget success codes: 0, plus "already installed" / "reboot required".
+        const WINGET_OK: &[i32] = &[0, 0x8A15_0061u32 as i32, 0x8A15_010Du32 as i32, 0x8A15_0109u32 as i32, 0x8A15_010Au32 as i32, 0x8A15_010Bu32 as i32];
+        let run = tokio::time::timeout(Duration::from_secs(300), Command::new(&winget).args(&args).output()).await;
         match run {
-            Ok(Ok(o)) if o.status.success() => {
+            Ok(Ok(o)) if WINGET_OK.contains(&o.status.code().unwrap_or(-1)) => {
                 self.state.ledger.lock().unwrap().mark(&change_id, ChangeStatus::Applied);
                 self.state.audit.record(tool, &format!("installed {id}"), Some(&format!("{:?}", decision.gate)), "applied", Some(&change_id));
-                Ok(text(Outcome::new(tool, format!("installed {id}; change {change_id}"))
-                    .data(json!({ "id": id, "changeId": change_id })).command(cmd).docs(docs).warn("revert with changes.revert to winget-uninstall it").to_value()))
+                let reboot = matches!(o.status.code(), Some(c) if c == 0x8A15_0109u32 as i32 || c == 0x8A15_010Au32 as i32 || c == 0x8A15_010Bu32 as i32);
+                let mut out = Outcome::new(tool, format!("installed {id}; change {change_id}"))
+                    .data(json!({ "id": id, "winget": wg, "exitCode": o.status.code(), "changeId": change_id })).command(cmd).docs(docs).warn("revert with changes.revert to winget-uninstall it");
+                if reboot { out = out.warn("winget reports a reboot is required to finish"); }
+                Ok(text(out.to_value()))
             }
             Ok(Ok(o)) => {
                 self.state.ledger.lock().unwrap().mark(&change_id, ChangeStatus::Failed);
                 let err = String::from_utf8_lossy(&o.stdout).to_string() + &String::from_utf8_lossy(&o.stderr);
-                Ok(text(error(tool, ErrorKind::Internal, format!("winget failed (exit {:?}): {}", o.status.code(), last_chars(&err, 400)), "winget under a SYSTEM service is flaky; provision the app via env.provision / Groundhog instead", Some(docs))))
+                Ok(text(error(tool, ErrorKind::Internal, format!("winget failed (exit 0x{:08X}): {}", o.status.code().unwrap_or(-1) as u32, last_chars(&err, 400)), "a SYSTEM msstore install can need a user context; provision via env.provision / Groundhog instead", Some(docs))))
             }
             Ok(Err(e)) => {
                 self.state.ledger.lock().unwrap().mark(&change_id, ChangeStatus::Failed);
-                Ok(text(error(tool, ErrorKind::ToolNotInstalled, format!("couldn't run winget: {e}"), "winget isn't available in this context; provision via env.provision / Groundhog", Some(docs))))
+                Ok(text(error(tool, ErrorKind::Internal, format!("couldn't run winget: {e}"), "provision via env.provision / Groundhog", Some(docs))))
             }
             Err(_) => {
                 self.state.ledger.lock().unwrap().mark(&change_id, ChangeStatus::Failed);
                 Ok(text(error(tool, ErrorKind::Timeout, "winget timed out", "retry, or provision via env.provision / Groundhog", Some(docs))))
             }
         }
+    }
+
+    #[tool(
+        name = "app.status",
+        description = "Check whether an app (winget/appx id, e.g. Microsoft.WindowsApp) is installed for any user. Read-only. The portal calls this lazily to fill in a knob's required-app status without slowing the Controls panel."
+    )]
+    async fn app_status(
+        &self,
+        Parameters(a): Parameters<AppStatusArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let id = sanitize_app_id(&a.id);
+        if id.is_empty() {
+            return Ok(text(error("app.status", ErrorKind::InvalidArgument, "bad app id", "pass a winget/appx id", Some(CONTROLS_DOCS))));
+        }
+        let installed = app_installed(&id).await;
+        let s = match installed { Some(true) => "installed", Some(false) => "not installed", None => "unknown" };
+        Ok(text(Outcome::new("app.status", format!("{id}: {s}")).data(json!({ "id": id, "installed": installed })).docs(CONTROLS_DOCS).to_value()))
     }
 
     #[tool(
@@ -7918,20 +7986,19 @@ impl ServerHandler for Heisenberg {
                 serde_json::to_string_pretty(&json!({ "backups": all })).ok()
             }
             "heisenberg://controls" => {
-                let mut knobs: Vec<serde_json::Value> = Vec::new();
-                for k in crate::controls::KNOBS {
+                // Fast: registry state only. A knob's required-app status (which shells
+                // out to Get-AppxPackage and is slow) is fetched lazily by the portal via
+                // app.status, so opening Controls doesn't block on it.
+                let knobs: Vec<serde_json::Value> = crate::controls::KNOBS.iter().map(|k| {
                     let (cur, raw) = crate::controls::current_state(k);
-                    let requires = match k.requires_app {
-                        Some(id) => Some(json!({ "id": id, "label": k.requires_app_label, "installed": app_installed(id).await })),
-                        None => None,
-                    };
-                    knobs.push(json!({
+                    let requires = k.requires_app.map(|id| json!({ "id": id, "label": k.requires_app_label }));
+                    json!({
                         "id": k.id, "label": k.label, "group": k.group, "description": k.description,
                         "kind": "toggle", "options": ["on", "off"], "current": cur,
                         "requiresReboot": k.requires_reboot, "danger": k.danger, "requires": requires,
                         "regs": raw.iter().map(|(n, v)| json!({ "name": n, "value": v })).collect::<Vec<_>>(),
-                    }));
-                }
+                    })
+                }).collect();
                 serde_json::to_string_pretty(&json!({ "controls": knobs })).ok()
             }
             "heisenberg://tools" => {

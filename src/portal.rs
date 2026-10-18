@@ -470,18 +470,24 @@ async function openControls(){
       top.append(name, state, onBtn, offBtn); card.append(top);
       if(k.requires){
         const dep=document.createElement("div"); dep.style.cssText="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap";
-        const inst=k.requires.installed; const chip=document.createElement("span"); chip.className="badge";
         const dlabel=(k.requires.label||k.requires.id);
-        if(inst===true){ chip.textContent="needs "+dlabel+": installed"; chip.style.color="var(--ok)"; }
-        else if(inst===false){ chip.textContent="needs "+dlabel+": NOT installed"; chip.style.color="var(--warn)"; }
-        else { chip.textContent="needs "+dlabel+": unknown"; chip.style.color="var(--mut)"; }
-        dep.append(chip);
-        if(inst===false){ const ib=document.createElement("button"); ib.className="go"; ib.style.cssText="padding:3px 10px"; ib.textContent="Install "+dlabel;
-          ib.onclick=async()=>{ ib.textContent="installing… (winget, can be slow)"; ib.disabled=true;
-            try{ const r=await toolCall("app.install",{id:k.requires.id, source:"msstore"}); if(r&&r.ok===false){ ib.textContent="failed — "+(((r.error&&r.error.message)||"")+(r.error&&r.error.remedy?(" · "+r.error.remedy):"")).slice(0,120); } else { chip.textContent="needs "+dlabel+": installed"; chip.style.color="var(--ok)"; ib.remove(); } }
-            catch(e){ ib.disabled=false; ib.textContent="Install "+dlabel+" (error)"; } };
-          dep.append(ib); }
-        card.append(dep);
+        const chip=document.createElement("span"); chip.className="badge"; chip.textContent="needs "+dlabel+": checking…"; chip.style.color="var(--mut)";
+        dep.append(chip); card.append(dep);
+        // Lazy: fetch the app's install status so opening Controls doesn't block on it.
+        (async()=>{
+          let inst=null;
+          try{ const r=await toolCall("app.status",{id:k.requires.id}); inst=(r&&r.data)?r.data.installed:null; }catch(e){ inst=null; }
+          if(inst===true){ chip.textContent="needs "+dlabel+": installed"; chip.style.color="var(--ok)"; return; }
+          if(inst!==false){ chip.textContent="needs "+dlabel+": unknown"; chip.style.color="var(--mut)"; return; }
+          chip.textContent="needs "+dlabel+": NOT installed"; chip.style.color="var(--warn)";
+          const ib=document.createElement("button"); ib.className="go"; ib.style.cssText="padding:3px 10px"; ib.textContent="Install "+dlabel;
+          ib.onclick=async()=>{ ib.disabled=true; ib.textContent="installing… (can be slow)";
+            try{ const r=await toolCall("app.install",{id:k.requires.id, source:"msstore"});
+              if(r&&r.ok===false){ ib.disabled=false; ib.textContent="Install "+dlabel; chip.textContent="needs "+dlabel+": install failed — "+(((r.error&&r.error.message)||"")+(r.error&&r.error.remedy?(" · "+r.error.remedy):"")).slice(0,160); chip.style.color="var(--bad)"; }
+              else { chip.textContent="needs "+dlabel+": installed"; chip.style.color="var(--ok)"; ib.remove(); } }
+            catch(e){ ib.disabled=false; ib.textContent="Install "+dlabel; } };
+          dep.append(ib);
+        })();
       }
       const desc=document.createElement("div"); desc.innerHTML="<small>"+(k.description||"").replace(/</g,"&lt;")+(k.requiresReboot?" <b>(reboot to apply)</b>":"")+(k.danger?(" — <span style='color:var(--warn)'>"+(""+k.danger).replace(/</g,"&lt;")+"</span>"):"")+"</small>"; card.append(desc);
       const res=document.createElement("div"); res.className="hint"; card.append(res);
