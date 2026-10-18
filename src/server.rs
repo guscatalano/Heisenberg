@@ -81,6 +81,9 @@ const PATCH_DOCS: &str =
     "https://learn.microsoft.com/windows/win32/api/memoryapi/nf-memoryapi-writeprocessmemory";
 const BIN_REPLACE_TOKEN: &str = "replace-binary-file";
 const BIN_DEPLOY_TOKEN: &str = "deploy-binary";
+const CONTROL_TOKEN: &str = "set-control";
+const CONTROLS_DOCS: &str =
+    "https://learn.microsoft.com/windows-server/security/credentials-protection-and-management/configuring-additional-lsa-protection";
 const REPLACE_DOCS: &str =
     "https://learn.microsoft.com/windows/win32/fileio/deleting-and-renaming-files";
 
@@ -720,6 +723,30 @@ pub struct BinaryDeployArgs {
     /// Optional note stored with the backup version (when replacing).
     #[serde(default)]
     pub note: Option<String>,
+    #[serde(default)]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub confirm: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DownloadChunkArgs {
+    /// Full path of the file on the box to read a slice from.
+    pub path: String,
+    /// Byte offset to start at (default 0).
+    #[serde(default)]
+    pub offset: Option<u64>,
+    /// Max bytes to return (default 1 MiB, capped at 4 MiB).
+    #[serde(default)]
+    pub len: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ControlSetArgs {
+    /// The control/knob id (see heisenberg://controls), e.g. "lsa.runAsPPL".
+    pub id: String,
+    /// Desired state: "on" or "off".
+    pub state: String,
     #[serde(default)]
     pub dry_run: bool,
     #[serde(default)]
@@ -3153,6 +3180,132 @@ impl Heisenberg {
                     self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
                     Ok(text(error(tool, ErrorKind::Internal, format!("deploy (create) failed: {e}"), "check the destination path and that its folder is writable", Some(docs))))
                 }
+            }
+        }
+    }
+
+    #[tool(
+        name = "download.chunk",
+        description = "Read a slice of a file on the box and return it base64-encoded, so the portal can download large artifacts (traces/dumps/ZIPs) in chunks. Returns the slice, the file's total size, and whether this was the final chunk. Read-only."
+    )]
+    async fn download_chunk(
+        &self,
+        Parameters(a): Parameters<DownloadChunkArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        use base64::Engine as _;
+        use std::io::{Read, Seek, SeekFrom};
+        let tool = "download.chunk";
+        let docs = REPLACE_DOCS;
+        let path = std::path::PathBuf::from(&a.path);
+        let meta = match std::fs::metadata(&path) {
+            Ok(m) if m.is_file() => m,
+            _ => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("file not found: {}", a.path), "pass a path to a file on the box", Some(docs)))),
+        };
+        let total = meta.len();
+        let offset = a.offset.unwrap_or(0);
+        let cap = a.len.unwrap_or(1024 * 1024).min(4 * 1024 * 1024);
+        if offset >= total {
+            return Ok(text(Outcome::new(tool, format!("eof at {offset}/{total}"))
+                .data(json!({ "path": a.path, "offset": offset, "len": 0, "total": total, "eof": true, "dataB64": "" })).docs(docs).to_value()));
+        }
+        let len = cap.min(total - offset);
+        let read = (|| -> std::io::Result<Vec<u8>> {
+            let mut f = std::fs::File::open(&path)?;
+            f.seek(SeekFrom::Start(offset))?;
+            let mut buf = vec![0u8; len as usize];
+            f.read_exact(&mut buf)?;
+            Ok(buf)
+        })();
+        match read {
+            Ok(buf) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&buf);
+                let eof = offset + len >= total;
+                Ok(text(Outcome::new(tool, format!("{len} bytes at {offset}/{total}"))
+                    .data(json!({ "path": a.path, "offset": offset, "len": len, "total": total, "eof": eof, "dataB64": b64 })).docs(docs).to_value()))
+            }
+            Err(e) => Ok(text(error(tool, ErrorKind::Internal, format!("read failed: {e}"), "check the path and permissions", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "control.set",
+        description = "Flip a declared control/knob (see heisenberg://controls) on or off - a reversible HKLM registry toggle (e.g. LSA RunAsPPL, CloudAP GE FixState / DebugBreak). State-changing, reversible via the ledger; needs elevation. dry_run + confirm. Some knobs take effect only after reboot. This is what the portal's Controls panel drives."
+    )]
+    async fn control_set(
+        &self,
+        Parameters(a): Parameters<ControlSetArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "control.set";
+        let docs = CONTROLS_DOCS;
+        let knob = match crate::controls::find(&a.id) {
+            Some(k) => k,
+            None => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no control '{}'", a.id), "see heisenberg://controls for the available knobs", Some(docs)))),
+        };
+        let want = a.state.trim().to_lowercase();
+        let target = match want.as_str() {
+            "on" => knob.on_value,
+            "off" => knob.off_value,
+            _ => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad state '{}'", a.state), "state must be \"on\" or \"off\"", Some(docs)))),
+        };
+        let (cur, raw) = crate::controls::current_state(knob);
+        let subkey = crate::controls::subkey(knob);
+        let cmd = format!("set control {} = {want}", knob.id);
+
+        if a.dry_run {
+            let decision = self.state.policy.decide(tool, EffectTier::StateChanging);
+            let mut out = Outcome::new(tool, format!("[dry-run] would set {} = {want} (currently {cur})", knob.id))
+                .data(json!({ "id": knob.id, "label": knob.label, "current": cur, "wouldSet": want, "regs": raw, "requiresReboot": knob.requires_reboot, "gate": decision }))
+                .command(cmd).docs(docs).warn("dry-run: no change made");
+            if let Some(d) = knob.danger { out = out.warn(d); }
+            if knob.requires_reboot { out = out.warn("takes effect only after reboot"); }
+            return Ok(text(out.to_value()));
+        }
+
+        if !env_probe::is_elevated() {
+            self.state.audit.record(tool, "not elevated", None, "blocked", None);
+            return Ok(text(error(tool, ErrorKind::RequiresElevation, "setting an HKLM control needs an elevated (admin) token", "re-run Heisenberg elevated, or via the elevated broker", Some(docs))));
+        }
+        let decision = match gate::enforce(&self.state.policy, tool, EffectTier::StateChanging, CONTROL_TOKEN, a.confirm.as_deref(), &self.state.approvals) {
+            Ok(d) => d,
+            Err(b) => {
+                self.state.audit.record(tool, &b.reason, Some(&format!("{:?}", b.gate)), "blocked", None);
+                return Ok(text(error(tool, b.kind, b.reason, b.remedy, Some(docs))));
+            }
+        };
+
+        // Capture prior DWORDs for revert, record the inverse, then apply.
+        let priors: Vec<(String, Option<u32>)> = knob.regs.iter().map(|r| (r.name.to_string(), regutil::hklm_read_dword(r.subkey, r.name))).collect();
+        let created_key = !regutil::hklm_key_exists(subkey);
+        let id = {
+            let mut l = self.state.ledger.lock().unwrap();
+            l.begin(tool, &format!("set {} = {want}", knob.id), RevertPlan::RegRestore {
+                subkey: subkey.to_string(),
+                strings: vec![],
+                dwords: priors,
+                created_key,
+            })
+        };
+        let mut apply_err = None;
+        for r in knob.regs {
+            if let Err(e) = regutil::hklm_set_dword(r.subkey, r.name, target) {
+                apply_err = Some(e);
+                break;
+            }
+        }
+        match apply_err {
+            None => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Applied);
+                self.state.audit.record(tool, &format!("set {} = {want}", knob.id), Some(&format!("{:?}", decision.gate)), "applied", Some(&id));
+                let mut out = Outcome::new(tool, format!("set {} = {want} (was {cur}); change {id}", knob.id))
+                    .data(json!({ "id": knob.id, "state": want, "previous": cur, "requiresReboot": knob.requires_reboot, "changeId": id }))
+                    .command(cmd).docs(docs).warn("revert with changes.revert to restore the prior value");
+                if knob.requires_reboot { out = out.warn("takes effect only after a reboot"); }
+                if let Some(d) = knob.danger { out = out.warn(d); }
+                Ok(text(out.to_value()))
+            }
+            Some(e) => {
+                self.state.ledger.lock().unwrap().mark(&id, ChangeStatus::Failed);
+                Ok(text(error(tool, ErrorKind::Internal, format!("failed to set control: {e}"), "check elevation and the registry key", Some(docs))))
             }
         }
     }
@@ -7581,6 +7734,7 @@ impl ServerHandler for Heisenberg {
             Resource::new("heisenberg://dumps", "Captured dumps".to_string()),
             Resource::new("heisenberg://repros", "Repro recipes".to_string()),
             Resource::new("heisenberg://backups", "Binary-replacement backups".to_string()),
+            Resource::new("heisenberg://controls", "Controls / knobs (stateful toggles)".to_string()),
             Resource::new("heisenberg://captures", "Background capture jobs".to_string()),
             Resource::new("heisenberg://cases", "Exported case bundles".to_string()),
             Resource::new("heisenberg://sessions", "Open debug sessions".to_string()),
@@ -7640,6 +7794,18 @@ impl ServerHandler for Heisenberg {
             "heisenberg://backups" => {
                 let all = crate::backup::list_all(&self.state.store.backups_dir());
                 serde_json::to_string_pretty(&json!({ "backups": all })).ok()
+            }
+            "heisenberg://controls" => {
+                let knobs: Vec<serde_json::Value> = crate::controls::KNOBS.iter().map(|k| {
+                    let (cur, raw) = crate::controls::current_state(k);
+                    json!({
+                        "id": k.id, "label": k.label, "group": k.group, "description": k.description,
+                        "kind": "toggle", "options": ["on", "off"], "current": cur,
+                        "requiresReboot": k.requires_reboot, "danger": k.danger,
+                        "regs": raw.iter().map(|(n, v)| json!({ "name": n, "value": v })).collect::<Vec<_>>(),
+                    })
+                }).collect();
+                serde_json::to_string_pretty(&json!({ "controls": knobs })).ok()
             }
             "heisenberg://tools" => {
                 serde_json::to_string_pretty(&json!({ "tools": self.state.locator.inventory() })).ok()
@@ -8021,6 +8187,7 @@ ExceptionCode: c0000374\n";
             "binary.patch",
             "binary.replace",
             "boot.trace",
+            "control.set",
             "dump.onCrashInstall",
             "dump.onExit",
             "env.provision",

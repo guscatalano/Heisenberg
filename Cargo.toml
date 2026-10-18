@@ -1,6 +1,6 @@
 [package]
 name = "heisenberg"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2021"
 rust-version = "1.88"
 description = "Windows-only MCP server that makes native debugging easy for an agent, wrapping only free Microsoft-published tools."

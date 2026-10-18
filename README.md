@@ -89,7 +89,9 @@ Tools today:
 | `appverifier.enable` | Enable Application Verifier for an image via IFEO (reversible; needs elevation). |
 | `memory.patch` / `binary.patch` | Patch bytes in a live process (`WriteProcessMemory`, ASLR-aware module+RVA) or in a PE file on disk (RVA→file offset). Reversible via the ledger; `dry_run` + confirm. |
 | `binary.replace` | Replace a whole binary file with another (rebuilt / instrumented / fixed build). Pristine original pinned, each replace versioned, retention-capped (`HEISENBERG_BACKUP_KEEP`); handles loaded images (renames aside) and TrustedInstaller/System32 (takes ownership, restored on revert). Reversible; needs elevation; `dry_run` + confirm. |
+| `control.set` | Flip a declared **knob** (see `heisenberg://controls`) on/off — a reversible HKLM registry toggle (LSA `RunAsPPL`, CloudAP GE `FixState`/`DebugBreak`). Reversible via the ledger; needs elevation; `dry_run` + confirm. Drives the portal's **Controls** panel. |
 | `upload.chunk` | Stage one chunk of a file upload (base64) under `HEISENBERG_HOME`, keyed by `id` (seq 0 starts fresh, later seqs append). Lets the portal upload a local file in small pieces instead of one large request. Read-only to the machine (no gate). |
+| `download.chunk` | Read a slice of a file on the box (base64) with the file's total size + an eof flag — lets the portal download large artifacts (traces/dumps/ZIPs) in chunks. Read-only. |
 | `binary.deploy` | Deploy an **uploaded** binary — inline (`source_b64`, small files) or a chunked upload (`upload_id` from `upload.chunk`, large files). Creates the destination (parent dirs made) or backs-up-and-replaces it, including ACL'd TrustedInstaller/System32 targets (same path as `binary.replace`). Reversible (revert restores prior bytes, or deletes a newly-created file); needs elevation; `dry_run` + confirm. Powers the portal's **Deploy binary** tab. |
 | `ttd.record` / `ttd.stop` / `ttd.replay` | Record a process to a Time Travel Debugging `.run` trace (a `job.*` capture) and replay it in cdb. |
 | `leak.heapTrackStart` / `leak.heapSnapshot` / `leak.heapDiff` | Enable the UMDH stack DB (IFEO), snapshot a heap, and diff snapshots to find leaks. |
@@ -158,7 +160,14 @@ On start it prints a bearer **token** and the URLs:
   state (env, policy + gate matrix, ledger, dumps, backups, captures, repros, audit),
   a tool runner, and a **Deploy binary** tab (pick a local file + destination path →
   uploaded in small chunks with a progress bar via `upload.chunk`, then placed with
-  `binary.deploy`, create-or-replace, reversible — works on ACL'd System32 targets).
+  `binary.deploy`, create-or-replace, reversible — works on ACL'd System32 targets),
+  a **Controls** panel: declared knobs (`heisenberg://controls`) rendered as live
+  on/off toggles — e.g. LSA `RunAsPPL`, CloudAP GE `FixState`/`DebugBreak` — each flip
+  a reversible registry change through the gate + ledger; and a **Traces** panel:
+  the background capture jobs (`heisenberg://captures`) with Start (opens the tool
+  form), Stop (`job.stop`), and chunked **Download** (`download.chunk`) of each
+  artifact. The tool runner renders each tool's **input schema as a form** (toggles,
+  dropdowns, fields) with a raw-JSON escape.
   The portal is itself an MCP client, so **every tool call goes through the same gate /
   confirm-token / ledger / audit as any other client** — the safety spine is not
   bypassed. The token is kept in the browser's `localStorage`, so a refresh keeps it.

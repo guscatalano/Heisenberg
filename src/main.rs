@@ -8,6 +8,7 @@ mod approvals;
 mod audit;
 mod backup;
 mod config;
+mod controls;
 mod docs;
 mod dumps;
 mod env_probe;

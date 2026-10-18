@@ -283,29 +283,107 @@ async function openResource(uri, label){
   } catch(e){ show(pre("ERROR: "+e.message)); }
 }
 
-async function openTools(){
+async function openTools(preselect){
   const wrap = document.createElement("div");
   const h = document.createElement("h2"); h.textContent = "Run a tool"; wrap.append(h);
-  const tools = await toolsList();
+  const tools = (await toolsList()).sort((a,b)=>a.name.localeCompare(b.name));
   const row = document.createElement("div"); row.className="row";
   const sel = document.createElement("select");
-  tools.sort((a,b)=>a.name.localeCompare(b.name)).forEach(t=>{ const o=document.createElement("option"); o.value=t.name; o.textContent=t.name; sel.append(o); });
+  tools.forEach(t=>{ const o=document.createElement("option"); o.value=t.name; o.textContent=t.name; sel.append(o); });
+  const rawL=document.createElement("label"); rawL.style.cssText="font-size:12px;color:var(--mut);display:flex;align-items:center;gap:4px"; const rawCb=document.createElement("input"); rawCb.type="checkbox"; rawL.append(rawCb, document.createTextNode("edit as JSON"));
   const run = document.createElement("button"); run.className="go"; run.textContent="Run";
-  row.append(sel, run); wrap.append(row);
+  row.append(sel, rawL, run); wrap.append(row);
   const desc = document.createElement("div"); desc.className="card"; wrap.append(desc);
-  const ta = document.createElement("textarea"); ta.value="{}"; wrap.append(ta);
-  const hint = document.createElement("div"); hint.className="hint"; wrap.append(hint);
+  const form = document.createElement("div"); wrap.append(form);
+  const ta = document.createElement("textarea"); ta.value="{}"; ta.style.display="none"; wrap.append(ta);
   const out = document.createElement("pre"); out.textContent="(result)"; wrap.append(out);
-  function refresh(){ const t=tools.find(x=>x.name===sel.value); desc.innerHTML = "<small>"+(t&&t.description?t.description.replace(/</g,"&lt;"):"")+"</small>";
-    hint.textContent = /gated|state-changing|reversible|needs elevation/i.test(t&&t.description||"") ? "mutating tool — may return a confirm token / require elevation; add it to the args and re-run." : ""; }
-  sel.onchange = refresh; refresh();
-  run.onclick = async ()=>{
-    let args; try{ args = JSON.parse(ta.value||"{}"); }catch(e){ out.textContent="bad JSON args: "+e.message; return; }
-    out.textContent = "running "+sel.value+"…";
-    try { const r = await toolCall(sel.value, args); out.textContent = JSON.stringify(r,null,2);
-      out.className = (r && r.ok===false) ? "err" : "good"; } catch(e){ out.className="err"; out.textContent="ERROR: "+e.message; }
-  };
-  show(wrap);
+  let fields={};
+  function schemaOf(name){ const t=tools.find(x=>x.name===name); return (t&&t.inputSchema)||{properties:{}}; }
+  function build(){
+    const t=tools.find(x=>x.name===sel.value);
+    desc.innerHTML="<small>"+(t&&t.description?t.description.replace(/</g,"&lt;"):"")+"</small>";
+    form.innerHTML=""; fields={};
+    if(rawCb.checked){ form.style.display="none"; ta.style.display=""; return; }
+    form.style.display=""; ta.style.display="none";
+    const sch=schemaOf(sel.value); const props=sch.properties||{}; const req=sch.required||[];
+    Object.keys(props).forEach(k=>{
+      const p=props[k]||{}; const fr=document.createElement("div"); fr.className="row"; fr.style.alignItems="center";
+      const lbl=document.createElement("label"); lbl.textContent=k+(req.includes(k)?" *":""); lbl.style.cssText="min-width:140px;font-size:13px;color:var(--mut)";
+      const typ=Array.isArray(p.type)?p.type.find(x=>x!=="null"):p.type;
+      const enumv=p.enum||(p.anyOf&&p.anyOf.map(x=>x.const).filter(x=>x!==undefined));
+      let input;
+      if(enumv&&enumv.length){ input=document.createElement("select"); const b=document.createElement("option"); b.value=""; b.textContent="(unset)"; input.append(b); enumv.forEach(v=>{const o=document.createElement("option");o.value=v;o.textContent=v;input.append(o);}); input.dataset.kind="enum"; }
+      else if(typ==="boolean"){ input=document.createElement("input"); input.type="checkbox"; input.dataset.kind="bool"; }
+      else if(typ==="integer"||typ==="number"){ input=document.createElement("input"); input.type="number"; input.dataset.kind="num"; input.style.flex="1"; }
+      else if(typ==="array"||typ==="object"){ input=document.createElement("input"); input.type="text"; input.placeholder="JSON "+typ; input.dataset.kind="json"; input.style.flex="1"; }
+      else { input=document.createElement("input"); input.type="text"; input.dataset.kind="str"; input.style.flex="1"; }
+      if(p.description) input.title=p.description;
+      fields[k]=input; fr.append(lbl, input); form.append(fr);
+    });
+  }
+  function collect(){
+    if(rawCb.checked) return JSON.parse(ta.value||"{}");
+    const args={};
+    Object.keys(fields).forEach(k=>{ const inp=fields[k], kind=inp.dataset.kind;
+      if(kind==="bool"){ if(inp.checked) args[k]=true; return; }
+      const v=inp.value; if(v===""||v==null) return;
+      if(kind==="num") args[k]=Number(v); else if(kind==="json") args[k]=JSON.parse(v); else args[k]=v;
+    });
+    return args;
+  }
+  sel.onchange=build;
+  rawCb.onchange=()=>{ if(rawCb.checked){ try{ ta.value=JSON.stringify(collect(),null,2); }catch(e){} } build(); };
+  run.onclick=async()=>{ let args; try{ args=collect(); }catch(e){ out.className="err"; out.textContent="bad args: "+e.message; return; }
+    out.className=""; out.textContent="running "+sel.value+"…";
+    try{ const r=await toolCall(sel.value,args); out.textContent=JSON.stringify(r,null,2); out.className=(r&&r.ok===false)?"err":"good"; }catch(e){ out.className="err"; out.textContent="ERROR: "+e.message; } };
+  if(preselect){ sel.value=preselect; }
+  build(); show(wrap);
+}
+
+async function downloadFile(path, btn){
+  const old=btn.textContent;
+  try{
+    let off=0, total=null; const parts=[];
+    for(;;){
+      const r=await toolCall("download.chunk",{ path:path, offset:off, len:1048576 });
+      if(r&&r.ok===false) throw new Error((r.error&&r.error.message)||"download failed");
+      const d=r.data; total=d.total; const bin=atob(d.dataB64||""); const u=new Uint8Array(bin.length); for(let i=0;i<bin.length;i++) u[i]=bin.charCodeAt(i); parts.push(u);
+      off+=d.len; btn.textContent=total?(Math.round(off/total*100)+"%"):"…";
+      if(d.eof || d.len===0) break;
+    }
+    const blob=new Blob(parts); const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=(path.split(/[\\/]/).pop()||"download.bin"); document.body.append(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+    btn.textContent=old;
+  }catch(e){ btn.textContent="err"; setTimeout(()=>btn.textContent=old,1500); }
+}
+
+async function openTraces(){
+  const wrap=document.createElement("div");
+  const h=document.createElement("h2"); h.textContent="Traces / captures"; wrap.append(h);
+  const bar=document.createElement("div"); bar.className="row"; bar.style.alignItems="center";
+  const sl=document.createElement("small"); sl.textContent="start a capture: "; bar.append(sl);
+  [["net.captureStart","network"],["logs.etwStart","ETW/WPR"],["trace.cpuSample","CPU"],["procmon.start","Procmon"],["dump.onTrigger","dump-on-trigger"]].forEach(([t,lbl])=>{ const b=document.createElement("button"); b.className="go"; b.style.cssText="padding:4px 10px;background:#2a3550;color:#cfe0ff"; b.textContent="+ "+lbl; b.onclick=()=>openTools(t); bar.append(b); });
+  const rf=document.createElement("button"); rf.className="go"; rf.style.padding="4px 10px"; rf.textContent="↻ refresh"; bar.append(rf);
+  wrap.append(bar);
+  const list=document.createElement("div"); wrap.append(list);
+  async function load(){
+    list.innerHTML="";
+    let data; try{ data=await resource("heisenberg://captures"); }catch(e){ list.append(pre("ERROR: "+e.message)); return; }
+    const jobs=(data&&data.jobs)||[];
+    if(!jobs.length){ list.append(pre("(no captures)")); return; }
+    jobs.forEach(j=>{
+      const card=document.createElement("div"); card.className="card";
+      const top=document.createElement("div"); top.style.cssText="display:flex;align-items:center;gap:10px;flex-wrap:wrap";
+      const nm=document.createElement("b"); nm.textContent=j.kind+" · "+j.id;
+      const st=document.createElement("span"); st.className="badge"; st.textContent=j.state; st.style.color=(j.state==="running")?"var(--ok)":"var(--mut)";
+      top.append(nm, st);
+      if(j.state==="running"){ const stop=document.createElement("button"); stop.className="go"; stop.style.cssText="padding:4px 10px;background:var(--bad);color:#200"; stop.textContent="Stop"; stop.onclick=async()=>{ stop.textContent="…"; try{ await toolCall("job.stop",{id:j.id}); }catch(e){} load(); }; top.append(stop); }
+      if(j.backing_file){ const dl=document.createElement("button"); dl.className="go"; dl.style.padding="4px 10px"; dl.textContent="Download"; dl.onclick=()=>downloadFile(j.backing_file, dl); top.append(dl); }
+      card.append(top);
+      const meta=document.createElement("div"); meta.innerHTML="<small>"+((j.summary||"").replace(/</g,"&lt;"))+(j.backing_file?("<br>"+(""+j.backing_file).replace(/</g,"&lt;")):"")+" · started "+j.started+"</small>"; card.append(meta);
+      list.append(card);
+    });
+  }
+  rf.onclick=load; await load(); show(wrap);
 }
 
 async function openDeploy(){
@@ -366,10 +444,47 @@ async function openDeploy(){
   show(wrap);
 }
 
+async function openControls(){
+  const wrap=document.createElement("div");
+  const h=document.createElement("h2"); h.textContent="Controls"; wrap.append(h);
+  let data; try{ data=await resource("heisenberg://controls"); }catch(e){ show(pre("ERROR: "+e.message)); return; }
+  const knobs=(data&&data.controls)||[];
+  if(!knobs.length){ wrap.append(pre("(no controls declared)")); show(wrap); return; }
+  const groups={}; knobs.forEach(k=>{ (groups[k.group]=groups[k.group]||[]).push(k); });
+  Object.keys(groups).forEach(g=>{
+    const gh=document.createElement("h3"); gh.textContent=g; gh.style.cssText="font-size:12px;color:var(--mut);margin:14px 0 6px;text-transform:uppercase;letter-spacing:.6px"; wrap.append(gh);
+    groups[g].forEach(k=>{
+      const card=document.createElement("div"); card.className="card";
+      const top=document.createElement("div"); top.style.cssText="display:flex;align-items:center;gap:10px;flex-wrap:wrap";
+      const name=document.createElement("b"); name.textContent=k.label;
+      const state=document.createElement("span"); state.className="badge";
+      function paint(s){ state.textContent=s; state.style.color = s==="on"?"var(--ok)":(s==="off"?"var(--mut)":"var(--warn)"); }
+      paint(k.current);
+      const onBtn=document.createElement("button"); onBtn.className="go"; onBtn.textContent="On"; onBtn.style.padding="4px 12px";
+      const offBtn=document.createElement("button"); offBtn.className="go"; offBtn.textContent="Off"; offBtn.style.cssText="padding:4px 12px;background:#2a3550;color:#cfe0ff";
+      top.append(name, state, onBtn, offBtn); card.append(top);
+      const desc=document.createElement("div"); desc.innerHTML="<small>"+(k.description||"").replace(/</g,"&lt;")+(k.requiresReboot?" <b>(reboot to apply)</b>":"")+(k.danger?(" — <span style='color:var(--warn)'>"+(""+k.danger).replace(/</g,"&lt;")+"</span>"):"")+"</small>"; card.append(desc);
+      const res=document.createElement("div"); res.className="hint"; card.append(res);
+      async function set(st){
+        res.style.color="var(--mut)"; res.textContent="setting "+k.id+" = "+st+"…";
+        try{ const r=await toolCall("control.set",{id:k.id, state:st});
+          if(r&&r.ok===false){ res.style.color="var(--bad)"; res.textContent=((r.error&&r.error.message)||JSON.stringify(r.error))+((r.error&&r.error.remedy)?(" — "+r.error.remedy):""); }
+          else { res.style.color="var(--ok)"; res.textContent=r.summary||"ok"; paint(st); }
+        }catch(e){ res.style.color="var(--bad)"; res.textContent="ERROR: "+e.message; }
+      }
+      onBtn.onclick=()=>set("on"); offBtn.onclick=()=>set("off");
+      wrap.append(card);
+    });
+  });
+  show(wrap);
+}
+
 function buildNav(){
   const nav = document.getElementById("nav"); nav.innerHTML="";
   const mk = (label, fn)=>{ const b=document.createElement("button"); b.textContent=label; b.onclick=()=>{ [...nav.children].forEach(c=>c.classList.remove("on")); b.classList.add("on"); fn(); }; nav.append(b); return b; };
-  const toolsBtn = mk("▶ Run a tool", openTools);
+  const toolsBtn = mk("▶ Run a tool", ()=>openTools());
+  mk("🎛 Controls", openControls);
+  mk("📈 Traces", openTraces);
   mk("⬆ Deploy binary", openDeploy);
   RES.forEach(([label,uri])=> mk(label, ()=>openResource(uri,label)) );
   toolsBtn.classList.add("on");
