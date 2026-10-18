@@ -206,10 +206,15 @@ const RES = [
   ["repros","heisenberg://repros"],["sessions","heisenberg://sessions"],["tools (inv.)","heisenberg://tools"],
   ["audit","heisenberg://audit"],
 ];
-let TOKEN = new URLSearchParams(location.search).get("token") || localStorage.getItem("hb_token") || "";
-// Persist in localStorage so a refresh / tab close / restart keeps the token
-// (sessionStorage was lost on refresh). Still bootstraps from ?token= and strips it.
-if(TOKEN){ try{ localStorage.setItem("hb_token", TOKEN); }catch(e){} history.replaceState({}, "", location.pathname); }
+let qsTok = new URLSearchParams(location.search).get("token");
+let TOKEN = qsTok || localStorage.getItem("hb_token") || "";
+if(TOKEN){
+  try{ localStorage.setItem("hb_token", TOKEN); }catch(e){}
+  // Keep the token in the URL so a refresh carries it even when the browser won't
+  // persist localStorage (private mode / strict privacy / http origin). If we loaded
+  // it from storage (no ?token), put it back in the URL.
+  if(!qsTok){ try{ history.replaceState({}, "", location.pathname + "?token=" + encodeURIComponent(TOKEN)); }catch(e){} }
+}
 function forgetToken(){ try{ localStorage.removeItem("hb_token"); }catch(e){} location.href = location.pathname; }
 let SESSION = null;
 
@@ -491,7 +496,17 @@ function buildNav(){
 }
 
 (async function(){
-  if(!TOKEN){ show(pre("No token. Open this page as /?token=YOUR_TOKEN (printed when the server started).")); return; }
+  if(!TOKEN){
+    const w=document.createElement("div");
+    const h=document.createElement("h2"); h.textContent="Connect"; w.append(h);
+    const c=document.createElement("div"); c.className="card"; c.innerHTML="<small>Paste the bearer token (printed when the server started), or open this page as <code>/?token=YOUR_TOKEN</code>.</small>"; w.append(c);
+    const row=document.createElement("div"); row.className="row";
+    const inp=document.createElement("input"); inp.type="text"; inp.placeholder="bearer token"; inp.style.flex="1"; inp.style.minWidth="320px";
+    const go=document.createElement("button"); go.className="go"; go.textContent="Connect";
+    go.onclick=()=>{ const t=inp.value.trim(); if(t){ try{localStorage.setItem("hb_token",t);}catch(e){} location.href=location.pathname+"?token="+encodeURIComponent(t); } };
+    inp.onkeydown=(e)=>{ if(e.key==="Enter"){ go.onclick(); } };
+    row.append(inp, go); w.append(row); show(w); return;
+  }
   try { await connect(); buildNav(); openTools(); }
   catch(e){ show(pre("Could not connect: "+e.message)); document.getElementById("conn").innerHTML="<span class='err'>disconnected</span>"; }
 })();
