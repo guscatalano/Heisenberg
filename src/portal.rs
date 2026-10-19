@@ -590,6 +590,14 @@ function render(knobs, wrap, reload, slot, clearSlot){
         })();
       }
       const desc=document.createElement("div"); desc.innerHTML="<small>"+(k.description||"").replace(/</g,"&lt;")+(k.requiresReboot?" <b>(reboot to apply)</b>":"")+(k.danger?(" — <span style='color:var(--warn)'>"+(""+k.danger).replace(/</g,"&lt;")+"</span>"):"")+"</small>"; card.append(desc);
+      // Show exactly which registry values this knob flips (and their live value).
+      const regs=(k.regs||[]);
+      if(regs.length){
+        const rl=document.createElement("div"); rl.style.cssText="margin-top:6px;font:11px ui-monospace,monospace;color:var(--mut);border-left:2px solid #2a3550;padding-left:8px";
+        const hd=document.createElement("div"); hd.textContent="sets "+regs.length+" value"+(regs.length>1?"s":"")+":"; hd.style.opacity=".8"; rl.append(hd);
+        regs.forEach(r=>{ const line=document.createElement("div"); const v=(r.value==null?"unset":String(r.value)); line.textContent="• "+r.name+" = "+v; line.title=(r.subkey?("HKLM\\"+r.subkey+"\\"+r.name):r.name); rl.append(line); });
+        card.append(rl);
+      }
       const res=document.createElement("div"); res.className="hint"; card.append(res);
       async function set(st){
         res.style.color="var(--mut)"; res.textContent="setting "+k.id+" = "+st+"…";
