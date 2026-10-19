@@ -598,12 +598,25 @@ function render(knobs, wrap, reload, slot, clearSlot){
         regs.forEach(r=>{ const line=document.createElement("div"); const v=(r.value==null?"unset":String(r.value)); line.textContent="• "+r.name+" = "+v; line.title=(r.subkey?("HKLM\\"+r.subkey+"\\"+r.name):r.name); rl.append(line); });
         card.append(rl);
       }
+      // Inline Undo: appears right after you flip this knob, reverts that exact change.
+      const undo=document.createElement("button"); undo.className="go"; undo.textContent="↩ Undo"; undo.title="Revert the change you just made"; undo.style.cssText="padding:4px 12px;background:var(--bad);color:#200;display:none";
+      top.append(undo);
       const res=document.createElement("div"); res.className="hint"; card.append(res);
       async function set(st){
-        res.style.color="var(--mut)"; res.textContent="setting "+k.id+" = "+st+"…";
+        undo.style.display="none"; res.style.color="var(--mut)"; res.textContent="setting "+k.id+" = "+st+"…";
         try{ const r=await toolCall("control.set",{id:k.id, state:st});
           if(r&&r.ok===false){ res.style.color="var(--bad)"; res.textContent=((r.error&&r.error.message)||JSON.stringify(r.error))+((r.error&&r.error.remedy)?(" — "+r.error.remedy):""); }
-          else { res.style.color="var(--ok)"; res.textContent=r.summary||"ok"; paint(st); }
+          else {
+            res.style.color="var(--ok)"; res.textContent=r.summary||"ok"; paint(st);
+            const cid=r.data&&r.data.changeId;
+            if(cid){ undo.style.display=""; undo.disabled=false;
+              undo.onclick=async()=>{ undo.disabled=true; undo.textContent="undoing…";
+                try{ const rv=await toolCall("changes.revert",{id:cid});
+                  if(rv&&rv.ok===false){ undo.textContent="↩ Undo"; undo.disabled=false; res.style.color="var(--bad)"; res.textContent="undo failed: "+((rv.error&&rv.error.message)||""); }
+                  else { undo.style.display="none"; undo.textContent="↩ Undo"; res.style.color="var(--mut)"; res.textContent="reverted — restored the previous value"; reload(); }
+                }catch(e){ undo.textContent="↩ Undo"; undo.disabled=false; res.style.color="var(--bad)"; res.textContent="undo error: "+e.message; } };
+            }
+          }
         }catch(e){ res.style.color="var(--bad)"; res.textContent="ERROR: "+e.message; }
       }
       onBtn.onclick=()=>set("on"); offBtn.onclick=()=>set("off");
