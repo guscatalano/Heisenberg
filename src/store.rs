@@ -37,6 +37,12 @@ impl Store {
         self.root.join("repros.json")
     }
 
+    /// User-defined control knobs (added/imported from the portal), merged with the
+    /// built-in catalog at `heisenberg://controls`.
+    pub fn controls_path(&self) -> PathBuf {
+        self.root.join("controls.json")
+    }
+
     pub fn backups_dir(&self) -> PathBuf {
         let d = self.root.join("backups");
         let _ = std::fs::create_dir_all(&d);

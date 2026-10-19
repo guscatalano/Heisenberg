@@ -57,6 +57,15 @@ Useful env vars for testing:
   the Wait Chain Traversal API (live cross-process deadlock detection).
 - `tools.rs` — external-tool locator; `docs.rs` — public-doc links; `envelope.rs`
   — the uniform result/error envelope.
+- `controls.rs` — the "knob" catalog (stateful registry toggles) exposed at
+  `heisenberg://controls` and flipped by the gated `control.set`. Built-in `KNOBS`
+  (compiled) are merged with **user knobs** — an owned `UserKnobStore` persisted to
+  `HEISENBERG_HOME\controls.json` that operators add/edit/import from the portal
+  (`control.add` / `control.remove` / `control.import`). Those three only edit the
+  catalog config, so they are **not** gated and **not** in the gate-lock test; the
+  registry write still happens through `control.set` (elevation + gate + ledger), so
+  a user knob is no more privileged than a built-in. `find_view`/`views` return an
+  owned `KnobView` that unifies both sources; new built-ins are still added as data.
 - `portal.rs` — opt-in HTTP surface (`heisenberg serve-http`): rmcp
   `StreamableHttpService` at `/mcp` + a bearer-gated, loopback-default web portal at
   `/` (an embedded SPA that drives `/mcp` as an MCP client — no separate dispatch, so

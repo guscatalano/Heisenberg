@@ -114,6 +114,9 @@ pub struct AppState {
     pub dumps: Mutex<DumpRegistry>,
     pub repros: Mutex<crate::repro::ReproStore>,
     pub jobs: Mutex<JobRegistry>,
+    /// User-defined control knobs added/imported from the portal (merged with the
+    /// built-in catalog at `heisenberg://controls`).
+    pub controls: Mutex<crate::controls::UserKnobStore>,
     pub audit: Audit,
     /// Operator-added tool search folders (persisted); shared with the locator.
     pub extra_folders: Arc<Mutex<Vec<PathBuf>>>,
@@ -132,6 +135,7 @@ impl AppState {
         let dumps = DumpRegistry::load(store.dumps_path());
         let repros = crate::repro::ReproStore::load(store.repros_path());
         let jobs = JobRegistry::load(store.jobs_path());
+        let controls = crate::controls::UserKnobStore::load(store.controls_path());
         let audit = Audit::open(store.audit_path());
         let folders_path = store.folders_path();
         let folders: Vec<PathBuf> = std::fs::read(&folders_path)
@@ -149,6 +153,7 @@ impl AppState {
             dumps: Mutex::new(dumps),
             repros: Mutex::new(repros),
             jobs: Mutex::new(jobs),
+            controls: Mutex::new(controls),
             audit,
             approvals: Approvals::load(store.approvals_path()),
             sessions: crate::sessions::DebugSessions::new(),
@@ -834,6 +839,53 @@ pub struct ControlSetArgs {
     pub dry_run: bool,
     #[serde(default)]
     pub confirm: Option<String>,
+}
+
+/// Define (or overwrite) a user knob. This only writes Heisenberg's own catalog
+/// config — the registry write still happens later through `control.set` (gated).
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ControlAddArgs {
+    /// Stable id, e.g. "cloudap.myToggle". Letters/digits/'.'/'_'/'-'; can't collide with a built-in.
+    pub id: String,
+    /// Human label shown in the portal.
+    pub label: String,
+    /// Group heading (defaults to "Custom").
+    #[serde(default)]
+    pub group: Option<String>,
+    /// What the knob does / when to flip it.
+    #[serde(default)]
+    pub description: Option<String>,
+    /// The HKLM DWORD(s) this knob flips together (all set to on_value / off_value).
+    pub regs: Vec<crate::controls::KnobReg>,
+    /// Value written for "on" (default 1).
+    #[serde(default)]
+    pub on_value: Option<u32>,
+    /// Value written for "off" (default 0).
+    #[serde(default)]
+    pub off_value: Option<u32>,
+    #[serde(default)]
+    pub requires_reboot: bool,
+    /// Optional warning shown before flipping it on.
+    #[serde(default)]
+    pub danger: Option<String>,
+    /// Overwrite an existing user knob of the same id instead of erroring.
+    #[serde(default)]
+    pub replace: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ControlRemoveArgs {
+    /// Id of the user knob to remove (built-in knobs can't be removed).
+    pub id: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ControlImportArgs {
+    /// A batch of user knobs to add (same shape as control.add, minus `replace`).
+    pub knobs: Vec<crate::controls::UserKnob>,
+    /// Overwrite existing user knobs of the same id.
+    #[serde(default)]
+    pub replace: bool,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -3418,17 +3470,19 @@ impl Heisenberg {
     ) -> Result<CallToolResult, McpError> {
         let tool = "control.set";
         let docs = CONTROLS_DOCS;
-        let knob = match crate::controls::find(&a.id) {
+        let user = self.state.controls.lock().unwrap().list().to_vec();
+        let knob = match crate::controls::find_view(&a.id, &user) {
             Some(k) => k,
             None => return Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no control '{}'", a.id), "see heisenberg://controls for the available knobs", Some(docs)))),
         };
+        let knob = &knob;
         let want = a.state.trim().to_lowercase();
         let target = match want.as_str() {
             "on" => knob.on_value,
             "off" => knob.off_value,
             _ => return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("bad state '{}'", a.state), "state must be \"on\" or \"off\"", Some(docs)))),
         };
-        let (cur, raw) = crate::controls::current_state(knob);
+        let (cur, raw) = knob.current_state();
         let cmd = format!("set control {} = {want}", knob.id);
 
         if a.dry_run {
@@ -3436,7 +3490,7 @@ impl Heisenberg {
             let mut out = Outcome::new(tool, format!("[dry-run] would set {} = {want} (currently {cur})", knob.id))
                 .data(json!({ "id": knob.id, "label": knob.label, "current": cur, "wouldSet": want, "regs": raw, "requiresReboot": knob.requires_reboot, "gate": decision }))
                 .command(cmd).docs(docs).warn("dry-run: no change made");
-            if let Some(d) = knob.danger { out = out.warn(d); }
+            if let Some(d) = &knob.danger { out = out.warn(d.clone()); }
             if knob.requires_reboot { out = out.warn("takes effect only after reboot"); }
             return Ok(text(out.to_value()));
         }
@@ -3455,13 +3509,13 @@ impl Heisenberg {
 
         // Group the knob's regs by subkey (a knob may span multiple keys, e.g. W365 Boot),
         // capturing prior values per key so one revert restores them all.
-        let mut by_subkey: std::collections::BTreeMap<&str, Vec<&crate::controls::RegDword>> = std::collections::BTreeMap::new();
-        for r in knob.regs {
-            by_subkey.entry(r.subkey).or_default().push(r);
+        let mut by_subkey: std::collections::BTreeMap<&str, Vec<&crate::controls::KnobReg>> = std::collections::BTreeMap::new();
+        for r in &knob.regs {
+            by_subkey.entry(r.subkey.as_str()).or_default().push(r);
         }
         let groups: Vec<crate::ledger::RegGroup> = by_subkey.iter().map(|(sk, regs)| crate::ledger::RegGroup {
             subkey: sk.to_string(),
-            dwords: regs.iter().map(|r| (r.name.to_string(), regutil::hklm_read_dword(r.subkey, r.name))).collect(),
+            dwords: regs.iter().map(|r| (r.name.clone(), regutil::hklm_read_dword(&r.subkey, &r.name))).collect(),
             created_key: !regutil::hklm_key_exists(sk),
         }).collect();
         let id = {
@@ -3469,8 +3523,8 @@ impl Heisenberg {
             l.begin(tool, &format!("set {} = {want}", knob.id), RevertPlan::RegRestoreMulti { groups })
         };
         let mut apply_err = None;
-        for r in knob.regs {
-            if let Err(e) = regutil::hklm_set_dword(r.subkey, r.name, target) {
+        for r in &knob.regs {
+            if let Err(e) = regutil::hklm_set_dword(&r.subkey, &r.name, target) {
                 apply_err = Some(e);
                 break;
             }
@@ -3483,11 +3537,12 @@ impl Heisenberg {
                     .data(json!({ "id": knob.id, "state": want, "previous": cur, "requiresReboot": knob.requires_reboot, "changeId": id }))
                     .command(cmd).docs(docs).warn("revert with changes.revert to restore the prior value");
                 if knob.requires_reboot { out = out.warn("takes effect only after a reboot"); }
-                if let Some(d) = knob.danger { out = out.warn(d); }
+                if let Some(d) = &knob.danger { out = out.warn(d.clone()); }
                 if want == "on" {
-                    if let Some(app) = knob.requires_app {
+                    if let Some(app) = &knob.requires_app {
                         if app_installed(app).await == Some(false) {
-                            out = out.warn(format!("{} ({app}) is NOT installed — this won't fully work without it. Install it via app.install (id={app}) or env.provision / Groundhog.", knob.requires_app_label.unwrap_or(app)));
+                            let label = knob.requires_app_label.as_deref().unwrap_or(app.as_str());
+                            out = out.warn(format!("{label} ({app}) is NOT installed — this won't fully work without it. Install it via app.install (id={app}) or env.provision / Groundhog."));
                         }
                     }
                 }
@@ -3498,6 +3553,102 @@ impl Heisenberg {
                 Ok(text(error(tool, ErrorKind::Internal, format!("failed to set control: {e}"), "check elevation and the registry key", Some(docs))))
             }
         }
+    }
+
+    #[tool(
+        name = "control.add",
+        description = "Define (or, with replace=true, overwrite) a user knob so it shows up in heisenberg://controls and the portal's Controls panel alongside the built-ins - without rebuilding. Takes an id, label, and the HKLM DWORD(s) it flips (regs: [{subkey,name}]), plus optional group/description/on_value/off_value/requires_reboot/danger. This writes only Heisenberg's own catalog config (HEISENBERG_HOME\\controls.json) - no registry change and no gate here; flipping the knob still goes through control.set's elevation + gate + ledger."
+    )]
+    async fn control_add(
+        &self,
+        Parameters(a): Parameters<ControlAddArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "control.add";
+        let docs = CONTROLS_DOCS;
+        let knob = crate::controls::UserKnob {
+            id: a.id.trim().to_string(),
+            label: a.label,
+            group: a.group.filter(|g| !g.trim().is_empty()).unwrap_or_else(|| "Custom".to_string()),
+            description: a.description.unwrap_or_default(),
+            regs: a.regs,
+            on_value: a.on_value.unwrap_or(1),
+            off_value: a.off_value.unwrap_or(0),
+            requires_reboot: a.requires_reboot,
+            danger: a.danger.filter(|d| !d.trim().is_empty()),
+        };
+        let id = knob.id.clone();
+        let result = {
+            let mut store = self.state.controls.lock().unwrap();
+            store.add(knob, a.replace)
+        };
+        match result {
+            Ok(replaced) => {
+                let verb = if replaced { "updated" } else { "added" };
+                self.state.audit.record(tool, &format!("{verb} knob {id}"), None, "applied", None);
+                Ok(text(Outcome::new(tool, format!("{verb} knob '{id}' — it now appears in the Controls panel"))
+                    .data(json!({ "id": id, "replaced": replaced }))
+                    .docs(docs)
+                    .warn("flip it with control.set (gated + reversible); remove it with control.remove")
+                    .to_value()))
+            }
+            Err(e) => Ok(text(error(tool, ErrorKind::InvalidArgument, e, "fix the knob definition and retry (ids can't collide with a built-in; on/off values must differ; each reg needs an HKLM subkey + value name)", Some(docs)))),
+        }
+    }
+
+    #[tool(
+        name = "control.remove",
+        description = "Remove a user knob (one added via control.add / control.import) by id. Built-in knobs can't be removed. Does not touch the registry - if the knob was flipped, revert that separately via changes.revert. Read-only to the machine (edits only HEISENBERG_HOME\\controls.json)."
+    )]
+    async fn control_remove(
+        &self,
+        Parameters(a): Parameters<ControlRemoveArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "control.remove";
+        let docs = CONTROLS_DOCS;
+        if crate::controls::find(&a.id).is_some() {
+            return Ok(text(error(tool, ErrorKind::InvalidArgument, format!("'{}' is a built-in knob", a.id), "built-in knobs can't be removed; only user-added knobs can", Some(docs))));
+        }
+        let removed = {
+            let mut store = self.state.controls.lock().unwrap();
+            store.remove(&a.id)
+        };
+        if removed {
+            self.state.audit.record(tool, &format!("removed knob {}", a.id), None, "applied", None);
+            Ok(text(Outcome::new(tool, format!("removed user knob '{}'", a.id)).data(json!({ "id": a.id, "removed": true })).docs(docs).to_value()))
+        } else {
+            Ok(text(error(tool, ErrorKind::TargetNotFound, format!("no user knob '{}'", a.id), "see heisenberg://controls (builtin=false entries are user knobs)", Some(docs))))
+        }
+    }
+
+    #[tool(
+        name = "control.import",
+        description = "Add a batch of user knobs at once (e.g. paste a saved set of knobs). Same per-knob shape as control.add. Each is validated independently; the result lists which were added/updated and which were rejected and why. Writes only Heisenberg's catalog config - no registry change and no gate here."
+    )]
+    async fn control_import(
+        &self,
+        Parameters(a): Parameters<ControlImportArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tool = "control.import";
+        let docs = CONTROLS_DOCS;
+        let mut added = Vec::new();
+        let mut updated = Vec::new();
+        let mut errors = Vec::new();
+        {
+            let mut store = self.state.controls.lock().unwrap();
+            for k in a.knobs {
+                let id = k.id.trim().to_string();
+                match store.add(k, a.replace) {
+                    Ok(true) => updated.push(id),
+                    Ok(false) => added.push(id),
+                    Err(e) => errors.push(json!({ "id": id, "error": e })),
+                }
+            }
+        }
+        self.state.audit.record(tool, &format!("import: {} added, {} updated, {} rejected", added.len(), updated.len(), errors.len()), None, "applied", None);
+        Ok(text(Outcome::new(tool, format!("imported {} knob(s) ({} updated, {} rejected)", added.len(), updated.len(), errors.len()))
+            .data(json!({ "added": added, "updated": updated, "errors": errors }))
+            .docs(docs)
+            .to_value()))
     }
 
     #[tool(
@@ -7988,15 +8139,21 @@ impl ServerHandler for Heisenberg {
             "heisenberg://controls" => {
                 // Fast: registry state only. A knob's required-app status (which shells
                 // out to Get-AppxPackage and is slow) is fetched lazily by the portal via
-                // app.status, so opening Controls doesn't block on it.
-                let knobs: Vec<serde_json::Value> = crate::controls::KNOBS.iter().map(|k| {
-                    let (cur, raw) = crate::controls::current_state(k);
-                    let requires = k.requires_app.map(|id| json!({ "id": id, "label": k.requires_app_label }));
+                // app.status, so opening Controls doesn't block on it. Built-in knobs
+                // plus any user knobs added/imported from the portal are merged here.
+                let user = self.state.controls.lock().unwrap().list().to_vec();
+                let knobs: Vec<serde_json::Value> = crate::controls::views(&user).iter().map(|k| {
+                    let (cur, raw) = k.current_state();
+                    let requires = k.requires_app.as_ref().map(|id| json!({ "id": id, "label": k.requires_app_label }));
                     json!({
                         "id": k.id, "label": k.label, "group": k.group, "description": k.description,
                         "kind": "toggle", "options": ["on", "off"], "current": cur,
                         "requiresReboot": k.requires_reboot, "danger": k.danger, "requires": requires,
-                        "regs": raw.iter().map(|(n, v)| json!({ "name": n, "value": v })).collect::<Vec<_>>(),
+                        "builtin": k.builtin,
+                        "onValue": k.on_value, "offValue": k.off_value,
+                        "regs": raw.iter().enumerate()
+                            .map(|(i, (n, v))| json!({ "name": n, "value": v, "subkey": k.regs.get(i).map(|r| r.subkey.clone()) }))
+                            .collect::<Vec<_>>(),
                     })
                 }).collect();
                 serde_json::to_string_pretty(&json!({ "controls": knobs })).ok()

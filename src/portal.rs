@@ -449,12 +449,103 @@ async function openDeploy(){
   show(wrap);
 }
 
+function ctlInput(ph, val){ const i=document.createElement("input"); i.type="text"; i.placeholder=ph||""; i.value=val||""; i.style.cssText="flex:1;min-width:120px;background:#0e1626;color:#dce7ff;border:1px solid #2a3550;border-radius:6px;padding:6px 8px;font:inherit"; return i; }
+
+// Inline "define a knob" form. `existing` (a control from the resource) prefills it for edit.
+function knobForm(existing, onSaved, onCancel){
+  const box=document.createElement("div"); box.className="card"; box.style.cssText+=";border:1px solid #3a4a70";
+  const title=document.createElement("b"); title.textContent=existing?("Edit knob — "+existing.id):"Add a knob"; box.append(title);
+  const grid=document.createElement("div"); grid.style.cssText="display:flex;flex-direction:column;gap:8px;margin-top:10px";
+  function row(label, el){ const r=document.createElement("label"); r.style.cssText="display:flex;align-items:center;gap:8px;flex-wrap:wrap"; const l=document.createElement("span"); l.textContent=label; l.style.cssText="width:120px;color:var(--mut);font-size:12px"; r.append(l, el); return r; }
+  const id=ctlInput("cloudap.myToggle", existing?existing.id:""); if(existing){ id.readOnly=true; id.style.opacity=".6"; }
+  const label=ctlInput("What it is", existing?existing.label:"");
+  const group=ctlInput("Custom", existing?existing.group:"");
+  const desc=ctlInput("What it does / when to flip it", existing?existing.description:"");
+  const onV=ctlInput("1", existing&&existing.onValue!=null?String(existing.onValue):"1"); onV.style.maxWidth="80px"; onV.style.flex="none";
+  const offV=ctlInput("0", existing&&existing.offValue!=null?String(existing.offValue):"0"); offV.style.maxWidth="80px"; offV.style.flex="none";
+  const reboot=document.createElement("input"); reboot.type="checkbox"; if(existing&&existing.requiresReboot) reboot.checked=true;
+  const danger=ctlInput("optional warning shown before turning on", existing&&existing.danger?existing.danger:"");
+  // registry rows
+  const regsWrap=document.createElement("div"); regsWrap.style.cssText="display:flex;flex-direction:column;gap:6px";
+  function regRow(sk, nm){ const r=document.createElement("div"); r.style.cssText="display:flex;gap:6px;align-items:center";
+    const s=ctlInput("SOFTWARE\\...\\Subkey  (HKLM, no leading \\)", sk||""); const n=ctlInput("ValueName", nm||""); n.style.maxWidth="160px"; n.style.flex="none";
+    const del=document.createElement("button"); del.className="go"; del.textContent="✕"; del.style.cssText="padding:4px 8px;background:#2a3550;color:#cfe0ff"; del.onclick=()=>{ if(regsWrap.children.length>1) r.remove(); };
+    r.append(s,n,del); r._get=()=>({subkey:s.value.trim(), name:n.value.trim()}); return r; }
+  const initRegs=(existing&&existing.regs&&existing.regs.length)?existing.regs:[{subkey:"",name:""}];
+  initRegs.forEach(rg=>regsWrap.append(regRow(rg.subkey||"", rg.name||"")));
+  const addReg=document.createElement("button"); addReg.className="go"; addReg.textContent="+ registry value"; addReg.style.cssText="padding:4px 10px;background:#2a3550;color:#cfe0ff;align-self:flex-start"; addReg.onclick=()=>regsWrap.append(regRow("",""));
+  grid.append(row("id", id), row("label", label), row("group", group), row("description", desc), row("registry", regsWrap), addReg, row("on value", onV), row("off value", offV), row("reboot?", reboot), row("danger", danger));
+  const res=document.createElement("div"); res.className="hint";
+  const bar=document.createElement("div"); bar.className="row"; bar.style.marginTop="10px";
+  const save=document.createElement("button"); save.className="go"; save.textContent=existing?"Save changes":"Add knob";
+  const cancel=document.createElement("button"); cancel.className="go"; cancel.style.cssText="background:#2a3550;color:#cfe0ff"; cancel.textContent="Cancel"; cancel.onclick=()=>onCancel&&onCancel();
+  bar.append(save, cancel);
+  save.onclick=async()=>{
+    const regs=[...regsWrap.children].map(r=>r._get()).filter(r=>r.subkey||r.name);
+    const knob={ id:id.value.trim(), label:label.value.trim(), group:group.value.trim()||undefined, description:desc.value.trim()||undefined,
+      regs, on_value:Number(onV.value||1), off_value:Number(offV.value||0), requires_reboot:reboot.checked, danger:danger.value.trim()||undefined, replace: existing?true:false };
+    if(!knob.id||!knob.label||!regs.length){ res.style.color="var(--bad)"; res.textContent="id, label, and at least one registry value are required"; return; }
+    save.disabled=true; res.style.color="var(--mut)"; res.textContent="saving…";
+    try{ const r=await toolCall("control.add", knob);
+      if(r&&r.ok===false){ save.disabled=false; res.style.color="var(--bad)"; res.textContent=((r.error&&r.error.message)||"failed")+((r.error&&r.error.remedy)?(" — "+r.error.remedy):""); }
+      else { onSaved&&onSaved(); }
+    }catch(e){ save.disabled=false; res.style.color="var(--bad)"; res.textContent="ERROR: "+e.message; }
+  };
+  box.append(grid, bar, res); return box;
+}
+
 async function openControls(){
   const wrap=document.createElement("div");
   const h=document.createElement("h2"); h.textContent="Controls"; wrap.append(h);
-  let data; try{ data=await resource("heisenberg://controls"); }catch(e){ show(pre("ERROR: "+e.message)); return; }
-  const knobs=(data&&data.controls)||[];
-  if(!knobs.length){ wrap.append(pre("(no controls declared)")); show(wrap); return; }
+  const tools=document.createElement("div"); tools.className="row"; tools.style.cssText="gap:8px;flex-wrap:wrap;margin-bottom:8px"; wrap.append(tools);
+  const addBtn=document.createElement("button"); addBtn.className="go"; addBtn.textContent="➕ Add knob";
+  const impBtn=document.createElement("button"); impBtn.className="go"; impBtn.style.cssText="background:#2a3550;color:#cfe0ff"; impBtn.textContent="📥 Import / Export JSON";
+  tools.append(addBtn, impBtn);
+  const slot=document.createElement("div"); wrap.append(slot);   // holds the add-form / import box
+  const body=document.createElement("div"); wrap.append(body);
+  show(wrap);
+  function clearSlot(){ slot.innerHTML=""; }
+  addBtn.onclick=()=>{ clearSlot(); slot.append(knobForm(null, ()=>{ clearSlot(); reload(); }, clearSlot)); };
+  impBtn.onclick=()=>{ clearSlot(); slot.append(importBox(()=>{ clearSlot(); reload(); })); };
+
+  async function reload(){
+    body.innerHTML="";
+    let data; try{ data=await resource("heisenberg://controls"); }catch(e){ body.append(pre("ERROR: "+e.message)); return; }
+    const knobs=(data&&data.controls)||[];
+    if(!knobs.length){ body.append(pre("No controls yet. Click “Add knob” to define a reversible registry toggle.")); return; }
+    render(knobs, body, reload, slot, clearSlot);
+  }
+  function importBox(onDone){
+    const box=document.createElement("div"); box.className="card"; box.style.cssText+=";border:1px solid #3a4a70";
+    const t=document.createElement("b"); t.textContent="Import / Export user knobs (JSON)"; box.append(t);
+    const ta=document.createElement("textarea"); ta.style.cssText="width:100%;min-height:140px;margin-top:8px;background:#0e1626;color:#dce7ff;border:1px solid #2a3550;border-radius:6px;padding:8px;font:12px ui-monospace,monospace"; ta.placeholder='[{"id":"cloudap.myToggle","label":"My toggle","group":"Custom","regs":[{"subkey":"SOFTWARE\\\\...","name":"MyValue"}],"on_value":1,"off_value":0}]'; box.append(ta);
+    const res=document.createElement("div"); res.className="hint";
+    const bar=document.createElement("div"); bar.className="row"; bar.style.marginTop="8px";
+    const exp=document.createElement("button"); exp.className="go"; exp.style.cssText="background:#2a3550;color:#cfe0ff"; exp.textContent="⤓ Load current user knobs";
+    const imp=document.createElement("button"); imp.className="go"; imp.textContent="Import";
+    const cancel=document.createElement("button"); cancel.className="go"; cancel.style.cssText="background:#2a3550;color:#cfe0ff"; cancel.textContent="Close"; cancel.onclick=()=>onDone&&onDone();
+    bar.append(imp, exp, cancel); box.append(bar, res);
+    exp.onclick=async()=>{ try{ const d=await resource("heisenberg://controls"); const user=((d&&d.controls)||[]).filter(k=>k.builtin===false).map(k=>({ id:k.id, label:k.label, group:k.group, description:k.description, regs:(k.regs||[]).map(r=>({subkey:r.subkey, name:r.name})), on_value:k.onValue, off_value:k.offValue, requires_reboot:k.requiresReboot, danger:k.danger||undefined })); ta.value=JSON.stringify(user, null, 2); res.style.color="var(--mut)"; res.textContent=user.length+" user knob(s) loaded — copy, or edit and Import with overwrite."; }catch(e){ res.style.color="var(--bad)"; res.textContent="ERROR: "+e.message; } };
+    imp.onclick=async()=>{
+      let parsed; try{ parsed=JSON.parse(ta.value); }catch(e){ res.style.color="var(--bad)"; res.textContent="not valid JSON: "+e.message; return; }
+      const list=Array.isArray(parsed)?parsed:(parsed&&parsed.knobs);
+      if(!Array.isArray(list)){ res.style.color="var(--bad)"; res.textContent="expected a JSON array of knobs, or {\"knobs\":[…]}"; return; }
+      imp.disabled=true; res.style.color="var(--mut)"; res.textContent="importing…";
+      try{ const r=await toolCall("control.import",{knobs:list, replace:true});
+        imp.disabled=false;
+        if(r&&r.ok===false){ res.style.color="var(--bad)"; res.textContent=(r.error&&r.error.message)||"failed"; return; }
+        const d=r.data||{}; const errs=(d.errors||[]);
+        res.style.color=errs.length?"var(--warn)":"var(--ok)";
+        res.textContent=(d.added||[]).length+" added, "+(d.updated||[]).length+" updated"+(errs.length?(", "+errs.length+" rejected: "+errs.map(e=>e.id+" ("+e.error+")").join("; ")):"");
+        reload();
+      }catch(e){ imp.disabled=false; res.style.color="var(--bad)"; res.textContent="ERROR: "+e.message; }
+    };
+    return box;
+  }
+  reload();
+}
+
+function render(knobs, wrap, reload, slot, clearSlot){
   const groups={}; knobs.forEach(k=>{ (groups[k.group]=groups[k.group]||[]).push(k); });
   Object.keys(groups).forEach(g=>{
     const gh=document.createElement("h3"); gh.textContent=g; gh.style.cssText="font-size:12px;color:var(--mut);margin:14px 0 6px;text-transform:uppercase;letter-spacing:.6px"; wrap.append(gh);
@@ -467,7 +558,16 @@ async function openControls(){
       paint(k.current);
       const onBtn=document.createElement("button"); onBtn.className="go"; onBtn.textContent="On"; onBtn.style.padding="4px 12px";
       const offBtn=document.createElement("button"); offBtn.className="go"; offBtn.textContent="Off"; offBtn.style.cssText="padding:4px 12px;background:#2a3550;color:#cfe0ff";
-      top.append(name, state, onBtn, offBtn); card.append(top);
+      top.append(name, state, onBtn, offBtn);
+      if(k.builtin===false){
+        const tag=document.createElement("span"); tag.className="badge"; tag.textContent="custom"; tag.style.cssText="color:#9fb6e6;background:#223052";
+        const edit=document.createElement("button"); edit.className="go"; edit.textContent="✎"; edit.title="Edit this knob"; edit.style.cssText="padding:4px 10px;background:#2a3550;color:#cfe0ff";
+        const del=document.createElement("button"); del.className="go"; del.textContent="🗑"; del.title="Remove this knob"; del.style.cssText="padding:4px 10px;background:#2a3550;color:#cfe0ff";
+        edit.onclick=()=>{ clearSlot(); slot.append(knobForm(k, ()=>{ clearSlot(); reload(); }, clearSlot)); slot.scrollIntoView({behavior:"smooth",block:"nearest"}); };
+        del.onclick=async()=>{ if(!confirm("Remove the knob “"+k.label+"”? (this only removes it from the list; if it's currently applied, revert it in Changes)")) return; del.disabled=true; try{ const r=await toolCall("control.remove",{id:k.id}); if(r&&r.ok===false){ del.disabled=false; alert((r.error&&r.error.message)||"remove failed"); } else { reload(); } }catch(e){ del.disabled=false; alert("ERROR: "+e.message); } };
+        top.append(tag, edit, del);
+      }
+      card.append(top);
       if(k.requires){
         const dep=document.createElement("div"); dep.style.cssText="margin-top:6px;display:flex;align-items:center;gap:8px;flex-wrap:wrap";
         const dlabel=(k.requires.label||k.requires.id);
@@ -502,7 +602,6 @@ async function openControls(){
       wrap.append(card);
     });
   });
-  show(wrap);
 }
 
 async function openChanges(){
